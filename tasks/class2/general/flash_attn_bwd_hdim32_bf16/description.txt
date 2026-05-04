@@ -1,0 +1,53 @@
+# Task: flash_attn_bwd_hdim32_bf16
+
+## Description
+
+Implement CUDA kernels for the Flash Attention backward pass.
+
+Given upstream gradient dO and saved forward tensors (Q, K, V, O, lse), compute:
+  dQ, dK, dV — gradients w.r.t. Q, K, V
+
+Algorithm (tiled, avoids materializing full attention matrix):
+  1. Preprocessing: dsoftmax_sum[b,h,i] = sum_d(dO[b,h,i,d] * O[b,h,i,d])
+  2. For each K/V tile:
+     For each Q tile:
+       S = Q_tile @ K_tile^T * scale
+       P = exp(S - lse)
+       dV += P^T @ dO_tile
+       dP = dO_tile @ V_tile^T
+       dS = P * (dP - dsoftmax_sum)
+       dQ += dS @ K_tile * scale
+       dK += dS^T @ Q_tile * scale
+
+Inputs (all bf16, contiguous [B, H, S, D]):
+  dO: [2, 8, 128, 32], Q/K/V/O: same shape
+  lse: [2, 8, 128] fp32
+
+Outputs (bf16): dQ, dK, dV same shape as Q, K, V
+
+scale = 1/sqrt(D) = 0.176777
+
+
+## Function Signature
+
+```c
+void launch_flash_attn_bwd(
+    const void* dO,    // [B, H, S, D] bf16
+    const void* Q,     // [B, H, S, D] bf16
+    const void* K,     // [B, H, S, D] bf16
+    const void* V,     // [B, H, S, D] bf16
+    const void* O,     // [B, H, S, D] bf16
+    const float* lse,  // [B, H, S]
+    void* dQ,          // [B, H, S, D] bf16
+    void* dK,          // [B, H, S, D] bf16
+    void* dV,          // [B, H, S, D] bf16
+    int B,
+    int H,
+    int Sq,
+    int Sk,
+    int D,
+    float scale,
+    cudaStream_t stream
+);
+
+```

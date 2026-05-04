@@ -1,0 +1,64 @@
+# Task: 51_hopper_gett
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+Hopper GETT (Generalized Tensor-Tensor contraction) -- a standard GEMM with
+half-precision inputs and float output.
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+cudaError_t HopperGett(
+    int M, int N, int K, float alpha,
+    __half const *A, int lda,
+    __half const *B, int ldb,
+    float beta,
+    __half const *C, int ldc,
+    float *D, int ldd);
+```
+
+## Operation
+
+D = alpha * A * B + beta * C
+
+Where:
+- A is M x K (half precision)
+- B is K x N (half precision)
+- C is M x N (half precision, input for beta accumulation)
+- D is M x N (float precision output)
+
+## Data Types
+
+- Input matrices A, B, C: `__half` (FP16)
+- Output matrix D: `float` (FP32)
+- Scalars alpha, beta: `float`
+- Accumulation: `float`
+
+## Memory Layout
+
+All matrices are **column-major**:
+- A: Element (i,k) at `A[i + k * lda]`.  lda = M.
+- B: Element (k,j) at `B[k + j * ldb]`.  ldb = K.
+- C: Element (i,j) at `C[i + j * ldc]`.  ldc = M.
+- D: Element (i,j) at `D[i + j * ldd]`.  ldd = M.
+
+## Test Sizes
+
+- small: M=1024, N=1024, K=1024
+- medium: M=4096, N=4096, K=4096
+- large: M=8192, N=8192, K=8192
+
+## Compilation
+
+```bash
+make test    # compiles with solution.h, needs CUTLASS headers
+./test       # runs correctness check + profiling
+```

@@ -1,0 +1,41 @@
+# Task: fa3_bwd_hdim96_fp16_causal
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+## Description
+
+Implement a CUDA kernel for Flash Attention 3 backward pass (Hopper SM90).
+
+Given forward outputs (O, lse) and upstream gradient dO, compute:
+  dQ, dK, dV — gradients of Q, K, V
+
+scale = 1/sqrt(D) = 0.102062
+Causal masking enabled.
+
+
+## Function Signature
+
+```c
+void launch_fa3_bwd(
+    const void* Q,          // [B, H, Sq, D] fp16
+    const void* K,          // [B, H, Sk, D] fp16
+    const void* V,          // [B, H, Sk, D] fp16
+    const void* O,          // [B, H, Sq, D] fp16
+    const void* dO,         // [B, H, Sq, D] fp16
+    void* dQ,               // [B, H, Sq, D] fp16
+    void* dK,               // [B, H, Sk, D] fp16
+    void* dV,               // [B, H, Sk, D] fp16
+    const float* lse,       // [B, H, Sq]
+    float* dsoftmax_sum,    // [B, H, Sq]
+    float* dq_accum,        // [B, H, Sq, D] fp32 accumulator
+    int B,
+    int H,
+    int Sq,
+    int Sk,
+    int D,
+    float scale,
+    cudaStream_t stream
+);
+
+```

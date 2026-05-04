@@ -1,0 +1,26 @@
+{
+  "build_script": "build.sh",
+  "run_script": "run.sh",
+  "files": [
+    "build.sh",
+    "run.sh",
+    "src/main.cu",
+    "src/attention_kernels.cu",
+    "src/training_kernels.cu",
+    "src/common.h"
+  ],
+  "cuda_sources": [
+    "src/main.cu",
+    "src/attention_kernels.cu",
+    "src/training_kernels.cu"
+  ],
+  "ops": {
+    "attention": "src/attention_kernels.cu",
+    "layernorm": "src/training_kernels.cu",
+    "gelu": "src/training_kernels.cu",
+    "encoder": "src/training_kernels.cu",
+    "fused_classifier": "src/training_kernels.cu",
+    "adamw": "src/training_kernels.cu",
+    "global_norm": "src/training_kernels.cu"
+  }
+}

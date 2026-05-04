@@ -1,0 +1,62 @@
+# Task: 23_ampere_gemm_operand_reduction_fusion
+
+BF16 GEMM with operand reduction fusion.
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
+cudaError_t GemmWithReduction(
+    int M, int N, int K, float alpha,
+    __nv_bfloat16 const *A, int lda,
+    __nv_bfloat16 const *B, int ldb,
+    float beta,
+    __nv_bfloat16 const *C, int ldc,
+    __nv_bfloat16 *D, int ldd,
+    float *row_reduction);
+```
+
+## Operation
+
+D = alpha * A * B + beta * C
+row_reduction[k] = sum_{m=0..M-1} float(A[m, k])   for k = 0..K-1
+
+Where:
+- A is M x K (column-major, bf16)
+- B is K x N (row-major, bf16)
+- C is M x N (column-major, bf16)
+- D is M x N (column-major, bf16)
+- row_reduction is a float array of length K
+
+## Data Types
+
+- A, B, C, D: `__nv_bfloat16` (BF16)
+- alpha, beta: `float`
+- row_reduction: `float`
+
+## Memory Layout
+
+- A: **column-major**. Element (i, k) at `A[i + k * lda]`. lda >= M.
+- B: **row-major**. Element (k, j) at `B[k * ldb + j]`. ldb >= N.
+- C: **column-major**. Element (i, j) at `C[i + j * ldc]`. ldc >= M.
+- D: **column-major**. Element (i, j) at `D[i + j * ldd]`. ldd >= M.
+
+## Build & Test
+
+```bash
+make test                    # requires solution.h in task directory
+./test                       # default: runs small/medium/large sizes
+./test 1024 1024 1024        # custom single size: M N K
+./test 1024 1024 1024 1.0 0.0 20  # M N K alpha beta iterations
+```
+
+Correctness is verified against a reference implementation at multiple problem sizes
+(small: 1024x1024x1024, medium: 4096x4096x4096, large: 8192x8192x8192).
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

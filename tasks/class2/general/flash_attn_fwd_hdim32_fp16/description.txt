@@ -1,0 +1,42 @@
+# Task: flash_attn_fwd_hdim32_fp16
+
+## Description
+
+Implement a CUDA kernel for the forward pass of Flash Attention.
+
+Compute scaled dot-product attention WITHOUT materializing the full attention matrix:
+  S = Q @ K^T * scale
+  O = softmax(S) @ V
+  lse[i] = log(sum(exp(S[i][:])))
+
+Inputs (all fp16, contiguous, [B, H, S, D] layout):
+  Q: [4, 8, 256, 32]
+  K: [4, 8, 256, 32]
+  V: [4, 8, 256, 32]
+
+Outputs:
+  O:   [B, H, Sq, D] fp16 — attention output
+  lse: [B, H, Sq] fp32 — log-sum-exp per query row
+
+scale = 1/sqrt(D) = 0.176777
+
+
+## Function Signature
+
+```c
+void launch_flash_attn_fwd(
+    const void* Q,     // [B, H, Sq, D] fp16
+    const void* K,     // [B, H, Sk, D] fp16
+    const void* V,     // [B, H, Sk, D] fp16
+    void* O,           // [B, H, Sq, D] fp16
+    float* lse,        // [B, H, Sq] log-sum-exp per query row
+    int B,
+    int H,
+    int Sq,
+    int Sk,
+    int D,
+    float scale,
+    cudaStream_t stream
+);
+
+```

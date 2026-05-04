@@ -1,0 +1,50 @@
+# Task: tk_linear_attention
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+Linear Attention with Exponential Decay on H100, matching ThunderKittens performance.
+
+Causal linear attention where each position's influence decays exponentially with distance.
+D=128 (head dim), hardcoded.
+
+## Function Signature
+
+Implement in solution.h:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
+void LinearAttention(
+    __nv_bfloat16 *Q, __nv_bfloat16 *K, __nv_bfloat16 *V, __nv_bfloat16 *O,
+    float *slopes,
+    int B, int H, int N, int D);
+```
+
+## Operation
+
+For each query position i:
+  O[i] = sum_{j<=i} exp(-slope * (i-j)) * (Q[i] @ K[j]^T) * V[j]
+
+With per-head decay slopes. Combines local causal attention with linear recurrence.
+
+Where:
+- Q, K: [B, H, N, 128] bf16
+- V, O: [B, H, N, 128] bf16
+- slopes: [H] float per-head decay rates
+
+Default test size: B=1, H=8, N=1024.
+
+## Build & Test
+
+```bash
+conda activate attn
+python gentests.py
+make test
+./test randn_1024.txt
+```
+
+Requires H100 GPU (SM90a). ThunderKittens headers on include path.

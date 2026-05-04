@@ -1,0 +1,152 @@
+# Task: 67_hopper_fp8_warp_specialized_gemm_with_blockwise_scaling
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+Hopper FP8 Blockwise Scaling GEMM test harness
+Based on CUTLASS example 67_hopper_fp8_warp_specialized_gemm_with_blockwise_scaling
+The LLM must implement:
+  cudaError_t HopperFp8BlockwiseGemm(int M, int N, int K, float alpha,
+      __nv_fp8_e4m3 const *A, int lda, float const *scale_A,
+      __nv_fp8_e4m3 const *B, int ldb, float const *scale_B,
+      __nv_bfloat16 *D, int ldd, int block_size);
+A is row-major [M, K] (lda = K), B is column-major [K, N] (ldb = K),
+D is row-major [M, N] (ldd = N).
+scale_A: per-block scale factors for A, scale_B: per-block for B.
+block_size determines the granularity of scaling.
+Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * Hopper FP8 Blockwise Scaling GEMM test harness
+ * Based on CUTLASS example 67_hopper_fp8_warp_specialized_gemm_with_blockwise_scaling
+ *
+ * The LLM must implement:
+ *   cudaError_t HopperFp8BlockwiseGemm(int M, int N, int K, float alpha,
+ *       __nv_fp8_e4m3 const *A, int lda, float const *scale_A,
+ *       __nv_fp8_e4m3 const *B, int ldb, float const *scale_B,
+ *       __nv_bfloat16 *D, int ldd, int block_size);
+ *
+ * A is row-major [M, K] (lda = K), B is column-major [K, N] (ldb = K),
+ * D is row-major [M, N] (ldd = N).
+ * scale_A: per-block scale factors for A, scale_B: per-block for B.
+ * block_size determines the granularity of scaling.
+ *
+ * Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+ */
+
+#include <cuda_fp8.h>
+#include <cuda_bf16.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status)                                              \
+  {                                                                     \
+    cudaError_t error = status;                                         \
+    if (error != cudaSuccess) {                                         \
+      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
+                << " at line: " << __LINE__ << std::endl;               \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
+  }
+
+extern cudaError_t HopperFp8BlockwiseGemm(
+  int M, int N, int K, float alpha,
+  __nv_fp8_e4m3 const *A, int lda, float const *scale_A,
+  __nv_fp8_e4m3 const *B, int ldb, float const *scale_B,
+  __nv_bfloat16 *D, int ldd,
+  int block_size);
+
+/// CPU reference: dequantize with per-block scales, then GEMM
+/// With all scales = 1.0, this is just a standard GEMM
+void reference(int M, int N, int K, float alpha,
+  std::vector<float> const &A, int lda,
+  std::vector<float> const &B, int ldb,
+  std::vector<float> &D, int ldd) {
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      float acc = 0;
+      for (int k = 0; k < K; ++k)
+        acc += A[i * lda + k] * B[k + j * ldb];
+      D[i * ldd + j] = alpha * acc;
+    }
+}
+
+int main() {
+  int M = 128, N = 128, K = 128;
+  int lda = K, ldb = K, ldd = N;
+  int block_size = 128;
+  float alpha = 1.0f;
+
+  int sA_count = M * ((K + block_size - 1) / block_size);
+  int sB_count = N * ((K + block_size - 1) / block_size);
+
+  std::vector<float> fA(M * K), fB(K * N), fD(M * N, 0), fRef(M * N, 0);
+  std::vector<float> sA(sA_count, 1.0f), sB(sB_count, 1.0f);
+
+  for (int i = 0; i < M * K; ++i) fA[i] = float((i * 16807 % 8) - 4) * 0.25f;
+  for (int i = 0; i < K * N; ++i) fB[i] = float((i * 48271 % 8) - 4) * 0.25f;
+
+  std::vector<__nv_fp8_e4m3> hA(M * K), hB(K * N);
+  for (int i = 0; i < M * K; ++i) hA[i] = __nv_fp8_e4m3(fA[i]);
+  for (int i = 0; i < K * N; ++i) hB[i] = __nv_fp8_e4m3(fB[i]);
+
+  __nv_fp8_e4m3 *dA, *dB;
+  __nv_bfloat16 *dD;
+  float *dsA, *dsB;
+  CUDA_CHECK(cudaMalloc(&dA, M * K * sizeof(__nv_fp8_e4m3)));
+  CUDA_CHECK(cudaMalloc(&dB, K * N * sizeof(__nv_fp8_e4m3)));
+  CUDA_CHECK(cudaMalloc(&dD, M * N * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMalloc(&dsA, sA_count * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&dsB, sB_count * sizeof(float)));
+
+  CUDA_CHECK(cudaMemcpy(dA, hA.data(), M * K * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB, hB.data(), K * N * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsA, sA.data(), sA_count * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsB, sB.data(), sB_count * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(dD, 0, M * N * sizeof(__nv_bfloat16)));
+
+  cudaError_t r = HopperFp8BlockwiseGemm(M, N, K, alpha, dA, lda, dsA, dB, ldb, dsB, dD, ldd, block_size);
+  if (r != cudaSuccess) {
+    std::cerr << "HopperFp8BlockwiseGemm failed: " << cudaGetErrorString(r) << std::endl;
+    cudaFree(dA); cudaFree(dB); cudaFree(dD); cudaFree(dsA); cudaFree(dsB);
+    return -1;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && r == cudaSuccess) {
+      kh_benchmark([&]() { HopperFp8BlockwiseGemm(M, N, K, alpha, dA, lda, dsA, dB, ldb, dsB, dD, ldd, block_size); }, _kh_trials);
+    }
+  }
+
+
+  std::vector<__nv_bfloat16> hD(M * N);
+  CUDA_CHECK(cudaMemcpy(hD.data(), dD, M * N * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+  cudaFree(dA); cudaFree(dB); cudaFree(dD); cudaFree(dsA); cudaFree(dsB);
+
+  for (int i = 0; i < M * N; ++i) fD[i] = __bfloat162float(hD[i]);
+  reference(M, N, K, alpha, fA, lda, fB, ldb, fRef, ldd);
+
+  float md = 0;
+  for (int i = 0; i < M * N; ++i) md = fmaxf(md, fabsf(fD[i] - fRef[i]));
+  // FP8 E4M3 has 3 mantissa bits — generous tolerance
+  if (md > 16.0f) {
+    std::cerr << "Results incorrect. Max diff: " << md << std::endl;
+    return -1;
+  }
+  std::cout << "Passed." << std::endl;
+  return 0;
+}
+```

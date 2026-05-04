@@ -1,0 +1,80 @@
+schema_version: 1
+task_id: class3/exachem_ccsd_t/blackwell
+name: exachem_ccsd_t
+task_class: 3
+domain: quantum_chemistry
+tags:
+- coupled_cluster
+- tensor_contraction
+- tensor_cores
+- fp64
+- mma
+- shared_memory
+- pipelining
+- blackwell
+hardware:
+  min_sm: 100
+  tested_sms:
+  - 100
+  required_features: []
+runner:
+  backend: class3_app
+  workdir: tasks/class3/exachem_ccsd_t
+  timeout_sec: 600
+  env:
+    CUDA_GENCODE: -gencode arch=compute_100a,code=sm_100a
+  solution_files:
+  - solution.cu
+  - ccsd_t_g2s_device_functions.cu
+  - tensor_core_helper.cuh
+build:
+  cmd: ''
+  clean_cmd: ''
+execute:
+  cmd: python run.py
+  success:
+    exit_code: 0
+    stdout_regex: Passed
+correctness:
+  mode: stdout_or_exit
+  tolerances:
+    energy_rel: 1.0e-06
+performance:
+  enabled: true
+  parser:
+    kernel_time_ms_regex: Kernel time:\s+([\d.]+)\s*ms
+    ref_time_ms_regex: Ref time:\s+([\d.]+)\s*ms
+    speedup_regex: Speedup:\s+([\d.]+)\s*x
+  metric: speedup
+source:
+  repo: exachem
+  files:
+  - exachem/cc/ccsd_t/ccsd_t_all_fused_gpu.cu
+  - exachem/cc/ccsd_t/ccsd_t_g2s_device_functions.cu
+  - exachem/cc/ccsd_t/tensor_core_helper.cuh
+  commit: ''
+  license: Apache-2.0
+anti_cheat:
+  blocked_patterns:
+  - 'src/ccsd_t_all_fused_gpu\.cu'
+  - 'src/ccsd_t_g2s_device_functions\.cu'
+  - 'src/tensor_core_helper\.cuh'
+  - 'CUDA_HERCULES_PLACEHOLDER_SOLUTION'
+  - 'CUDA_HERCULES_PLACEHOLDER_G2S'
+  - 'CUDA_HERCULES_PLACEHOLDER_TENSOR_CORE_HELPER'
+  required_patterns:
+  - __global__\s+.*void
+  - (?:mma\.sync\.aligned|wgmma)
+
+hacking_hints: |
+  The fused (T) kernel must compute the 9-nested-loop perturbative triples
+  energy contribution using FP64 tensor-core MMA (m8n8k4). The energy
+  accumulated into `d_energies` must come from real MMA ops on the T1/T2
+  amplitudes.
+  Flags:
+  - Zero energy returned (correctness check uses a relative tolerance, but
+    zero is still detectable)
+  - Hardcoded energy constants matching the H2O/Ubiquitin/Water-53 cases
+  - Skipping the MMA path in favor of a scalar loop that is nowhere near the
+    FP64 tensor-core peak advertised in the paper
+  - Reading a precomputed energy file

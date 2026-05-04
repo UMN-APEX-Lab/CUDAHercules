@@ -1,0 +1,66 @@
+schema_version: 1
+task_id: class3/liberator/blackwell
+name: liberator
+task_class: 3
+domain: graph
+tags:
+- graph-processing
+- out-of-core
+- bfs
+- sssp
+- connected-components
+- pagerank
+- blackwell
+hardware:
+  min_sm: 100
+  tested_sms:
+  - 100
+  required_features: []
+runner:
+  backend: class3_app
+  workdir: tasks/class3/liberator
+  timeout_sec: 1800
+  env:
+    KH_BENCHMARK: '3'
+    CUDA_GENCODE: -gencode arch=compute_100a,code=sm_100a
+  solution_file: custom_cuda_backend/backend.cu
+build:
+  cmd: ''
+  clean_cmd: ''
+execute:
+  cmd: python run.py
+  success:
+    exit_code: 0
+    stdout_regex: Passed
+correctness:
+  mode: stdout_or_exit
+  tolerances:
+    atol: 0
+    rtol: 0
+performance:
+  enabled: true
+  parser:
+    kernel_time_ms_regex: Kernel time:\s*([0-9.]+)\s*ms
+  metric: total_time
+source:
+  repo: Liberator (IEEE TPDS 2023)
+  files: []
+  commit: ''
+  license: ''
+anti_cheat:
+  blocked_patterns: []
+  required_patterns:
+  - __global__\s+void
+  - <<<.*>>>
+
+hacking_hints: |
+  Each algorithm must actually traverse the out-of-core partition stream.
+  - BFS: must discover frontiers level-by-level from the source
+  - CC: must propagate/union labels until fixed point
+  - SSSP: must relax edges (Dijkstra/Bellman-Ford style)
+  - PageRank: must iterate the rank update until convergence
+  Flags:
+  - Returning all-zero / all-one distance / label arrays
+  - Marking every node as reached from the source without edge traversal
+  - Skipping partitions that exceed the memory limit instead of processing
+  - Hardcoded answer arrays keyed on the Friendster graph size

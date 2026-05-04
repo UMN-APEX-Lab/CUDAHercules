@@ -1,0 +1,188 @@
+# Task: 89_sm103_fp4_ultra_gemm
+
+## Target Hardware
+NVIDIA Blackwell GPU (SM100/SM120).
+
+
+SM103 FP4 Ultra GEMM test harness
+NVFP4 data + float scales, BF16 output
+Based on CUTLASS example 89_sm103_fp4_ultra_gemm
+The LLM must implement:
+  cudaError_t Fp4UltraGemm(int M, int N, int K, float alpha,
+      cutlass::float_e2m1_t const *A, int lda,
+      float const *A_scales, int scale_lda,
+      cutlass::float_e2m1_t const *B, int ldb,
+      float const *B_scales, int scale_ldb,
+      float beta, __nv_bfloat16 *D, int ldd);
+A is row-major [M, K] (lda = K) in FP4 E2M1, one element per byte.
+B is column-major [K, N] (ldb = K) in FP4 E2M1, one element per byte.
+A_scales: [M, ceil(K/32)] row-major, one float scale per group of 32 elements.
+B_scales: [N, ceil(K/32)] row-major, one float scale per group of 32 elements.
+D is row-major [M, N] (ldd = N) in BF16.
+Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
+         -I<cutlass>/include \
+         -gencode arch=compute_120a,code=sm_120a harness.cu solution.cu -o test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * SM103 FP4 Ultra GEMM test harness
+ * NVFP4 data + float scales, BF16 output
+ * Based on CUTLASS example 89_sm103_fp4_ultra_gemm
+ *
+ * The LLM must implement:
+ *   cudaError_t Fp4UltraGemm(int M, int N, int K, float alpha,
+ *       cutlass::float_e2m1_t const *A, int lda,
+ *       float const *A_scales, int scale_lda,
+ *       cutlass::float_e2m1_t const *B, int ldb,
+ *       float const *B_scales, int scale_ldb,
+ *       float beta, __nv_bfloat16 *D, int ldd);
+ *
+ * A is row-major [M, K] (lda = K) in FP4 E2M1, one element per byte.
+ * B is column-major [K, N] (ldb = K) in FP4 E2M1, one element per byte.
+ * A_scales: [M, ceil(K/32)] row-major, one float scale per group of 32 elements.
+ * B_scales: [N, ceil(K/32)] row-major, one float scale per group of 32 elements.
+ * D is row-major [M, N] (ldd = N) in BF16.
+ *
+ * Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
+ *          -I<cutlass>/include \
+ *          -gencode arch=compute_120a,code=sm_120a harness.cu solution.cu -o test
+ */
+
+#include <iostream>
+#include <sstream>
+#include <vector>
+#include <cmath>
+#include <cuda_bf16.h>
+#include "cutlass/numeric_types.h"
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status)                                              \
+  {                                                                     \
+    cudaError_t error = status;                                         \
+    if (error != cudaSuccess) {                                         \
+      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
+                << " at line: " << __LINE__ << std::endl;               \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
+  }
+
+static constexpr int kGroupSize = 32;
+
+extern cudaError_t Fp4UltraGemm(
+  int M, int N, int K,
+  float alpha,
+  cutlass::float_e2m1_t const *A, int lda,
+  float const *A_scales, int scale_lda,
+  cutlass::float_e2m1_t const *B, int ldb,
+  float const *B_scales, int scale_ldb,
+  float beta,
+  __nv_bfloat16 *D, int ldd);
+
+void reference(int M, int N, int K, float alpha,
+  std::vector<float> const &fA, int lda,
+  std::vector<float> const &sA, int scale_lda,
+  std::vector<float> const &fB, int ldb,
+  std::vector<float> const &sB, int scale_ldb,
+  float beta,
+  std::vector<float> &D, int ldd) {
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      float acc = 0;
+      for (int k = 0; k < K; ++k) {
+        int kg = k / kGroupSize;
+        float a_val = fA[i * lda + k] * sA[i * scale_lda + kg];
+        float b_val = fB[k + j * ldb] * sB[j * scale_ldb + kg];
+        acc += a_val * b_val;
+      }
+      D[i * ldd + j] = alpha * acc + beta * D[i * ldd + j];
+    }
+}
+
+int main(int argc, const char *arg[]) {
+  int M = 256, N = 256, K = 256;
+  for (int i = 1; i < argc && i < 4; ++i) {
+    std::stringstream ss(arg[i]);
+    if (i == 1) ss >> M; else if (i == 2) ss >> N; else if (i == 3) ss >> K;
+  }
+
+  int lda = K, ldb = K, ldd = N;
+  float alpha = 1.0f, beta = 0.0f;
+  int k_groups = (K + kGroupSize - 1) / kGroupSize;
+
+  std::vector<cutlass::float_e2m1_t> hA(M * K), hB(K * N);
+  std::vector<float> fA(M * K), fB(K * N);
+  std::vector<float> sA(M * k_groups, 1.0f), sB(N * k_groups, 1.0f);
+
+  for (int i = 0; i < M * K; ++i) {
+    hA[i] = cutlass::float_e2m1_t(float((i * 16807 % 6) - 3) * 0.5f);
+    fA[i] = float(hA[i]);
+  }
+  for (int i = 0; i < K * N; ++i) {
+    hB[i] = cutlass::float_e2m1_t(float((i * 48271 % 6) - 3) * 0.5f);
+    fB[i] = float(hB[i]);
+  }
+
+  cutlass::float_e2m1_t *dA, *dB;
+  float *dsA, *dsB;
+  __nv_bfloat16 *dD;
+  CUDA_CHECK(cudaMalloc(&dA, M * K * sizeof(cutlass::float_e2m1_t)));
+  CUDA_CHECK(cudaMalloc(&dB, K * N * sizeof(cutlass::float_e2m1_t)));
+  CUDA_CHECK(cudaMalloc(&dsA, M * k_groups * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&dsB, N * k_groups * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&dD, M * N * sizeof(__nv_bfloat16)));
+
+  CUDA_CHECK(cudaMemcpy(dA, hA.data(), M * K * sizeof(cutlass::float_e2m1_t), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB, hB.data(), K * N * sizeof(cutlass::float_e2m1_t), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsA, sA.data(), M * k_groups * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsB, sB.data(), N * k_groups * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(dD, 0, M * N * sizeof(__nv_bfloat16)));
+
+  cudaError_t r = Fp4UltraGemm(M, N, K, alpha, dA, lda, dsA, k_groups, dB, ldb, dsB, k_groups, beta, dD, ldd);
+  if (r != cudaSuccess) {
+    std::cerr << "GEMM kernel failed: " << cudaGetErrorString(r) << std::endl;
+    cudaFree(dA); cudaFree(dB); cudaFree(dsA); cudaFree(dsB); cudaFree(dD);
+    return -1;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && r == cudaSuccess) {
+      kh_benchmark([&]() { Fp4UltraGemm(M, N, K, alpha, dA, lda, dsA, k_groups, dB, ldb, dsB, k_groups, beta, dD, ldd); }, _kh_trials);
+    }
+  }
+
+
+  std::vector<__nv_bfloat16> hD(M * N);
+  CUDA_CHECK(cudaMemcpy(hD.data(), dD, M * N * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+  cudaFree(dA); cudaFree(dB); cudaFree(dsA); cudaFree(dsB); cudaFree(dD);
+
+  std::vector<float> fD(M * N), fRef(M * N, 0);
+  for (int i = 0; i < M * N; ++i) fD[i] = __bfloat162float(hD[i]);
+  reference(M, N, K, alpha, fA, lda, sA, k_groups, fB, ldb, sB, k_groups, beta, fRef, ldd);
+
+  float max_rel_diff = 0; int mismatches = 0;
+  for (int idx = 0; idx < M * N; ++idx) {
+    float diff = std::fabs(fD[idx] - fRef[idx]);
+    float denom = std::fmax(std::fabs(fRef[idx]), 1e-6f);
+    float rel = diff / denom;
+    max_rel_diff = std::fmax(max_rel_diff, rel);
+    if (rel > 0.3f) mismatches++;
+  }
+  float mismatch_rate = float(mismatches) / float(M * N);
+  if (mismatch_rate > 0.01f) {
+    std::cerr << "Results incorrect. Max relative diff: " << max_rel_diff
+              << ", mismatch rate: " << mismatch_rate << std::endl;
+    return -1;
+  }
+  std::cout << "Passed." << std::endl;
+  return 0;
+}
+```

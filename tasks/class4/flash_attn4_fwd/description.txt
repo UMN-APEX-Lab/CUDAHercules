@@ -1,0 +1,92 @@
+# Task: flash_attn4_fwd (Class 4 — Unsolved)
+
+Implement FlashAttention-4 forward pass using CUDA/PTX code for NVIDIA
+Blackwell (SM100) GPUs, WITHOUT using CuTe DSL. CUTLASS C++ headers are allowed.
+
+## Background
+
+FlashAttention-4 (Dao et al., 2025) achieves 1613 TFLOPS (71% utilization) on B200
+GPUs by co-designing algorithms and kernel pipelines for Blackwell's asymmetric
+hardware scaling. The official implementation uses CuTe DSL (a Python-embedded GPU
+programming framework). No hand-written CUDA implementation exists.
+
+## Challenge
+
+Write a pure CUDA/PTX kernel implementing FA4's forward pass. This requires:
+
+### 1. Conditional Softmax Rescaling
+Standard FlashAttention rescales the running output O every tile. FA4 only
+rescales when the new row-max exceeds the old by a threshold τ = log₂(256) = 8.0,
+skipping ~90% of rescaling operations. The final normalization corrects any
+intermediate drift.
+
+### 2. Software Exponential Emulation
+Blackwell's MUFU.EX2 unit is a throughput bottleneck (shared with tensor cores).
+FA4 uses a degree-3 polynomial approximation of 2^x on FMA units for the
+majority of softmax entries, reserving hardware exp2 only for the ~10-25% of
+entries that need higher precision. Max relative error: 8.8×10⁻⁵ at FP32.
+
+### 3. Warp-Specialized Pipelining
+Five distinct warp roles execute concurrently:
+- **Load warps**: TMA bulk copies (Q/K/V → shared memory)
+- **MMA warps**: Tensor core WGMMA (S = Q·Kᵀ, O = P·V) via tcgen05.mma
+- **Softmax warps**: Online softmax with conditional rescaling
+- **Correction warps**: Output rescaling via tensor memory (TMEM)
+- **Epilogue warps**: TMA store (O → global memory)
+
+### 4. Blackwell-Specific Hardware Features
+- **Tensor Memory (TMEM)**: 256KB programmer-managed L1 for accumulators
+- **tcgen05.mma**: Fully asynchronous 128×128 MMA with TMEM output
+- **TMA**: Tensor Memory Accelerator for bulk async transfers
+- **2-CTA MMA mode**: Paired CTAs sharing MMA resources
+
+## Function Signature
+
+```c
+extern "C" void flash_attn4_fwd(
+    const __nv_bfloat16* Q,   // [batch, seqlen_q, num_heads, head_dim]
+    const __nv_bfloat16* K,   // [batch, seqlen_k, num_heads_k, head_dim]
+    const __nv_bfloat16* V,   // [batch, seqlen_k, num_heads_k, head_dim]
+    __nv_bfloat16* O,         // [batch, seqlen_q, num_heads, head_dim]
+    float* LSE,               // [batch, num_heads, seqlen_q] (log-sum-exp)
+    int batch, int seqlen_q, int seqlen_k,
+    int num_heads, int num_heads_k, int head_dim,
+    float softmax_scale,
+    bool is_causal,
+    cudaStream_t stream
+);
+```
+
+## Supported Configurations
+
+- **Precision**: BF16
+- **Head dimensions**: 64, 128, 256
+- **Sequence lengths**: 1K, 4K, 8K, 16K, 32K
+- **Causal / non-causal**
+- **GQA**: num_heads_k may differ from num_heads
+
+## Metrics
+
+- **Correctness**: |O_custom - O_ref| < atol=1e-2, rtol=1e-2 (BF16 precision)
+- **Performance**: TFLOPS achieved vs. FA4 CuTe DSL baseline
+
+## Reference Materials
+
+- `FlashAttention4.pdf` — Full paper with algorithm details
+- `reference/flash_fwd_sm100.py` — Official CuTe DSL forward kernel (2842 lines)
+- `reference/softmax.py` — Conditional rescaling softmax implementation
+- `reference/blackwell_helpers.py` — PTX assembly for TMA, WGMMA, TMEM
+- `reference/fast_math.py` — Software exp2 polynomial approximation
+
+## Hardware Requirements
+
+- **GPU**: NVIDIA B200 / GB200 (SM100, compute capability 10.0)
+- **CUDA**: 13.0+
+
+## Why Class 4
+
+This task is classified as "unsolved" because:
+1. No hand-written CUDA implementation of FA4 exists — only CuTe DSL
+2. Even the Triton team abandoned writing Blackwell attention kernels
+3. Requires deep understanding of Blackwell's async MMA, TMEM, TMA, and 2-CTA mode
+4. Correct warp specialization scheduling is extremely difficult without CuTe's abstractions

@@ -1,0 +1,49 @@
+# Task: sageattn3_fp4_quant_trans_hdim128
+
+## Target Hardware
+NVIDIA Blackwell GPU (SM120).
+
+## Description
+
+Implement a CUDA kernel for FP4 transposed quantization (for attention V matrix).
+
+This kernel converts FP16 input [B, H, S, D] to transposed packed FP4 [B, H, D, S/2]
+with FP8 E4M3 scale factors. The transpose is done in shared memory for efficiency.
+This layout allows the attention kernel to read V column-wise for the P @ V matmul.
+
+Algorithm:
+  1. Load [BLOCK_SIZE, HEAD_DIM] tile of FP16 values per thread block
+  2. Store to shared memory
+  3. Read back transposed: each thread now handles [D_chunk, BLOCK_SIZE_chunk]
+  4. Compute per-16-element max and FP8 scale factor
+  5. Convert to FP4 E2M1 using PTX cvt.rn.satfinite.e2m1x2.f32
+  6. Write transposed packed output and block-scaled scale factors
+
+Parameters:
+  input:     [2 * 16 * 1024 * 128] float16 -- input V (BHSD layout)
+  output:    [2 * 16 * 128 * 512] uint8 -- transposed packed FP4
+  output_sf: [2 * 16 * 128 * 64] uint8 -- transposed FP8 scales
+  batch_size:  2
+  num_heads:   16
+  num_tokens:  1024
+
+Head dimension: 128
+Sequence length padded to: 1024 (multiple of 128)
+Output layout: transposed [B, H, D, S] for column-wise V access
+Requires: SM120+ (Blackwell)
+
+
+## Function Signature
+
+```c
+void sageattn3_fp4_quant_trans_hdim128(
+    const void* input,
+    void* output,
+    void* output_sf,
+    int batch_size,
+    int num_heads,
+    int num_tokens,
+    cudaStream_t stream
+);
+
+```

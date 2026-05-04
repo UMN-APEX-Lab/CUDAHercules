@@ -1,0 +1,51 @@
+schema_version: 1
+task_id: class2/general/fft_c2c_3d_64x64x64_fp32
+name: fft_c2c_3d_64x64x64_fp32
+task_class: 2
+domain: hpc
+tags:
+- fft
+- c2c
+- fp32
+- 3d
+hardware:
+  min_sm: 80
+  tested_sms:
+  - 80
+  required_features: []
+runner:
+  backend: class2_defpy
+  workdir: tasks/class2/general/fft_c2c_3d_64x64x64_fp32
+  timeout_sec: 300
+  env: {}
+  solution_file: solution.cu
+build:
+  cmd: ''
+  clean_cmd: ''
+execute:
+  cmd: ''
+  success:
+    exit_code: 0
+    stdout_regex: ''
+correctness:
+  mode: tensor_compare
+  tolerances:
+    atol: 0.001
+    rtol: 0.001
+performance:
+  enabled: true
+  parser: {}
+  metric: speedup_ref_over_sol
+source:
+  repo: NVIDIA/CUDALibrarySamples
+  files: []
+  commit: ''
+  license: Apache-2.0
+anti_cheat:
+  blocked_patterns:
+  - '#include\s*[<\"]cufft'
+  - cufftExec
+  - cufftPlan
+  required_patterns:
+  - __global__\s+void
+  - <<<.*>>>

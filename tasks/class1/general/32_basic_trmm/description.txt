@@ -1,0 +1,54 @@
+# Task: 32_basic_trmm
+
+Double-precision Triangular Matrix Multiply (TRMM), column-major layout.
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+
+cudaError_t Dtrmm(
+    int M, int N,
+    double alpha,
+    double const *A, int lda,
+    double const *B, int ldb,
+    double *C, int ldc);
+```
+
+## Operation
+
+C = alpha * A * B
+
+Where:
+- A is M x M, lower-triangular (upper triangle is zero)
+- B is M x N
+- C is M x N
+
+## Data Types
+
+All matrices are `double` (FP64).
+
+## Memory Layout
+
+All matrices are **column-major**:
+- A: Element (i,k) at `A[i + k * lda]`.  lda >= M.  Only lower triangle (i >= k) is non-zero.
+- B: Element (k,j) at `B[k + j * ldb]`.  ldb >= M.
+- C: Element (i,j) at `C[i + j * ldc]`.  ldc >= M.
+
+## Build & Test
+
+```bash
+make test                    # requires solution.h in task directory
+./test                       # default: runs small/medium/large sizes
+./test 1024 1024             # custom single size: M N
+./test 1024 1024 1.0 20     # M N alpha iterations
+```
+
+Correctness is verified against a reference implementation at multiple problem sizes
+(small: M=N=1024, medium: M=N=4096, large: M=4096 N=8192).
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

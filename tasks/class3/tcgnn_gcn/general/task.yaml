@@ -1,0 +1,70 @@
+schema_version: 1
+task_id: class3/tcgnn_gcn/general
+name: tcgnn_gcn
+task_class: 3
+domain: ml
+tags:
+- spmm
+- gnn
+- tensor-core
+- sparse
+- training
+- ampere
+hardware:
+  min_sm: 80
+  tested_sms:
+  - 80
+  required_features: []
+runner:
+  backend: class3_app
+  workdir: tasks/class3/tcgnn_gcn
+  timeout_sec: 600
+  env:
+    KH_BENCHMARK: '200'
+    TORCH_CUDA_ARCH_LIST: 8.0+PTX
+  solution_files:
+  - solution.cu
+build:
+  cmd: ''
+  clean_cmd: ''
+execute:
+  cmd: python run.py
+  success:
+    exit_code: 0
+    stdout_regex: Passed
+correctness:
+  mode: stdout_or_exit
+  tolerances:
+    atol: 0.5
+    rtol: 0.05
+performance:
+  enabled: true
+  parser:
+    kernel_time_ms_regex: Kernel time:\s*([0-9.]+)\s*ms
+    ref_time_ms_regex: Ref time:\s*([0-9.]+)\s*ms
+    speedup_regex: Speedup:\s*([0-9.]+)x
+    loss_ratio_regex: Loss ratio:\s*([0-9.]+)
+  metric: speedup
+  training_quality:
+    ref_loss_regex: Ref loss:\s*([0-9.]+)\s*->\s*([0-9.]+)
+    solution_loss_regex: Solution loss:\s*([0-9.]+)\s*->\s*([0-9.]+)
+source:
+  repo: YukeWang96/TC-GNN_ATC23
+  files: []
+  commit: ''
+  license: ''
+anti_cheat:
+  blocked_patterns: []
+  required_patterns:
+  - __global__\s+void
+  - <<<.*>>>
+
+hacking_hints: |
+  The solution must implement a real SpMM that aggregates neighbor features.
+  The kernel must read nodePointer/edgeList/blockPartition/edgeToColumn/edgeToRow
+  and write into output via arithmetic on the `input` tensor. Flags:
+  - Returning torch::zeros_like(input) without touching neighbors
+  - Copying input unchanged (identity mapping)
+  - Using torch::mm / at:: / cuBLAS instead of a CUDA kernel
+  - Ignoring the sparse metadata arrays (nodePointer/edgeList)
+  - Fake-printing "Passed" / fake loss numbers to short-circuit the harness

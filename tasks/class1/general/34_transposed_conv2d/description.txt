@@ -1,0 +1,56 @@
+# Task: 34_transposed_conv2d
+
+Transposed Conv2D (Deconvolution / Fractionally-Strided Convolution). NHWC layout, half precision input/output.
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+cudaError_t TransposedConv2d(
+    __half const *input, __half const *filter, __half *output,
+    int N, int C, int H, int W, int K, int R, int S,
+    int pad_h, int pad_w, int stride_h, int stride_w);
+```
+
+## Operation
+
+output[n][h_out][w_out][k] = sum_{c,r,s} input[n][h][w][c] * filter[c][r][s][k]
+
+Where:
+- h_out = h * stride_h + r - pad_h  (scatter from input to output)
+- w_out = w * stride_w + s - pad_w
+
+Equivalently, gathering into each output pixel:
+- h = (h_out - r + pad_h) / stride_h  (only valid when divisible)
+- w = (w_out - s + pad_w) / stride_w
+
+Output size: H_out = (H-1)*stride_h + R - 2*pad_h, W_out = (W-1)*stride_w + S - 2*pad_w
+
+## Data Types
+
+All tensors are `__half` (FP16). Use FP32 accumulation internally for numerical stability.
+
+## Memory Layout
+
+All tensors are **NHWC** (channels-last):
+- input:  Element (n,h,w,c) at `input[((n*H + h)*W + w)*C + c]`
+- filter: Element (c,r,s,k) at `filter[((c*R + r)*S + s)*K + k]`  (CRSK layout)
+- output: Element (n,h_out,w_out,k) at `output[((n*H_out + h_out)*W_out + w_out)*K + k]`
+
+## Build & Test
+
+```bash
+make test                    # requires solution.h in task directory
+./test                       # default: runs small/medium/large sizes
+```
+
+Correctness is verified against a CUTLASS reference implementation at multiple problem sizes
+(small: N=1 H=W=56 C=K=64, medium: N=1 H=W=112 C=K=128, large: N=4 H=W=56 C=K=256).
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

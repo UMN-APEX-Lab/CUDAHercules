@@ -1,0 +1,178 @@
+# Task: 81_blackwell_gemm_blockwise
+
+## Target Hardware
+NVIDIA Blackwell GPU (SM100/SM120).
+
+
+Blackwell SM100 blockwise-scaled GEMM test harness — FP8 data, float scales
+Based on CUTLASS example 81_blackwell_gemm_blockwise
+The LLM must implement:
+  cudaError_t BlackwellBlockwiseGemm(int M, int N, int K, float alpha,
+      __nv_fp8_e4m3 const *A, int lda, float const *scale_A,
+      __nv_fp8_e4m3 const *B, int ldb, float const *scale_B,
+      float beta, __nv_fp8_e4m3 *D, int ldd, int block_size);
+A is row-major [M, K] (lda = K) in FP8 E4M3, B is column-major [K, N] (ldb = K) in FP8 E4M3,
+D is column-major [M, N] (ldd = M) in FP8 E4M3.
+scale_A: [M, ceil(K/block_size)] per-block scale factors for A rows.
+scale_B: [N, ceil(K/block_size)] per-block scale factors for B columns.
+block_size determines the granularity of scaling along the K dimension.
+Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
+         -gencode arch=compute_100a,code=sm_100a harness.cu solution.cu -o test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * Blackwell SM100 blockwise-scaled GEMM test harness — FP8 data, float scales
+ * Based on CUTLASS example 81_blackwell_gemm_blockwise
+ *
+ * The LLM must implement:
+ *   cudaError_t BlackwellBlockwiseGemm(int M, int N, int K, float alpha,
+ *       __nv_fp8_e4m3 const *A, int lda, float const *scale_A,
+ *       __nv_fp8_e4m3 const *B, int ldb, float const *scale_B,
+ *       float beta, __nv_fp8_e4m3 *D, int ldd, int block_size);
+ *
+ * A is row-major [M, K] (lda = K) in FP8 E4M3, B is column-major [K, N] (ldb = K) in FP8 E4M3,
+ * D is column-major [M, N] (ldd = M) in FP8 E4M3.
+ * scale_A: [M, ceil(K/block_size)] per-block scale factors for A rows.
+ * scale_B: [N, ceil(K/block_size)] per-block scale factors for B columns.
+ * block_size determines the granularity of scaling along the K dimension.
+ *
+ * Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
+ *          -gencode arch=compute_100a,code=sm_100a harness.cu solution.cu -o test
+ */
+
+#include <iostream>
+#include <sstream>
+#include <vector>
+#include <cmath>
+#include <cuda_fp8.h>
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status)                                              \
+  {                                                                     \
+    cudaError_t error = status;                                         \
+    if (error != cudaSuccess) {                                         \
+      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
+                << " at line: " << __LINE__ << std::endl;               \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
+  }
+
+extern cudaError_t BlackwellBlockwiseGemm(
+  int M, int N, int K, float alpha,
+  __nv_fp8_e4m3 const *A, int lda, float const *scale_A,
+  __nv_fp8_e4m3 const *B, int ldb, float const *scale_B,
+  float beta, __nv_fp8_e4m3 *D, int ldd,
+  int block_size);
+
+/// CPU reference: dequantize FP8 with block scales, then standard GEMM
+/// A row-major, B col-major, D col-major
+void reference(int M, int N, int K, float alpha,
+  std::vector<float> const &fA, int lda,
+  std::vector<float> const &sA,
+  std::vector<float> const &fB, int ldb,
+  std::vector<float> const &sB,
+  float beta,
+  std::vector<float> &D, int ldd,
+  int block_size) {
+  int k_blocks = (K + block_size - 1) / block_size;
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      float acc = 0;
+      for (int k = 0; k < K; ++k) {
+        int kb = k / block_size;
+        float a_val = fA[i * lda + k] * sA[i * k_blocks + kb];
+        float b_val = fB[k + j * ldb] * sB[j * k_blocks + kb];
+        acc += a_val * b_val;
+      }
+      D[i + j * ldd] = alpha * acc + beta * D[i + j * ldd];
+    }
+}
+
+int main(int argc, const char *arg[]) {
+  int M = 256, N = 256, K = 256;
+  int block_size = 128;
+  for (int i = 1; i < argc && i < 4; ++i) {
+    std::stringstream ss(arg[i]);
+    if (i == 1) ss >> M;
+    else if (i == 2) ss >> N;
+    else if (i == 3) ss >> K;
+  }
+
+  int lda = K, ldb = K, ldd = M;
+  float alpha = 1.0f, beta = 0.0f;
+
+  int k_blocks = (K + block_size - 1) / block_size;
+  int sA_count = M * k_blocks;
+  int sB_count = N * k_blocks;
+
+  // Generate FP8 inputs on host
+  std::vector<float> fA_raw(M * K), fB_raw(K * N);
+  for (int i = 0; i < M * K; ++i) fA_raw[i] = float((i * 16807 % 8) - 4) * 0.25f;
+  for (int i = 0; i < K * N; ++i) fB_raw[i] = float((i * 48271 % 8) - 4) * 0.25f;
+
+  std::vector<__nv_fp8_e4m3> hA(M * K), hB(K * N);
+  std::vector<float> fA(M * K), fB(K * N);
+  for (int i = 0; i < M * K; ++i) { hA[i] = __nv_fp8_e4m3(fA_raw[i]); fA[i] = float(hA[i]); }
+  for (int i = 0; i < K * N; ++i) { hB[i] = __nv_fp8_e4m3(fB_raw[i]); fB[i] = float(hB[i]); }
+
+  std::vector<float> sA(sA_count, 1.0f), sB(sB_count, 1.0f);
+
+  __nv_fp8_e4m3 *dA, *dB, *dD;
+  float *dsA, *dsB;
+  CUDA_CHECK(cudaMalloc(&dA, M * K * sizeof(__nv_fp8_e4m3)));
+  CUDA_CHECK(cudaMalloc(&dB, K * N * sizeof(__nv_fp8_e4m3)));
+  CUDA_CHECK(cudaMalloc(&dD, M * N * sizeof(__nv_fp8_e4m3)));
+  CUDA_CHECK(cudaMalloc(&dsA, sA_count * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&dsB, sB_count * sizeof(float)));
+
+  CUDA_CHECK(cudaMemcpy(dA, hA.data(), M * K * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB, hB.data(), K * N * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsA, sA.data(), sA_count * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsB, sB.data(), sB_count * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(dD, 0, M * N * sizeof(__nv_fp8_e4m3)));
+
+  cudaError_t r = BlackwellBlockwiseGemm(
+    M, N, K, alpha, dA, lda, dsA, dB, ldb, dsB, beta, dD, ldd, block_size);
+  if (r != cudaSuccess) {
+    std::cerr << "BlackwellBlockwiseGemm failed: " << cudaGetErrorString(r) << std::endl;
+    cudaFree(dA); cudaFree(dB); cudaFree(dD); cudaFree(dsA); cudaFree(dsB);
+    return -1;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && r == cudaSuccess) {
+      kh_benchmark([&]() { BlackwellBlockwiseGemm(
+    M, N, K, alpha, dA, lda, dsA, dB, ldb, dsB, beta, dD, ldd, block_size); }, _kh_trials);
+    }
+  }
+
+
+  std::vector<__nv_fp8_e4m3> hD(M * N);
+  CUDA_CHECK(cudaMemcpy(hD.data(), dD, M * N * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost));
+  cudaFree(dA); cudaFree(dB); cudaFree(dD); cudaFree(dsA); cudaFree(dsB);
+
+  std::vector<float> fD(M * N), fRef(M * N, 0);
+  for (int i = 0; i < M * N; ++i) fD[i] = float(hD[i]);
+  reference(M, N, K, alpha, fA, lda, sA, fB, ldb, sB, beta, fRef, ldd, block_size);
+
+  float max_diff = 0;
+  for (int i = 0; i < M * N; ++i)
+    max_diff = fmaxf(max_diff, fabsf(fD[i] - fRef[i]));
+  // FP8 blockwise scaling: generous tolerance due to narrow precision
+  if (max_diff > 16.0f) {
+    std::cerr << "Results incorrect. Max diff: " << max_diff << std::endl;
+    return -1;
+  }
+  std::cout << "Passed." << std::endl;
+  return 0;
+}
+```

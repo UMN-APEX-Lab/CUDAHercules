@@ -1,0 +1,56 @@
+# Task: 20_simt_canonical
+
+Single-precision General Matrix Multiply (SGEMM) with mixed memory layouts.
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+
+cudaError_t SimtCanonicalGemm(
+    int M, int N, int K, float alpha,
+    float const *A, int lda,
+    float const *B, int ldb,
+    float beta,
+    float const *C, int ldc,
+    float *D, int ldd);
+```
+
+## Operation
+
+D = alpha * A * B + beta * C
+
+Where:
+- A is M x K
+- B is K x N
+- C is M x N (bias/input)
+- D is M x N (output)
+
+## Data Types
+
+All matrices are `float` (FP32).
+
+## Memory Layout
+
+- A: **row-major**. Element (i,k) at `A[i * lda + k]`. lda >= K.
+- B: **column-major**. Element (k,j) at `B[k + j * ldb]`. ldb >= K.
+- C: **row-major**. Element (i,j) at `C[i * ldc + j]`. ldc >= N.
+- D: **row-major**. Element (i,j) at `D[i * ldd + j]`. ldd >= N.
+
+## Build & Test
+
+```bash
+make test                    # requires solution.h in task directory
+./test                       # default: runs small/medium/large sizes
+./test 1024 1024 1024        # custom single size: M N K
+./test 1024 1024 1024 1.0 0.0 20  # M N K alpha beta iterations
+```
+
+Correctness is verified against a reference implementation at multiple problem sizes
+(small: 1024x1024x1024, medium: 4096x4096x4096, large: 8192x8192x8192).
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

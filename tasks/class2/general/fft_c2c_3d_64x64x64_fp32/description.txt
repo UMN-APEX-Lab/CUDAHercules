@@ -1,0 +1,35 @@
+# Task: fft_c2c_3d_64x64x64_fp32
+
+## Description
+
+Implement a CUDA kernel for 3D Complex-to-Complex FFT (forward transform).
+
+Parameters:
+  input:  [1 * 262144 * 2] float32 -- complex input (interleaved real/imag)
+  output: [1 * 262144 * 2] float32 -- complex output (interleaved real/imag)
+  N:          262144 -- total elements per batch (product of dimensions)
+  batch_size: 1
+  inverse:    0 for forward FFT
+
+Dimensions: 64x64x64
+Data type: float32
+
+The forward DFT is defined as:
+  X[k] = sum_{n=0}^{N-1} x[n] * exp(-2*pi*i*k*n/N)
+
+Each batch element is an independent 3D FFT.
+
+
+## Function Signature
+
+```c
+void launch_fft_c2c_3d_64x64x64_fp32(
+    const void* input,
+    void* output,
+    int N,
+    int batch_size,
+    int inverse,
+    cudaStream_t stream
+);
+
+```

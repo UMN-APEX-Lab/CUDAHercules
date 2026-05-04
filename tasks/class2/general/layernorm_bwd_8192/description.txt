@@ -1,0 +1,40 @@
+# Task: layernorm_bwd_8192
+
+## Description
+
+Implement a CUDA kernel for LayerNorm backward pass.
+
+Given upstream gradient dz, saved input x, mean mu, reciprocal std rs, and weight gamma:
+
+Per-row (data gradient):
+  x_hat[i,j] = (x[i,j] - mu[i]) * rs[i]
+  dz_gamma[i,j] = dz[i,j] * gamma[j]
+  ds[i] = sum_j(dz_gamma[i,j] * x_hat[i,j])
+  db[i] = sum_j(dz_gamma[i,j])
+  dx[i,j] = rs[i] * (dz_gamma[i,j] - (ds[i] * x_hat[i,j] + db[i]) / cols)
+
+Per-column (weight gradients):
+  dgamma[j] = sum_i(dz[i,j] * x_hat[i,j])
+  dbeta[j] = sum_i(dz[i,j])
+
+Dimensions: rows=16384, cols=8192
+
+
+## Function Signature
+
+```c
+void launch_layernorm_backward(
+    const float* dz,      // [rows, cols] upstream gradient
+    const float* x,       // [rows, cols] saved input from forward
+    const float* mu,      // [rows] saved mean
+    const float* rs,      // [rows] saved reciprocal std
+    const float* gamma,   // [cols] scale weight
+    float* dx,            // [rows, cols] gradient w.r.t. input
+    float* dgamma,        // [cols] gradient w.r.t. gamma
+    float* dbeta,         // [cols] gradient w.r.t. beta
+    int rows,
+    int cols,
+    cudaStream_t stream
+);
+
+```

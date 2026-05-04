@@ -1,0 +1,80 @@
+# Task: cuszp (Hopper)
+
+Optimize GPU error-bounded lossy compression and decompression throughput
+across all data dimensions (1D, 2D, 3D) and precisions (float32, float64),
+leveraging Hopper (SM90) architecture features.
+
+## Goal
+
+Maximize compression and decompression throughput (GB/s) for scientific
+floating-point data while maintaining the error bound guarantee: every
+decompressed value must be within the specified tolerance of the original.
+
+You should exploit Hopper-generation GPU features where applicable:
+- **TMA (Tensor Memory Accelerator)**: Use `cp.async.bulk` / TMA descriptors
+  for high-throughput bulk data movement during compress and decompress passes,
+  replacing manual global-to-shared copies with hardware-accelerated transfers
+- **Warp specialization**: Separate producer warps (loading raw data / compressed
+  bitstreams) from consumer warps (quantization, delta encoding, bit-packing)
+  to overlap data movement with computation
+- **Asynchronous pipelines**: Multi-stage `cp.async.bulk` pipelines to keep
+  shared memory buffers filled while processing previous tiles, hiding global
+  memory latency across the compress/decompress pipeline stages
+- **Thread Block Clusters**: Coordinate adjacent thread blocks to share
+  intermediate quantization/delta state via distributed shared memory,
+  reducing redundant global memory accesses at tile boundaries
+- **Asynchronous barriers**: `cp.async.mbarrier` for fine-grained
+  producer-consumer synchronization within the multi-stage pipeline
+
+## Variants
+
+Six kernel files cover all dimension/precision combinations:
+- **1D float32** (cuSZp_kernels_1D_f32.cu) — linear data compression
+- **1D float64** (cuSZp_kernels_1D_f64.cu) — linear data, double precision
+- **2D float32** (cuSZp_kernels_2D_f32.cu) — 2D-blocked spatial compression
+- **2D float64** (cuSZp_kernels_2D_f64.cu) — 2D-blocked, double precision
+- **3D float32** (cuSZp_kernels_3D_f32.cu) — 3D-blocked spatial compression
+- **3D float64** (cuSZp_kernels_3D_f64.cu) — 3D-blocked, double precision
+
+Each variant has three encoding modes:
+1. **Fixed** — direct quantization without delta encoding
+2. **Plain** — sequential delta encoding with fixed-length bit packing
+3. **Outlier** — delta encoding with separate outlier preservation
+
+## Error Bounds
+
+Three relative error bound levels are tested (following cuSZp SC'23/SC'24/SC'25):
+- **REL 1E-2** (loose) — abs eb = 0.4 for value range [-20, 20]
+- **REL 1E-3** (moderate) — abs eb = 0.04
+- **REL 1E-4** (strict) — abs eb = 0.004
+
+Each kernel must satisfy the error bound: max |original - decompressed| <= eb.
+Correctness is checked per-kernel per-error-bound.
+
+## Workload
+
+- **Float32**: 2 GB (512M elements), tested as 1D, 2D (512x1024x1024), 3D (512x512x2048)
+- **Float64**: 2 GB (256M elements), tested as 1D, 2D (256x1024x1024), 3D (256x512x2048)
+- **Total**: 54 test cases (6 variants x 3 modes x 3 error bounds = 108 kernel calls)
+
+## Metrics
+
+Per-kernel metrics reported:
+- **Correctness**: error count, max_error, error_bound, err_ratio (max_error/error_bound)
+- **Performance**: compress_ms, decompress_ms, compress throughput (GB/s), decompress throughput (GB/s)
+- **Compression ratio**: original size / compressed size
+
+Aggregate metrics:
+- **Kernel time**: Sum of all 108 kernel operations
+- **Pass rate**: Number of kernels satisfying error bound / total
+
+## Solution Files
+
+Six kernel files in `src/`, each containing 6 GPU kernels (3 compress + 3 decompress).
+Kernel signatures are defined in the corresponding header files under `include/cuSZp/`.
+
+## Build & Run
+
+```bash
+python run.py
+```

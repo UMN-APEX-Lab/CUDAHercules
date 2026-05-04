@@ -1,0 +1,53 @@
+# Task: sageattn3_fp4_quant_hdim128
+
+## Target Hardware
+NVIDIA Blackwell GPU (SM120).
+
+## Description
+
+Implement a CUDA kernel for FP4 (NVFP4 E2M1) quantization with block-scaled scale factors.
+
+This is a SageAttention v3 quantization kernel that converts FP16 input to packed FP4
+(E2M1 format) with per-16-element FP8 (E4M3) scale factors.
+
+Algorithm:
+  1. Load 16 consecutive FP16 elements per thread group
+  2. Compute max absolute value across the 16 elements
+  3. Compute FP8 E4M3 scale factor: scale = max_abs / 6.0
+  4. Scale input: x_scaled = x * (1.0 / scale)
+  5. Convert to FP4 E2M1 using PTX: cvt.rn.satfinite.e2m1x2.f32
+  6. Pack two FP4 values per byte (uint8 output)
+  7. Write scale factors in block-scaled layout for SM120 MMA consumption
+
+Block-scaled layout for scale factors (per 64-token super-block):
+  offset = (col_id / 4) * 256 + (col_id % 4) + (token_id_local / 16) * 4 + (token_id_local % 16) * 16
+  where token_id_local = token_id % 64, col_id = head_dim_offset / 16
+
+Parameters:
+  input:     [2 * 16 * 1024 * 128] float16 -- input tensor (BHSD layout)
+  output:    [2 * 16 * 1024 * 64] uint8 -- packed FP4 output
+  output_sf: [2 * 16 * 1024 * 8] uint8 -- FP8 E4M3 scale factors (block-scaled layout)
+  batch_size:  2
+  num_heads:   16
+  num_tokens:  1024
+
+Head dimension: 128
+Quantization: per-16-element blocks, NVFP4 E2M1 format
+Scale factors: FP8 E4M3 in SM120 block-scaled layout
+Requires: SM120+ (Blackwell) for cvt.rn.satfinite.e2m1x2.f32 PTX instruction
+
+
+## Function Signature
+
+```c
+void sageattn3_fp4_quant_hdim128(
+    const void* input,
+    void* output,
+    void* output_sf,
+    int batch_size,
+    int num_heads,
+    int num_tokens,
+    cudaStream_t stream
+);
+
+```

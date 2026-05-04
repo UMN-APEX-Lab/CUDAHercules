@@ -1,0 +1,100 @@
+# Task: 50_hopper_gemm_with_epilogue_swizzle
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+Hopper GEMM with Epilogue Swizzle test harness — half precision
+Extracted from CUTLASS example 50
+The LLM must implement:
+  cudaError_t HopperEpilogueSwizzleGemm(
+      int M, int N, int K, float alpha,
+      __half const *A, int lda,
+      __half const *B, int ldb,
+      float beta,
+      __half *D, int ldd);
+Row-major A, column-major B, column-major D.
+Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * Hopper GEMM with Epilogue Swizzle test harness — half precision
+ * Extracted from CUTLASS example 50
+ *
+ * The LLM must implement:
+ *   cudaError_t HopperEpilogueSwizzleGemm(
+ *       int M, int N, int K, float alpha,
+ *       __half const *A, int lda,
+ *       __half const *B, int ldb,
+ *       float beta,
+ *       __half *D, int ldd);
+ *
+ * Row-major A, column-major B, column-major D.
+ * Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+ */
+
+#include <cuda_fp16.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status) { cudaError_t e = status; if (e != cudaSuccess) { std::cerr << "CUDA error: " << cudaGetErrorString(e) << " at line " << __LINE__ << std::endl; exit(EXIT_FAILURE); } }
+
+extern cudaError_t HopperEpilogueSwizzleGemm(
+  int M, int N, int K, float alpha,
+  __half const *A, int lda, __half const *B, int ldb,
+  float beta, __half *D, int ldd);
+
+void reference(int M, int N, int K, float alpha,
+  std::vector<float> const &A, int lda, std::vector<float> const &B, int ldb,
+  float beta, std::vector<float> &D, int ldd) {
+  for (int j=0;j<N;++j) for (int i=0;i<M;++i) {
+    float acc=0;
+    for (int k=0;k<K;++k) acc+=A[i*lda+k]*B[k+j*ldb];
+    D[i+j*ldd]=alpha*acc+beta*D[i+j*ldd];
+  }
+}
+
+int main() {
+  int M=1024,N=1024,K=512; int lda=K,ldb=K,ldd=M;
+  float alpha=1.0f,beta=0.0f;
+  int cA=M*K,cB=K*N,cD=M*N;
+  std::vector<float> fA(cA),fB(cB),fD(cD,0),fRef(cD,0);
+  for (int i=0;i<cA;++i) fA[i]=float((i*16807%16)-8)*0.01f;
+  for (int i=0;i<cB;++i) fB[i]=float((i*48271%16)-8)*0.01f;
+  std::vector<__half> hA(cA),hB(cB),hD(cD);
+  for (int i=0;i<cA;++i) hA[i]=__float2half(fA[i]);
+  for (int i=0;i<cB;++i) hB[i]=__float2half(fB[i]);
+  __half *dA,*dB,*dD;
+  CUDA_CHECK(cudaMalloc(&dA,cA*sizeof(__half))); CUDA_CHECK(cudaMalloc(&dB,cB*sizeof(__half))); CUDA_CHECK(cudaMalloc(&dD,cD*sizeof(__half)));
+  CUDA_CHECK(cudaMemcpy(dA,hA.data(),cA*sizeof(__half),cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB,hB.data(),cB*sizeof(__half),cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(dD,0,cD*sizeof(__half)));
+  cudaError_t r = HopperEpilogueSwizzleGemm(M,N,K,alpha,dA,lda,dB,ldb,beta,dD,ldd);
+  if (r!=cudaSuccess) { std::cerr<<"Failed\n"; return -1; }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && r == cudaSuccess) {
+      kh_benchmark([&]() { HopperEpilogueSwizzleGemm(M,N,K,alpha,dA,lda,dB,ldb,beta,dD,ldd); }, _kh_trials);
+    }
+  }
+
+  CUDA_CHECK(cudaMemcpy(hD.data(),dD,cD*sizeof(__half),cudaMemcpyDeviceToHost));
+  cudaFree(dA);cudaFree(dB);cudaFree(dD);
+  for (int i=0;i<cD;++i) fD[i]=__half2float(hD[i]);
+  reference(M,N,K,alpha,fA,lda,fB,ldb,beta,fRef,ldd);
+  float md=0; for (int i=0;i<cD;++i) md=fmaxf(md,fabsf(fD[i]-fRef[i]));
+  if (md>1.0f) { std::cerr<<"Results incorrect. Max diff: "<<md<<std::endl; return -1; }
+  std::cout<<"Passed."<<std::endl; return 0;
+}
+```

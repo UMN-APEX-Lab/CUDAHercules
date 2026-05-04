@@ -1,0 +1,48 @@
+# Task: tk_based
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+Based Linear Attention on H100, matching ThunderKittens performance.
+
+Based uses Taylor-expansion feature maps for linear attention with KV state accumulation.
+D_QK=16 (query/key dim), D_VO=64 (value/output dim), both hardcoded.
+
+## Function Signature
+
+Implement in solution.h:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
+void BasedLinearAttention(
+    __nv_bfloat16 *Q, __nv_bfloat16 *K, __nv_bfloat16 *V, __nv_bfloat16 *O,
+    int B, int H, int N);
+```
+
+## Operation
+
+Linear attention with second-order Taylor expansion feature maps:
+- phi(x) = [1, x, x^2/sqrt(2)] (feature map)
+- KV state accumulation across sequence
+- O[b,h,n,:] = attention output at position n
+
+Where:
+- Q: [B, H, N, 16] bf16 queries
+- K: [B, H, N, 16] bf16 keys
+- V: [B, H, N, 64] bf16 values
+- O: [B, H, N, 64] bf16 output
+
+## Build & Test
+
+```bash
+conda activate attn
+python gentests.py randn     # generates test data
+make test
+./test randn.txt
+```
+
+Requires H100 GPU (SM90a). ThunderKittens headers on include path.

@@ -1,0 +1,177 @@
+# Task: 77_blackwell_fmha
+
+## Target Hardware
+NVIDIA Blackwell GPU (SM100/SM120).
+
+
+Blackwell SM100 Fused Multi-Head Attention test harness — half precision
+Based on CUTLASS example 77_blackwell_fmha
+The LLM must implement:
+  cudaError_t BlackwellFmha(int batch, int num_heads, int seq_q, int seq_k,
+      int head_dim, __half const *Q, __half const *K, __half const *V,
+      __half *O);
+Q: [batch, num_heads, seq_q, head_dim] row-major
+K: [batch, num_heads, seq_k, head_dim] row-major
+V: [batch, num_heads, seq_k, head_dim] row-major
+O: [batch, num_heads, seq_q, head_dim] row-major
+O = softmax(Q * K^T / sqrt(head_dim)) * V
+Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
+         -gencode arch=compute_100a,code=sm_100a harness.cu solution.cu -o test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * Blackwell SM100 Fused Multi-Head Attention test harness — half precision
+ * Based on CUTLASS example 77_blackwell_fmha
+ *
+ * The LLM must implement:
+ *   cudaError_t BlackwellFmha(int batch, int num_heads, int seq_q, int seq_k,
+ *       int head_dim, __half const *Q, __half const *K, __half const *V,
+ *       __half *O);
+ *
+ * Q: [batch, num_heads, seq_q, head_dim] row-major
+ * K: [batch, num_heads, seq_k, head_dim] row-major
+ * V: [batch, num_heads, seq_k, head_dim] row-major
+ * O: [batch, num_heads, seq_q, head_dim] row-major
+ *
+ * O = softmax(Q * K^T / sqrt(head_dim)) * V
+ *
+ * Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
+ *          -gencode arch=compute_100a,code=sm_100a harness.cu solution.cu -o test
+ */
+
+#include <cuda_fp16.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status)                                              \
+  {                                                                     \
+    cudaError_t error = status;                                         \
+    if (error != cudaSuccess) {                                         \
+      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
+                << " at line: " << __LINE__ << std::endl;               \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
+  }
+
+extern cudaError_t BlackwellFmha(
+  int batch, int num_heads, int seq_q, int seq_k, int head_dim,
+  __half const *Q, __half const *K, __half const *V, __half *O);
+
+/// CPU reference: standard multi-head attention per head
+void reference_fmha(
+  int batch, int num_heads, int seq_q, int seq_k, int head_dim,
+  std::vector<float> const &Q, std::vector<float> const &K,
+  std::vector<float> const &V, std::vector<float> &O) {
+  float scale = 1.0f / sqrtf((float)head_dim);
+  int q_head_stride = seq_q * head_dim;
+  int k_head_stride = seq_k * head_dim;
+  int q_batch_stride = num_heads * q_head_stride;
+  int k_batch_stride = num_heads * k_head_stride;
+
+  for (int b = 0; b < batch; ++b)
+    for (int h = 0; h < num_heads; ++h) {
+      int q_base = b * q_batch_stride + h * q_head_stride;
+      int k_base = b * k_batch_stride + h * k_head_stride;
+      // S = Q * K^T  [seq_q x seq_k]
+      std::vector<float> S(seq_q * seq_k, 0);
+      for (int i = 0; i < seq_q; ++i)
+        for (int j = 0; j < seq_k; ++j) {
+          float dot = 0;
+          for (int d = 0; d < head_dim; ++d)
+            dot += Q[q_base + i * head_dim + d] * K[k_base + j * head_dim + d];
+          S[i * seq_k + j] = dot * scale;
+        }
+      // Softmax per row
+      for (int i = 0; i < seq_q; ++i) {
+        float max_val = -1e30f;
+        for (int j = 0; j < seq_k; ++j)
+          max_val = fmaxf(max_val, S[i * seq_k + j]);
+        float sum = 0;
+        for (int j = 0; j < seq_k; ++j) {
+          S[i * seq_k + j] = expf(S[i * seq_k + j] - max_val);
+          sum += S[i * seq_k + j];
+        }
+        for (int j = 0; j < seq_k; ++j)
+          S[i * seq_k + j] /= sum;
+      }
+      // O = S * V  [seq_q x head_dim]
+      for (int i = 0; i < seq_q; ++i)
+        for (int d = 0; d < head_dim; ++d) {
+          float acc = 0;
+          for (int j = 0; j < seq_k; ++j)
+            acc += S[i * seq_k + j] * V[k_base + j * head_dim + d];
+          O[q_base + i * head_dim + d] = acc;
+        }
+    }
+}
+
+int main() {
+  int batch = 2, num_heads = 4, seq_q = 64, seq_k = 64, head_dim = 32;
+  int total_q = batch * num_heads * seq_q * head_dim;
+  int total_k = batch * num_heads * seq_k * head_dim;
+
+  std::vector<float> fQ(total_q), fK(total_k), fV(total_k);
+  std::vector<float> fO(total_q, 0), fRef(total_q, 0);
+
+  for (int i = 0; i < total_q; ++i) fQ[i] = float((i * 16807 % 16) - 8) * 0.05f;
+  for (int i = 0; i < total_k; ++i) fK[i] = float((i * 48271 % 16) - 8) * 0.05f;
+  for (int i = 0; i < total_k; ++i) fV[i] = float((i * 12345 % 16) - 8) * 0.05f;
+
+  std::vector<__half> hQ(total_q), hK(total_k), hV(total_k), hO(total_q);
+  for (int i = 0; i < total_q; ++i) hQ[i] = __float2half(fQ[i]);
+  for (int i = 0; i < total_k; ++i) hK[i] = __float2half(fK[i]);
+  for (int i = 0; i < total_k; ++i) hV[i] = __float2half(fV[i]);
+
+  __half *dQ, *dK, *dV, *dO;
+  CUDA_CHECK(cudaMalloc(&dQ, total_q * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dK, total_k * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dV, total_k * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dO, total_q * sizeof(__half)));
+  CUDA_CHECK(cudaMemcpy(dQ, hQ.data(), total_q * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dK, hK.data(), total_k * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dV, hV.data(), total_k * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(dO, 0, total_q * sizeof(__half)));
+
+  cudaError_t r = BlackwellFmha(batch, num_heads, seq_q, seq_k, head_dim, dQ, dK, dV, dO);
+  if (r != cudaSuccess) {
+    std::cerr << "BlackwellFmha failed: " << cudaGetErrorString(r) << std::endl;
+    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
+    return -1;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && r == cudaSuccess) {
+      kh_benchmark([&]() { BlackwellFmha(batch, num_heads, seq_q, seq_k, head_dim, dQ, dK, dV, dO); }, _kh_trials);
+    }
+  }
+
+
+  CUDA_CHECK(cudaMemcpy(hO.data(), dO, total_q * sizeof(__half), cudaMemcpyDeviceToHost));
+  cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
+
+  for (int i = 0; i < total_q; ++i) fO[i] = __half2float(hO[i]);
+  reference_fmha(batch, num_heads, seq_q, seq_k, head_dim, fQ, fK, fV, fRef);
+
+  float max_diff = 0;
+  for (int i = 0; i < total_q; ++i)
+    max_diff = fmaxf(max_diff, fabsf(fO[i] - fRef[i]));
+  // Half precision attention: moderate tolerance
+  if (max_diff > 0.05f) {
+    std::cerr << "Results incorrect. Max diff: " << max_diff << std::endl;
+    return -1;
+  }
+  std::cout << "Passed." << std::endl;
+  return 0;
+}
+```

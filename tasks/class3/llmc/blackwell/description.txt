@@ -1,0 +1,25 @@
+# Task: llmc (Blackwell Black-Box Project Generation)
+
+Generate a complete self-contained CUDA project for GPT-2 124M training on the
+same TinyShakespeare benchmark setup as the reference, targeting Blackwell-era
+GPUs.
+
+This is a fully black-box task. You are generating a project under
+`generated_project/`, not editing upstream `llmc/*.cuh` files.
+
+## Goal
+
+Maximize end-to-end training throughput while maintaining meaningful learning
+behavior on the fixed benchmark setup.
+
+## Blackwell Guidance
+
+Design for SM100+ hardware and exploit Blackwell-friendly implementation
+choices where they improve throughput, memory movement, or kernel fusion.
+
+## Kernel Requirement
+
+Your generated project must include real custom CUDA kernels for the core
+training path, not just a host wrapper around existing libraries.
+
+See `build_contract.md` for the exact project contract.

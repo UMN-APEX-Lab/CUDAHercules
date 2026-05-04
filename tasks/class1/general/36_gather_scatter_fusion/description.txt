@@ -1,0 +1,167 @@
+# Task: 36_gather_scatter_fusion
+
+Gather-Scatter GEMM test harness — half input, float accumulate
+Extracted from CUTLASS example 36_gather_scatter_fusion
+Operation: D[gather_D[i], j] = alpha * sum_k A[gather_A[i], k] * B[k, j] + beta * C[gather_C[i], j]
+Rows of A/C/D are accessed via index arrays (gather for A/C, scatter for D).
+The LLM must implement:
+  cudaError_t GatherScatterGemm(
+      int M, int N, int K, float alpha,
+      __half const *A, int lda, int const *gather_A,
+      __half const *B, int ldb,
+      float beta,
+      float const *C, int ldc, int const *gather_C,
+      float *D, int ldd, int const *scatter_D);
+Row-major layouts. gather_A/gather_C/scatter_D are index arrays of length M.
+Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * Gather-Scatter GEMM test harness — half input, float accumulate
+ * Extracted from CUTLASS example 36_gather_scatter_fusion
+ *
+ * Operation: D[gather_D[i], j] = alpha * sum_k A[gather_A[i], k] * B[k, j] + beta * C[gather_C[i], j]
+ * Rows of A/C/D are accessed via index arrays (gather for A/C, scatter for D).
+ *
+ * The LLM must implement:
+ *   cudaError_t GatherScatterGemm(
+ *       int M, int N, int K, float alpha,
+ *       __half const *A, int lda, int const *gather_A,
+ *       __half const *B, int ldb,
+ *       float beta,
+ *       float const *C, int ldc, int const *gather_C,
+ *       float *D, int ldd, int const *scatter_D);
+ *
+ * Row-major layouts. gather_A/gather_C/scatter_D are index arrays of length M.
+ *
+ * Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+ */
+
+#include <cuda_fp16.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status)                                              \
+  {                                                                     \
+    cudaError_t error = status;                                         \
+    if (error != cudaSuccess) {                                         \
+      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
+                << " at line: " << __LINE__ << std::endl;               \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
+  }
+
+extern cudaError_t GatherScatterGemm(
+  int M, int N, int K, float alpha,
+  __half const *A, int lda, int const *gather_A,
+  __half const *B, int ldb,
+  float beta,
+  float const *C, int ldc, int const *gather_C,
+  float *D, int ldd, int const *scatter_D);
+
+void reference_gather_scatter_gemm(
+  int M, int N, int K, float alpha,
+  std::vector<float> const &A, int lda, std::vector<int> const &gather_A,
+  std::vector<float> const &B, int ldb,
+  float beta,
+  std::vector<float> const &C, int ldc, std::vector<int> const &gather_C,
+  std::vector<float> &D, int ldd, std::vector<int> const &scatter_D) {
+  for (int i = 0; i < M; ++i) {
+    int a_row = gather_A[i];
+    int c_row = gather_C[i];
+    int d_row = scatter_D[i];
+    for (int j = 0; j < N; ++j) {
+      float acc = 0;
+      for (int k = 0; k < K; ++k)
+        acc += A[a_row * lda + k] * B[k * ldb + j];
+      D[d_row * ldd + j] = alpha * acc + beta * C[c_row * ldc + j];
+    }
+  }
+}
+
+int main() {
+  int M = 248, N = 256, K = 256;
+  int A_rows = 512;  // backing store rows
+  int lda = K, ldb = N, ldc = N, ldd = N;
+  float alpha = 1.0f, beta = 0.0f;
+
+  std::vector<int> gather_A(M), gather_C(M), scatter_D(M);
+  for (int i = 0; i < M; ++i) {
+    gather_A[i] = (i * 2) % A_rows;
+    gather_C[i] = i;
+    scatter_D[i] = i;
+  }
+
+  int count_A = A_rows * K, count_B = K * N, count_C = M * N, count_D = M * N;
+  std::vector<float> fA(count_A), fB(count_B), fC(count_C, 0), fD(count_D, 0), fRef(count_D, 0);
+
+  for (int i = 0; i < count_A; ++i) fA[i] = float((i * 16807 % 16) - 8) * 0.01f;
+  for (int i = 0; i < count_B; ++i) fB[i] = float((i * 48271 % 16) - 8) * 0.01f;
+
+  std::vector<__half> hA(count_A), hB(count_B);
+  for (int i = 0; i < count_A; ++i) hA[i] = __float2half(fA[i]);
+  for (int i = 0; i < count_B; ++i) hB[i] = __float2half(fB[i]);
+
+  __half *dA, *dB; float *dC, *dD; int *dGA, *dGC, *dSD;
+  CUDA_CHECK(cudaMalloc(&dA, count_A * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dB, count_B * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dC, count_C * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&dD, count_D * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&dGA, M * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&dGC, M * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&dSD, M * sizeof(int)));
+
+  CUDA_CHECK(cudaMemcpy(dA, hA.data(), count_A * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB, hB.data(), count_B * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(dC, 0, count_C * sizeof(float)));
+  CUDA_CHECK(cudaMemset(dD, 0, count_D * sizeof(float)));
+  CUDA_CHECK(cudaMemcpy(dGA, gather_A.data(), M * sizeof(int), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dGC, gather_C.data(), M * sizeof(int), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dSD, scatter_D.data(), M * sizeof(int), cudaMemcpyHostToDevice));
+
+  cudaError_t result = GatherScatterGemm(M, N, K, alpha, dA, lda, dGA, dB, ldb,
+    beta, dC, ldc, dGC, dD, ldd, dSD);
+  if (result != cudaSuccess) {
+    std::cerr << "GatherScatterGemm failed: " << cudaGetErrorString(result) << std::endl;
+    cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dD);
+    cudaFree(dGA); cudaFree(dGC); cudaFree(dSD);
+    return -1;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && result == cudaSuccess) {
+      kh_benchmark([&]() { GatherScatterGemm(M, N, K, alpha, dA, lda, dGA, dB, ldb,
+    beta, dC, ldc, dGC, dD, ldd, dSD); }, _kh_trials);
+    }
+  }
+
+
+  CUDA_CHECK(cudaMemcpy(fD.data(), dD, count_D * sizeof(float), cudaMemcpyDeviceToHost));
+  cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dD);
+  cudaFree(dGA); cudaFree(dGC); cudaFree(dSD);
+
+  reference_gather_scatter_gemm(M, N, K, alpha, fA, lda, gather_A, fB, ldb,
+    beta, fC, ldc, gather_C, fRef, ldd, scatter_D);
+
+  float max_diff = 0;
+  for (int i = 0; i < count_D; ++i)
+    max_diff = fmaxf(max_diff, fabsf(fD[i] - fRef[i]));
+  if (max_diff > 1.0f) {
+    std::cerr << "Results incorrect. Max diff: " << max_diff << std::endl;
+    return -1;
+  }
+  std::cout << "Passed." << std::endl;
+  return 0;
+}
+```

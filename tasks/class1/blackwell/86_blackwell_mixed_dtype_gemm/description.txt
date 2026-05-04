@@ -1,0 +1,192 @@
+# Task: 86_blackwell_mixed_dtype_gemm
+
+## Target Hardware
+NVIDIA Blackwell GPU (SM100/SM120).
+
+
+Blackwell SM100 Mixed-Dtype GEMM test harness
+BF16 A + INT4 B (with per-block BF16 scale factors) -> BF16 D
+Based on CUTLASS example 86_blackwell_mixed_dtype_gemm
+The LLM must implement:
+  cudaError_t BlackwellMixedDtypeGemm(int M, int N, int K, float alpha,
+      __nv_bfloat16 const *A, int lda,
+      int8_t const *B, int ldb,
+      __nv_bfloat16 const *B_scales, int scale_ldb,
+      float beta, __nv_bfloat16 *D, int ldd);
+A is row-major [M, K] (lda = K) in BF16.
+B is column-major [K, N] (ldb = K) in INT4 stored as int8_t (one element per byte,
+  values in [-8, 7]). The LLM must pack into CUTLASS int4b_t layout internally.
+B_scales: [N, ceil(K/128)] row-major, one BF16 scale per group of 128 K-elements.
+  B is dequantized as: B_float[k,j] = int4_val * scale[j, k/128].
+D is row-major [M, N] (ldd = N) in BF16.
+Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
+         -I<cutlass>/include harness.cu solution.cu -o test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * Blackwell SM100 Mixed-Dtype GEMM test harness
+ * BF16 A + INT4 B (with per-block BF16 scale factors) -> BF16 D
+ * Based on CUTLASS example 86_blackwell_mixed_dtype_gemm
+ *
+ * The LLM must implement:
+ *   cudaError_t BlackwellMixedDtypeGemm(int M, int N, int K, float alpha,
+ *       __nv_bfloat16 const *A, int lda,
+ *       int8_t const *B, int ldb,
+ *       __nv_bfloat16 const *B_scales, int scale_ldb,
+ *       float beta, __nv_bfloat16 *D, int ldd);
+ *
+ * A is row-major [M, K] (lda = K) in BF16.
+ * B is column-major [K, N] (ldb = K) in INT4 stored as int8_t (one element per byte,
+ *   values in [-8, 7]). The LLM must pack into CUTLASS int4b_t layout internally.
+ * B_scales: [N, ceil(K/128)] row-major, one BF16 scale per group of 128 K-elements.
+ *   B is dequantized as: B_float[k,j] = int4_val * scale[j, k/128].
+ * D is row-major [M, N] (ldd = N) in BF16.
+ *
+ * Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
+ *          -I<cutlass>/include harness.cu solution.cu -o test
+ */
+
+#include <iostream>
+#include <sstream>
+#include <vector>
+#include <cmath>
+#include <cuda_bf16.h>
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status)                                              \
+  {                                                                     \
+    cudaError_t error = status;                                         \
+    if (error != cudaSuccess) {                                         \
+      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
+                << " at line: " << __LINE__ << std::endl;               \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
+  }
+
+static constexpr int kGroupSize = 128;
+
+extern cudaError_t BlackwellMixedDtypeGemm(
+  int M, int N, int K,
+  float alpha,
+  __nv_bfloat16 const *A, int lda,
+  int8_t const *B, int ldb,
+  __nv_bfloat16 const *B_scales, int scale_ldb,
+  float beta,
+  __nv_bfloat16 *D, int ldd);
+
+void reference_gemm(int M, int N, int K, float alpha,
+  std::vector<float> const &fA, int lda,
+  std::vector<float> const &fB, int ldb,
+  float beta, std::vector<float> &D, int ldd) {
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      float acc = 0;
+      for (int k = 0; k < K; ++k) acc += fA[i*lda+k] * fB[k+j*ldb];
+      D[i*ldd+j] = alpha * acc + beta * D[i*ldd+j];
+    }
+}
+
+int main(int argc, const char *arg[]) {
+  int M = 256, N = 256, K = 256;
+  for (int i = 1; i < argc && i < 4; ++i) {
+    std::stringstream ss(arg[i]);
+    if (i == 1) ss >> M; else if (i == 2) ss >> N; else if (i == 3) ss >> K;
+  }
+
+  int lda = K, ldb = K, ldd = N;
+  float alpha = 1.0f, beta = 0.0f;
+  int k_groups = (K + kGroupSize - 1) / kGroupSize;
+
+  // BF16 A
+  std::vector<__nv_bfloat16> hA(M * K);
+  std::vector<float> fA(M * K);
+  for (int i = 0; i < M * K; ++i) {
+    float val = float((i * 16807 % 16) - 8) * 0.125f;
+    hA[i] = __float2bfloat16(val);
+    fA[i] = __bfloat162float(hA[i]);
+  }
+
+  // INT4 B stored as int8_t (one element per byte, values in [-8, 7])
+  std::vector<int8_t> hB(K * N);
+  std::vector<float> fB_raw(K * N);
+  for (int i = 0; i < K * N; ++i) {
+    hB[i] = int8_t(((i * 48271 % 9) - 4));  // range [-4, 4] fits int4
+    fB_raw[i] = float(hB[i]);
+  }
+
+  // BF16 scales for B: [N, k_groups] row-major
+  std::vector<__nv_bfloat16> hB_scales(N * k_groups);
+  std::vector<float> fB_scales(N * k_groups);
+  for (int i = 0; i < N * k_groups; ++i) {
+    hB_scales[i] = __float2bfloat16(1.0f);
+    fB_scales[i] = 1.0f;
+  }
+
+  // Dequantized B for reference: B_float[k,j] = int4_val * scale[j, k/128]
+  std::vector<float> fB(K * N);
+  for (int j = 0; j < N; ++j)
+    for (int k = 0; k < K; ++k) {
+      int kg = k / kGroupSize;
+      fB[k + j * ldb] = fB_raw[k + j * ldb] * fB_scales[j * k_groups + kg];
+    }
+
+  __nv_bfloat16 *dA; int8_t *dB; __nv_bfloat16 *dB_scales, *dD;
+  CUDA_CHECK(cudaMalloc(&dA, M * K * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMalloc(&dB, K * N * sizeof(int8_t)));
+  CUDA_CHECK(cudaMalloc(&dB_scales, N * k_groups * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMalloc(&dD, M * N * sizeof(__nv_bfloat16)));
+
+  CUDA_CHECK(cudaMemcpy(dA, hA.data(), M * K * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB, hB.data(), K * N * sizeof(int8_t), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB_scales, hB_scales.data(), N * k_groups * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(dD, 0, M * N * sizeof(__nv_bfloat16)));
+
+  cudaError_t r = BlackwellMixedDtypeGemm(M, N, K, alpha, dA, lda, dB, ldb, dB_scales, k_groups, beta, dD, ldd);
+  if (r != cudaSuccess) {
+    std::cerr << "GEMM kernel failed: " << cudaGetErrorString(r) << std::endl;
+    cudaFree(dA); cudaFree(dB); cudaFree(dB_scales); cudaFree(dD);
+    return -1;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && r == cudaSuccess) {
+      kh_benchmark([&]() { BlackwellMixedDtypeGemm(M, N, K, alpha, dA, lda, dB, ldb, dB_scales, k_groups, beta, dD, ldd); }, _kh_trials);
+    }
+  }
+
+
+  std::vector<__nv_bfloat16> hD(M * N);
+  CUDA_CHECK(cudaMemcpy(hD.data(), dD, M * N * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+  cudaFree(dA); cudaFree(dB); cudaFree(dB_scales); cudaFree(dD);
+
+  std::vector<float> fD(M * N), fRef(M * N, 0);
+  for (int i = 0; i < M * N; ++i) fD[i] = __bfloat162float(hD[i]);
+  reference_gemm(M, N, K, alpha, fA, lda, fB, ldb, beta, fRef, ldd);
+
+  float max_rel_diff = 0; int mismatches = 0;
+  for (int idx = 0; idx < M * N; ++idx) {
+    float diff = std::fabs(fD[idx] - fRef[idx]);
+    float denom = std::fmax(std::fabs(fRef[idx]), 1e-6f);
+    float rel = diff / denom;
+    max_rel_diff = std::fmax(max_rel_diff, rel);
+    if (rel > 0.3f) mismatches++;
+  }
+  float mismatch_rate = float(mismatches) / float(M * N);
+  if (mismatch_rate > 0.01f) {
+    std::cerr << "Results incorrect. Max relative diff: " << max_rel_diff
+              << ", mismatch rate: " << mismatch_rate << std::endl;
+    return -1;
+  }
+  std::cout << "Passed." << std::endl;
+  return 0;
+}
+```

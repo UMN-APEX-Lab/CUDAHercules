@@ -1,0 +1,47 @@
+# Task: fa3_fwd_hdim192_bf16
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+## Description
+
+Implement a CUDA kernel for Flash Attention 3 forward pass (Hopper SM90).
+
+Compute scaled dot-product attention WITHOUT materializing the full attention matrix:
+  S = Q @ K^T * scale
+
+  O = softmax(S) @ V
+  lse[i] = log(sum(exp(S[i][:])))
+
+Inputs (all bf16, contiguous, [B, H, S, D] layout):
+  Q: [4, 8, 256, 192]
+  K: [4, 8, 256, 192]
+  V: [4, 8, 256, 192]
+
+Outputs:
+  O:   [B, H, Sq, D] bf16 — attention output
+  lse: [B, H, Sq] fp32 — log-sum-exp per query row
+
+scale = 1/sqrt(D) = 0.072169
+Non-causal: full attention.
+
+
+## Function Signature
+
+```c
+void launch_fa3_fwd(
+    const void* Q,     // [B, H, Sq, D] bf16
+    const void* K,     // [B, H, Sk, D] bf16
+    const void* V,     // [B, H, Sk, D] bf16
+    void* O,           // [B, H, Sq, D] bf16
+    float* lse,        // [B, H, Sq] log-sum-exp per query row
+    int B,
+    int H,
+    int Sq,
+    int Sk,
+    int D,
+    float scale,
+    cudaStream_t stream
+);
+
+```

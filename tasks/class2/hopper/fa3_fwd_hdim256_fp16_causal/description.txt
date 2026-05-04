@@ -1,0 +1,47 @@
+# Task: fa3_fwd_hdim256_fp16_causal
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+## Description
+
+Implement a CUDA kernel for Flash Attention 3 forward pass (Hopper SM90).
+
+Compute scaled dot-product attention WITHOUT materializing the full attention matrix:
+  S = Q @ K^T * scale
+  Apply causal mask (upper triangular = -inf)
+  O = softmax(S) @ V
+  lse[i] = log(sum(exp(S[i][:])))
+
+Inputs (all fp16, contiguous, [B, H, S, D] layout):
+  Q: [4, 8, 256, 256]
+  K: [4, 8, 256, 256]
+  V: [4, 8, 256, 256]
+
+Outputs:
+  O:   [B, H, Sq, D] fp16 — attention output
+  lse: [B, H, Sq] fp32 — log-sum-exp per query row
+
+scale = 1/sqrt(D) = 0.062500
+Causal: upper triangular of attention matrix is masked to -inf.
+
+
+## Function Signature
+
+```c
+void launch_fa3_fwd(
+    const void* Q,     // [B, H, Sq, D] fp16
+    const void* K,     // [B, H, Sk, D] fp16
+    const void* V,     // [B, H, Sk, D] fp16
+    void* O,           // [B, H, Sq, D] fp16
+    float* lse,        // [B, H, Sq] log-sum-exp per query row
+    int B,
+    int H,
+    int Sq,
+    int Sk,
+    int D,
+    float scale,
+    cudaStream_t stream
+);
+
+```

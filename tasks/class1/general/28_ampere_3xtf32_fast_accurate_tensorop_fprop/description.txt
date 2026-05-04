@@ -1,0 +1,51 @@
+# Task: 28_ampere_3xtf32_fast_accurate_tensorop_fprop
+
+Conv2D Forward Propagation using 3xTF32 for FP32 accuracy with TensorCore performance. NHWC layout, float32 input/output.
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+
+cudaError_t Conv2dFprop3xTF32(
+    float const *input, float const *filter, float *output,
+    int N, int C, int H, int W, int K, int R, int S,
+    int pad_h, int pad_w, int stride_h, int stride_w);
+```
+
+## Operation
+
+output[n][p][q][k] = sum_{r,s,c} input[n][h][w][c] * filter[k][r][s][c]
+
+Where:
+- h = p * stride_h + r - pad_h
+- w = q * stride_w + s - pad_w
+- P = (H + 2*pad_h - R) / stride_h + 1
+- Q = (W + 2*pad_w - S) / stride_w + 1
+
+## Data Types
+
+All tensors are `float` (FP32).
+
+## Memory Layout
+
+All tensors are **NHWC** (channels-last):
+- input:  Element (n,h,w,c) at `input[((n*H + h)*W + w)*C + c]`
+- filter: Element (k,r,s,c) at `filter[((k*R + r)*S + s)*C + c]`
+- output: Element (n,p,q,k) at `output[((n*P + p)*Q + q)*K + k]`
+
+## Build & Test
+
+```bash
+make test                    # requires solution.h in task directory
+./test                       # default: runs small/medium/large sizes
+```
+
+Correctness is verified against a CUTLASS reference implementation at multiple problem sizes
+(small: N=1 H=W=56 C=K=64, medium: N=1 H=W=112 C=K=128, large: N=4 H=W=56 C=K=256).
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

@@ -1,0 +1,22 @@
+# Task: liberator (Blackwell)
+
+Optimize GPU graph processing performance under OOM scenarios on Blackwell-class
+GPUs.
+
+You are implementing a black-box CUDA backend for BFS, CC, SSSP, and PageRank
+under strict 8/10/12/15 GB memory budgets. The benchmark hides Liberator's
+source code, enforces the memory budget itself, and calls your backend through
+the fixed ABI in `custom_backend_api.h`.
+
+Use Blackwell-specific features when they help, but correctness and budget
+compliance come first.
+
+Semantics:
+- BFS source = `101`, source value = `1`, unreachable = `UINT32_MAX`
+- CC = min-label propagation to convergence
+- SSSP source = `101`, source value = `1`, unreachable = `UINT32_MAX`
+- PageRank starts from `1.0` everywhere and uses
+  `0.15 + 0.85 * incoming_sum`, stopping when no vertex changes by more than
+  `0.001` or `1000` iterations are reached
+
+You are writing exactly one file: `custom_cuda_backend/backend.cu`.

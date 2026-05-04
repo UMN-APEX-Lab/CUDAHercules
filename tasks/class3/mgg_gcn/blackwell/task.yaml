@@ -1,0 +1,67 @@
+schema_version: 1
+task_id: class3/mgg_gcn/blackwell
+name: mgg_gcn
+task_class: 3
+domain: multi-gpu-gnn
+tags:
+- multi-gpu
+- nvshmem
+- spmm
+- gnn
+- pipeline
+- communication-computation-overlap
+- blackwell
+hardware:
+  min_sm: 100
+  tested_sms:
+  - 100
+  required_features:
+  - nvshmem
+  - mpi
+  min_gpus: 4
+runner:
+  backend: class3_app
+  workdir: tasks/class3/mgg_gcn
+  timeout_sec: 600
+  env:
+    NVSHMEM_SYMMETRIC_SIZE: '21474836480'
+    CUDA_GENCODE: -gencode arch=compute_100a,code=sm_100a
+  solution_files:
+  - src/include/neighbor_utils.cuh
+build:
+  cmd: ''
+  clean_cmd: ''
+execute:
+  cmd: python run.py
+  success:
+    exit_code: 0
+    stdout_regex: Passed
+correctness:
+  mode: stdout_or_exit
+  tolerances: {}
+performance:
+  enabled: true
+  parser:
+    kernel_time_ms_regex: Kernel time:\s*([0-9.]+)\s*ms
+    ref_time_ms_regex: Ref time:\s*([0-9.]+)\s*ms
+    speedup_regex: Speedup:\s*([0-9.]+)x
+  metric: speedup
+source:
+  repo: YukeWang96/MGG-OSDI23-AE
+  files: []
+  commit: ''
+  license: ''
+anti_cheat:
+  blocked_patterns: []
+  required_patterns:
+  - nvshmem
+  - __global__\s+void
+  - <<<.*>>>
+
+hacking_hints: |
+  SpMM-based GCN forward must aggregate neighbor features across partitioned
+  subgraphs. Kernels must read the graph partitioning metadata.
+  Flags:
+  - Returning zeros or identity
+  - Skipping inter-partition edges
+  - Hardcoded accuracy/loss prints

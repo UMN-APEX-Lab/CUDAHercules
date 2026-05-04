@@ -1,0 +1,76 @@
+# Task: 37_gemm_layernorm_gemm_fusion
+
+Fused GEMM + LayerNorm + GEMM on half-precision (FP16) data.
+
+## Operation
+
+The pipeline computes:
+  1. GEMM0: C0 = alpha * A0 * B0 + beta * C0_in     (column-major output)
+  2. LayerNorm: normalized = (C0 - mean) * inv_std * gamma + beta_ln   (per-column normalization)
+  3. GEMM1: C1 = alpha * A1 * normalized              (column-major output)
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+cudaError_t gemm_layernorm_gemm_solution(
+    int M_sol, int N0_sol, int K0_sol, int N1_sol,
+    float alpha, float beta,
+    __half const *A0, int lda0,
+    __half const *B0, int ldb0,
+    __half const *A1, int lda1,
+    __half *C1, int ldc1,
+    __half const *gamma,
+    __half const *beta_ln,
+    __half const *shifted_K,
+    bool is_column_major);
+```
+
+## Memory Layouts (Column-Major Case, is_column_major=true)
+
+The CUTLASS example uses column-major output. In this mode:
+
+- **A0**: row-major, shape [N0_sol, K0_sol], stride lda0. Element (i,j) at `A0[i * lda0 + j]`.
+- **B0**: column-major, shape [K0_sol, M_sol], stride ldb0. Element (i,j) at `B0[i + j * ldb0]`.
+- **C0** (intermediate): column-major, shape [N0_sol, M_sol], stride N0_sol.
+  Must be allocated internally.
+- **A1**: column-major, shape [N1_sol, N0_sol], stride lda1. Element (i,j) at `A1[i + j * lda1]`.
+- **C1** (output): column-major, shape [N1_sol, M_sol], stride ldc1. Element (i,j) at `C1[i + j * ldc1]`.
+- **gamma**: [N0_sol] LayerNorm scale factors.
+- **beta_ln**: [N0_sol] LayerNorm bias.
+- **shifted_K**: optional shifted-K value for numerical stability (can be ignored).
+
+## LayerNorm Details
+
+LayerNorm is applied per-column of C0 (column-major). For each column `c`:
+  - mean = average of C0[0..N0_sol-1, c]
+  - variance = average of (C0[i,c] - mean)^2
+  - inv_std = 1 / sqrt(variance + 1e-6)
+  - normalized[i,c] = (C0[i,c] - mean) * inv_std * gamma[i] + beta_ln[i]
+
+## Dimensions
+
+- M_sol = valid_word_num (number of token positions)
+- N0_sol = hidden_dim (feature dimension)
+- K0_sol = hidden_dim
+- N1_sol = hidden_dim * intermediate_scale (typically 4x hidden_dim)
+
+## Build & Test
+
+```bash
+make test                             # requires solution.h in task directory
+./test                                # default: runs small/medium/large sizes
+./test --hidden_dim=256 --valid_word_num=512  # custom single size
+./test --iterations=50                # more profiling iterations (default: 20)
+```
+
+Correctness is verified against a reference implementation at multiple problem sizes
+(small: 128x256, medium: 256x1024, large: 512x2048).
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

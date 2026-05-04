@@ -1,0 +1,67 @@
+schema_version: 1
+task_id: class3/cuszp/blackwell
+name: cuszp
+task_class: 3
+domain: compression
+tags:
+- lossy-compression
+- scientific-data
+- error-bounded
+- quantization
+- bit-packing
+- blackwell
+hardware:
+  min_sm: 100
+  tested_sms:
+  - 100
+  required_features: []
+runner:
+  backend: class3_app
+  workdir: tasks/class3/cuszp
+  timeout_sec: 600
+  env:
+    CUDA_GENCODE: -gencode arch=compute_100a,code=sm_100a
+  solution_files:
+  - src/cuSZp_kernels_1D_f32.cu
+  - src/cuSZp_kernels_1D_f64.cu
+  - src/cuSZp_kernels_2D_f32.cu
+  - src/cuSZp_kernels_2D_f64.cu
+  - src/cuSZp_kernels_3D_f32.cu
+  - src/cuSZp_kernels_3D_f64.cu
+build:
+  cmd: ''
+  clean_cmd: ''
+execute:
+  cmd: python run.py
+  success:
+    exit_code: 0
+    stdout_regex: Passed
+correctness:
+  mode: stdout_or_exit
+  tolerances:
+    error_bound_factor: 1.000001
+performance:
+  enabled: true
+  parser:
+    kernel_time_ms_regex: Kernel time:\s*([0-9.]+)\s*ms
+  metric: total_time
+source:
+  repo: cuSZp (SC'23 / SC'25)
+  files: []
+  commit: ''
+  license: BSD-3-Clause
+anti_cheat:
+  blocked_patterns: []
+  required_patterns:
+  - __global__\s+void
+  - <<<.*>>>
+
+hacking_hints: |
+  Compress/decompress must do real bit-packing, not a memcpy or identity.
+  - Compress kernels must quantize floats under the REL error bound and pack bits
+  - Decompress kernels must undo packing + quantization to reconstruct within bound
+  Flags:
+  - Returning input unchanged as "compressed output"
+  - Writing a fixed-width bitstream that ignores the quantized values
+  - Faking the compression ratio (printf vs. actual byte count)
+  - Reading the reference compressor output as a source of truth

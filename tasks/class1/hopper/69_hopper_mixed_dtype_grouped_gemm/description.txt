@@ -1,0 +1,194 @@
+# Task: 69_hopper_mixed_dtype_grouped_gemm
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+Hopper Mixed-Dtype Grouped GEMM test harness — half A, int8 B, half D
+Based on CUTLASS example 69_hopper_mixed_dtype_grouped_gemm
+The LLM must implement:
+  cudaError_t HopperMixedGroupedGemm(
+      int problem_count,
+      int const *Ms, int const *Ns, int const *Ks,
+      float alpha,
+      __half const **A_ptrs, int const *ldas,
+      int8_t const **B_ptrs, int const *ldbs,
+      float beta,
+      __half **D_ptrs, int const *ldds);
+Per problem: A row-major (half), B column-major (int8), D row-major (half).
+D = alpha * A(half) * B(int8->half) + beta * D
+Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * Hopper Mixed-Dtype Grouped GEMM test harness — half A, int8 B, half D
+ * Based on CUTLASS example 69_hopper_mixed_dtype_grouped_gemm
+ *
+ * The LLM must implement:
+ *   cudaError_t HopperMixedGroupedGemm(
+ *       int problem_count,
+ *       int const *Ms, int const *Ns, int const *Ks,
+ *       float alpha,
+ *       __half const **A_ptrs, int const *ldas,
+ *       int8_t const **B_ptrs, int const *ldbs,
+ *       float beta,
+ *       __half **D_ptrs, int const *ldds);
+ *
+ * Per problem: A row-major (half), B column-major (int8), D row-major (half).
+ * D = alpha * A(half) * B(int8->half) + beta * D
+ *
+ * Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+ */
+
+#include <cuda_fp16.h>
+#include <iostream>
+#include <vector>
+#include <cstdint>
+#include <cmath>
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status)                                              \
+  {                                                                     \
+    cudaError_t error = status;                                         \
+    if (error != cudaSuccess) {                                         \
+      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
+                << " at line: " << __LINE__ << std::endl;               \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
+  }
+
+extern cudaError_t HopperMixedGroupedGemm(
+  int problem_count,
+  int const *Ms, int const *Ns, int const *Ks,
+  float alpha,
+  __half const **A_ptrs, int const *ldas,
+  int8_t const **B_ptrs, int const *ldbs,
+  float beta,
+  __half **D_ptrs, int const *ldds);
+
+/// CPU reference: A(float) row-major, B(float from int8) col-major, D row-major
+void reference_gemm(int M, int N, int K, float alpha,
+  float const *A, int lda, float const *B, int ldb,
+  float beta, float *D, int ldd) {
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      float acc = 0;
+      for (int k = 0; k < K; ++k)
+        acc += A[i * lda + k] * B[k + j * ldb];
+      D[i * ldd + j] = alpha * acc + beta * D[i * ldd + j];
+    }
+}
+
+int main() {
+  const int PC = 3;
+  int Ms[] = {128, 64, 96};
+  int Ns[] = {64, 128, 64};
+  int Ks[] = {128, 64, 128};
+  float alpha = 1.0f, beta = 0.0f;
+
+  std::vector<std::vector<float>> fAs(PC), fBs(PC), fDs(PC), fRefs(PC);
+  std::vector<__half*> dAs(PC);
+  std::vector<int8_t*> dBs(PC);
+  std::vector<__half*> dDs(PC);
+  int ldas[3], ldbs[3], ldds[3];
+
+  for (int p = 0; p < PC; ++p) {
+    ldas[p] = Ks[p]; ldbs[p] = Ks[p]; ldds[p] = Ns[p];
+    int sA = Ms[p] * Ks[p], sB = Ks[p] * Ns[p], sD = Ms[p] * Ns[p];
+    fAs[p].resize(sA); fBs[p].resize(sB); fDs[p].resize(sD, 0); fRefs[p].resize(sD, 0);
+    for (int i = 0; i < sA; ++i) fAs[p][i] = float(((i + p * 1000) * 16807 % 16) - 8) * 0.01f;
+    for (int i = 0; i < sB; ++i) fBs[p][i] = float(((i + p * 2000) * 48271 % 7) - 3);
+
+    // A as half
+    std::vector<__half> hA(sA);
+    for (int i = 0; i < sA; ++i) hA[i] = __float2half(fAs[p][i]);
+    // B as int8
+    std::vector<int8_t> hB(sB);
+    for (int i = 0; i < sB; ++i) hB[i] = (int8_t)fBs[p][i];
+
+    CUDA_CHECK(cudaMalloc(&dAs[p], sA * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&dBs[p], sB * sizeof(int8_t)));
+    CUDA_CHECK(cudaMalloc(&dDs[p], sD * sizeof(__half)));
+    CUDA_CHECK(cudaMemcpy(dAs[p], hA.data(), sA * sizeof(__half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dBs[p], hB.data(), sB * sizeof(int8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(dDs[p], 0, sD * sizeof(__half)));
+  }
+
+  // Device arrays of pointers and dims
+  int *dMs, *dNs, *dKs, *dldas, *dldbs, *dldds;
+  __half const **dAp;
+  int8_t const **dBp;
+  __half **dDp;
+
+  CUDA_CHECK(cudaMalloc(&dMs, PC * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&dNs, PC * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&dKs, PC * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&dldas, PC * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&dldbs, PC * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&dldds, PC * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&dAp, PC * sizeof(void*)));
+  CUDA_CHECK(cudaMalloc(&dBp, PC * sizeof(void*)));
+  CUDA_CHECK(cudaMalloc(&dDp, PC * sizeof(void*)));
+
+  CUDA_CHECK(cudaMemcpy(dMs, Ms, PC * sizeof(int), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dNs, Ns, PC * sizeof(int), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dKs, Ks, PC * sizeof(int), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dldas, ldas, PC * sizeof(int), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dldbs, ldbs, PC * sizeof(int), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dldds, ldds, PC * sizeof(int), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dAp, dAs.data(), PC * sizeof(void*), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dBp, dBs.data(), PC * sizeof(void*), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dDp, dDs.data(), PC * sizeof(void*), cudaMemcpyHostToDevice));
+
+  cudaError_t result = HopperMixedGroupedGemm(
+    PC, dMs, dNs, dKs, alpha, dAp, dldas, dBp, dldbs, beta, dDp, dldds);
+  if (result != cudaSuccess) {
+    std::cerr << "HopperMixedGroupedGemm failed: " << cudaGetErrorString(result) << std::endl;
+    return -1;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && result == cudaSuccess) {
+      kh_benchmark([&]() { HopperMixedGroupedGemm(
+    PC, dMs, dNs, dKs, alpha, dAp, dldas, dBp, dldbs, beta, dDp, dldds); }, _kh_trials);
+    }
+  }
+
+
+  bool pass = true;
+  for (int p = 0; p < PC; ++p) {
+    int sD = Ms[p] * Ns[p];
+    std::vector<__half> hD(sD);
+    CUDA_CHECK(cudaMemcpy(hD.data(), dDs[p], sD * sizeof(__half), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < sD; ++i) fDs[p][i] = __half2float(hD[i]);
+    reference_gemm(Ms[p], Ns[p], Ks[p], alpha,
+      fAs[p].data(), ldas[p], fBs[p].data(), ldbs[p], beta, fRefs[p].data(), ldds[p]);
+    float md = 0;
+    for (int i = 0; i < sD; ++i) md = fmaxf(md, fabsf(fDs[p][i] - fRefs[p][i]));
+    if (md > 1.0f) {
+      std::cerr << "Problem " << p << " incorrect. Max diff: " << md << std::endl;
+      pass = false;
+    }
+  }
+
+  // Cleanup
+  for (int p = 0; p < PC; ++p) {
+    cudaFree(dAs[p]); cudaFree(dBs[p]); cudaFree(dDs[p]);
+  }
+  cudaFree(dMs); cudaFree(dNs); cudaFree(dKs);
+  cudaFree(dldas); cudaFree(dldbs); cudaFree(dldds);
+  cudaFree(dAp); cudaFree(dBp); cudaFree(dDp);
+
+  if (pass) { std::cout << "Passed." << std::endl; return 0; }
+  return -1;
+}
+```

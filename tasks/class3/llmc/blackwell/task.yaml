@@ -1,0 +1,70 @@
+schema_version: 1
+task_id: class3/llmc/blackwell
+name: llmc
+task_class: 3
+domain: llm-training
+tags:
+- gpt2
+- attention
+- softmax
+- transformer
+- training
+- blackwell
+hardware:
+  min_sm: 100
+  tested_sms:
+  - 100
+  required_features: []
+runner:
+  backend: class3_app
+  workdir: tasks/class3/llmc
+  timeout_sec: 300
+  env:
+    CUDA_GENCODE: -gencode arch=compute_100a,code=sm_100a
+  solution_files:
+  - generated_project/
+build:
+  cmd: ''
+  clean_cmd: ''
+execute:
+  cmd: python run.py
+  success:
+    exit_code: 0
+    stdout_regex: Passed
+correctness:
+  mode: stdout_or_exit
+  tolerances: {}
+performance:
+  enabled: true
+  parser:
+    kernel_time_ms_regex: Kernel time:\s*([0-9.]+)\s*ms
+    ref_time_ms_regex: Ref time:\s*([0-9.]+)\s*ms
+    speedup_regex: Speedup:\s*([0-9.]+)x
+  metric: speedup
+  training_quality:
+    solution_loss_regex: Solution loss:\s*([0-9.]+)\s*->\s*([0-9.]+)
+source:
+  repo: llm.c (Karpathy)
+  files: []
+  commit: ''
+  license: MIT
+anti_cheat:
+  blocked_patterns:
+  - '#include\s*[<"].*llmc/'
+  - train_gpt2cu
+  - train_gpt2\.cu
+  - tasks/class3/llmc/src
+  required_patterns:
+  - __global__\s+void
+  - <<<.*>>>
+
+hacking_hints: |
+  Each attention kernel must implement the stated op (permute, softmax, unpermute).
+  - softmax must use max-subtract stabilization and sum-normalize
+  - permute/unpermute must reshape Q/K/V by head layout correctly
+  - must compute scaled dot product against real inputs, not zeros
+  Flags:
+  - Returning torch::zeros_like(output) or copying input unchanged
+  - Hardcoded loss values printed from the solution
+  - Skipping the softmax normalization step
+  - Intercepting KH_BENCHMARK env var to short-circuit

@@ -1,0 +1,35 @@
+# Task: tk_bf16_gemm
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+BF16 General Matrix Multiply on H100, matching ThunderKittens performance.
+
+## Function Signature
+
+Implement in solution.h:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
+void Bf16Gemm(__nv_bfloat16 *A, __nv_bfloat16 *B, __nv_bfloat16 *C, int M, int N, int K);
+```
+
+## Operation
+
+C = A * B
+
+Where A is M×K, B is K×N, C is M×N. All row-major, BF16.
+
+## Build & Test
+
+```bash
+# Generate test data (no external data needed - self-contained)
+make test
+./test
+```
+
+Requires H100 GPU (SM90a). ThunderKittens headers on include path.

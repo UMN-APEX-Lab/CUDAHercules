@@ -1,0 +1,113 @@
+# Task: tcgnn_gcn (Ampere)
+
+End-to-end GCN (Graph Convolutional Network) training optimization.
+
+## Overview
+
+Optimize the SpMM (Sparse Matrix-Matrix Multiplication) CUDA kernel used in
+GCN training for Ampere-class GPUs. The kernel is the computational
+bottleneck — it runs in both the forward pass (neighbor feature aggregation)
+and backward pass (gradient propagation). The baseline uses TC-GNN's
+WMMA 16x16x8 TF32 Tensor Core implementation (ATC'23), which is already
+an Ampere-oriented design point.
+
+The harness compiles both the reference and solution extensions with Ampere
+targets (`sm_80` plus `compute_80` PTX) regardless of the host GPU.
+
+## Function Signature
+
+Implement the following function in `solution.cu`:
+
+```cuda
+#include <torch/extension.h>
+#include <vector>
+
+std::vector<torch::Tensor> spmm_forward_cuda(
+    torch::Tensor nodePointer,     // [numNodes+1] CSR row pointers (int32, GPU)
+    torch::Tensor edgeList,        // [numEdges] neighbor node IDs (int32, GPU)
+    torch::Tensor blockPartition,  // [numWindows] TC blocks per row window (int32, GPU)
+    torch::Tensor edgeToColumn,    // [numEdges] compressed column index (int32, GPU)
+    torch::Tensor edgeToRow,       // [numEdges] source node ID (int32, GPU)
+    int num_nodes,
+    int num_edges,
+    int embedding_dim,
+    torch::Tensor input            // [numNodes, embedding_dim] float32, GPU
+);
+```
+
+Must return `{output}` where `output = torch::zeros_like(input)` filled with:
+
+    output[i, :] = sum_{j in N(i)} input[j, :]
+
+(sum of neighbor features for each node i).
+
+## Preprocessing Data
+
+TC-GNN groups nodes into row windows of 16. For each window, neighbor IDs
+are sorted and deduplicated, then mapped to compressed column indices:
+
+- `edgeToRow[e]`: source node for edge e
+- `edgeToColumn[e]`: compressed column index within its row window
+- `blockPartition[w]`: number of TC blocks (16×8 tiles) in window w
+
+You may use this preprocessed data for a Tensor Core solution, or ignore it
+and implement a standard CSR SpMM. Both approaches are valid.
+
+## Training Pipeline
+
+The GCN has 2 layers, each performing:
+1. GEMM: `x = x @ weights`  (torch.mm, not your code)
+2. SpMM: `x = A @ x`        (YOUR kernel — called via `spmm_forward_cuda`)
+3. ReLU (except last layer)
+
+Training uses Adam optimizer with cross-entropy loss. SpMM runs in both
+forward and backward passes.
+
+## Constraints
+
+- `embedding_dim` is always divisible by 16
+- All tensors are contiguous, on CUDA device, float32 (features) or int32 (graph)
+- The function is called many times per training epoch — optimize for throughput
+
+## Build & Test
+
+```bash
+python run.py                    # default: 200 timed epochs
+KH_BENCHMARK=50 python run.py   # custom number of timed epochs
+```
+
+## Test Configuration
+
+The benchmark runs on four TC-GNN graphs:
+
+- `amazon0505`: 410,236 nodes, 4,878,875 edges, input_dim=96, classes=22
+- `artist`: 50,515 nodes, 1,638,396 edges, input_dim=100, classes=12
+- `soc-BlogCatalog`: 88,784 nodes, 2,093,195 edges, input_dim=128, classes=39
+- `amazon0601`: 403,394 nodes, 3,387,388 edges, input_dim=96, classes=22
+
+Shared model/training settings:
+
+- 2-layer GCN
+- hidden_dim=256
+- The final layer output dimension is padded up to a multiple of 16 so both reference and solution kernels always see aligned embedding dimensions
+- Training loss uses only the first `num_classes` logits; padded tail logits are ignored
+- Correctness: 50 training epochs per seed
+- Correctness seeds: 123, 456, 789
+- Correctness constraint: for every seed, the solution loss must remain finite, decrease over training, and end with final loss ratio <= 1.1 relative to the reference
+- Aggregate correctness summary uses the worst final loss ratio across seeds
+- Performance: 10 warmup + 200 timed epochs per graph
+
+The final report aggregates performance across the selected graphs. This task
+is defined around the Ampere implementation strategy; the harness still
+builds with fixed Ampere codegen even when evaluated on a newer GPU. You can
+override the default graph set with:
+
+```bash
+TCGNN_GRAPHS=amazon0505,artist python run.py
+```
+
+## Reference
+
+TC-GNN: Bridging Sparse GNN Computation and Dense Tensor Core on GPUs (ATC'23).
+Baseline uses WMMA 16x16x8 TF32 tiles, one CUDA block per row window (16 nodes),
+8 warps per block each handling one embedding dimension tile.

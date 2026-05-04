@@ -1,0 +1,61 @@
+# Task: 05_batched_gemm
+
+Batched Strided Single-Precision General Matrix Multiply (SGEMM), column-major layout.
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+
+cudaError_t StridedBatchedSgemm(
+    int m, int n, int k,
+    float alpha,
+    float const *A, int lda, long long int batch_stride_A,
+    float const *B, int ldb, long long int batch_stride_B,
+    float *C, int ldc, long long int batch_stride_C,
+    float beta,
+    int batch_count);
+```
+
+## Operation
+
+For each batch b in [0, batch_count):
+  C_b = alpha * A_b * B_b + beta * C_b
+
+Where:
+- A_b is M x K, starting at A + b * batch_stride_A
+- B_b is K x N, starting at B + b * batch_stride_B
+- C_b is M x N, starting at C + b * batch_stride_C
+
+## Data Types
+
+All matrices are `float` (FP32).
+
+## Memory Layout
+
+All matrices are **column-major**:
+- A: Element (i,k) at `A[i + k * lda]`.  lda >= M. batch_stride_A = lda * K.
+- B: Element (k,j) at `B[k + j * ldb]`.  ldb = K * batch_count. batch_stride_B = K.
+  (All batches of B are interleaved along the leading dimension.)
+- C: Element (i,j) at `C[i + j * ldc]`.  ldc >= M. batch_stride_C = ldc * N.
+
+## Build & Test
+
+```bash
+make test                              # requires solution.h in task directory
+./test                                 # default: runs small/medium/large sizes
+./test 256 256 128 8                   # custom single size: M N K batch_count
+./test 256 256 128 8 1.0 0.0 20       # M N K batch_count alpha beta iterations
+```
+
+Correctness is verified against a reference implementation at multiple problem sizes:
+- small:   M=128,  N=128,  K=64,   batch=4
+- medium:  M=512,  N=512,  K=256,  batch=16
+- large:   M=2048, N=2048, K=1024, batch=4
+
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

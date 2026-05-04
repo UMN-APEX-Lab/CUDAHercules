@@ -1,0 +1,62 @@
+schema_version: 1
+task_id: class3/icicle_zk/blackwell
+name: icicle_zk
+task_class: 3
+domain: zero-knowledge
+tags:
+- ntt
+- msm
+- bn254
+- finite-field
+- elliptic-curve
+- cryptography
+- blackwell
+hardware:
+  min_sm: 100
+  tested_sms:
+  - 100
+  required_features: []
+runner:
+  backend: class3_app
+  workdir: tasks/class3/icicle_zk
+  timeout_sec: 600
+  env:
+    CUDA_GENCODE: -gencode arch=compute_100a,code=sm_100a
+  solution_files:
+  - custom_cuda_backend/backend.cu
+build:
+  cmd: ''
+  clean_cmd: ''
+execute:
+  cmd: python run.py
+  success:
+    exit_code: 0
+    stdout_regex: Passed
+correctness:
+  mode: stdout_or_exit
+  tolerances: {}
+performance:
+  enabled: true
+  parser:
+    kernel_time_ms_regex: Kernel time:\s*([0-9.]+)\s*ms
+  metric: total_time
+source:
+  repo: Icicle (Ingonyama)
+  files: []
+  commit: ''
+  license: Apache-2.0
+anti_cheat:
+  blocked_patterns: []
+  required_patterns:
+  - __global__\s+void
+  - <<<.*>>>
+
+hacking_hints: |
+  NTT must perform a real Cooley-Tukey / Stockham butterfly over BN254 Fp.
+  MSM must actually accumulate scalar-multiplied BN254 G1 points (Pippenger /
+  bucket method are fine; memcpy is not).
+  Flags:
+  - Returning input unchanged as "NTT output"
+  - Returning G1::identity() as MSM result
+  - Using any pre-built ICICLE runtime entry point instead of a CUDA kernel
+  - Hardcoded magic-number outputs

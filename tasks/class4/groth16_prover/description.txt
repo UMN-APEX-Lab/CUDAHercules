@@ -1,0 +1,108 @@
+# Task: groth16_prover (Class 4 — Unsolved)
+
+Implement a complete Groth16 zero-knowledge proof prover on GPU using
+hand-written CUDA code. No existing hand-written CUDA Groth16 prover
+exists — all current implementations rely on libraries (Icicle, cuZK, bellman).
+
+## Background
+
+Groth16 (Jens Groth, 2016) is the most widely deployed zkSNARK proving
+system, used in Zcash, Filecoin, and many L2 rollups. The prover is
+computationally intensive: proving a 2^22-constraint circuit requires
+5 MSMs and 6 NTTs on the BN254 elliptic curve, totaling billions of
+group operations.
+
+## Groth16 Proving Algorithm
+
+Given R1CS matrices (A, B, C) of size m×n, witness z = (1, x, w) where
+x is public input and w is private witness:
+
+### Phase 1: Quotient Polynomial H(x)
+
+Compute h(x) such that A(x)·B(x) - C(x) = h(x)·Z_D(x), where Z_D is
+the vanishing polynomial over domain D.
+
+```
+1. a_coeff = IFFT(A · z)     // Interpolate A·z to coefficients
+2. b_coeff = IFFT(B · z)     // Interpolate B·z to coefficients
+3. c_coeff = IFFT(C · z)     // Interpolate C·z to coefficients
+4. a_eval = FFT(a_coeff, coset)  // Evaluate on coset domain (2n points)
+5. b_eval = FFT(b_coeff, coset)  // Evaluate on coset domain
+6. c_eval = FFT(c_coeff, coset)  // Evaluate on coset domain
+7. h_eval = (a_eval * b_eval - c_eval) / Z_D_eval  // Element-wise
+8. h_coeff = IFFT(h_eval, coset) // Recover h coefficients
+```
+
+All FFT/IFFT are NTT (Number Theoretic Transform) over the BN254 scalar
+field (254-bit prime). Domain size n is typically 2^20 to 2^26.
+
+### Phase 2: Proof Generation (5 MSMs)
+
+Sample random blinding factors r, s ∈ F_r.
+
+```
+π_A = [α]₁ + MSM(z, [A_k(τ)]₁) + r·[δ]₁
+π_B₂ = [β]₂ + MSM(z, [B_k(τ)]₂) + s·[δ]₂
+π_B₁ = [β]₁ + MSM(z, [B_k(τ)]₁) + s·[δ]₁
+[ht]₁ = MSM(h_coeff, [τⁱ·Z_D(τ)/δ]₁)
+π_C = MSM(w_private, [K_i]₁) + [ht]₁ + s·π_A + r·π_B₁ - r·s·[δ]₁
+```
+
+Output: Proof π = (π_A ∈ G1, π_B ∈ G2, π_C ∈ G1)
+
+## Computational Primitives Required
+
+### 1. NTT / IFFT (Number Theoretic Transform)
+- Forward and inverse transforms over BN254 scalar field
+- Domain sizes: 2^20 to 2^26
+- Coset evaluation (shift by generator)
+- 6 transforms total (3 IFFT + 3 FFT, or 3 IFFT + 3 coset FFT + 1 coset IFFT)
+
+### 2. MSM (Multi-Scalar Multiplication)
+- 5 MSMs on BN254: 3 on G1, 1 on G2, 1 on G1 (quotient)
+- Scalar count: n (circuit constraints), typically 2^20 to 2^26
+- Algorithm: Pippenger bucket method recommended
+- G2 MSM is ~4x slower due to extension field arithmetic
+
+### 3. Field Arithmetic (BN254 Scalar Field)
+- 254-bit modular addition, subtraction, multiplication
+- Montgomery form for efficient modular reduction
+- Element-wise vector operations (mul, sub, div by vanishing poly eval)
+
+### 4. Elliptic Curve Arithmetic (BN254 G1/G2)
+- Point addition, doubling in projective/Jacobian coordinates
+- G1: over F_p (base field)
+- G2: over F_p² (quadratic extension field)
+- Scalar multiplication for blinding (r·P, s·P)
+
+## Input Format
+
+- **Proving key**: Precomputed curve points from trusted setup
+  - [A_k(τ)]₁, [B_k(τ)]₁, [B_k(τ)]₂, [K_i]₁, [τⁱ·Z_D(τ)/δ]₁
+  - [α]₁, [β]₁, [β]₂, [δ]₁, [δ]₂
+- **Witness**: Field elements z = (1, public_inputs, private_witness)
+
+## Output Format
+
+- **Proof**: Three curve points (π_A, π_B, π_C)
+- Verified by: e(π_A, π_B) = e([α]₁, [β]₂) · e(Σ x_i·[L_i]₁, [γ]₂) · e(π_C, [δ]₂)
+
+## Test Circuit
+
+A standard benchmark circuit (e.g., Poseidon hash or SHA256 over BN254)
+with ~2^22 constraints. The circuit, trusted setup, and test witness are
+provided as binary files.
+
+## Metrics
+
+- **Correctness**: Generated proof must pass Groth16 verification
+- **Performance**: Total proving time compared against Icicle's GPU Groth16
+
+## Why Class 4
+
+1. No hand-written CUDA Groth16 prover exists — all use library calls
+2. Requires implementing NTT, MSM, and full BN254 arithmetic from scratch
+3. End-to-end pipeline optimization (data flow, GPU memory management) is critical
+4. Must correctly implement the cryptographic protocol (not just compute primitives)
+5. Memory management for 2^22+ constraint circuits (GBs of proving key data)
+6. Even Ingonyama (Icicle authors) built their prover on top of their library, not raw CUDA

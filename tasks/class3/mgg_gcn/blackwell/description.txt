@@ -1,0 +1,122 @@
+# Task: mgg_gcn (Hopper)
+
+Multi-GPU GCN inference optimization with NVSHMEM-based communication-computation
+pipelining, leveraging Hopper (SM90) architecture features.
+
+## Overview
+
+Optimize the multi-GPU GNN neighbor aggregation (SpMM) kernels to maximize
+inference throughput on a 4-GPU system. The key challenge is overlapping
+NVSHMEM inter-GPU communication with local computation -- remote neighbor
+embeddings must be fetched from other GPUs while local neighbors are
+being aggregated.
+
+The baseline uses MGG's (OSDI'23) dynamic software pipeline with warp-level
+NVSHMEM get operations, neighbor partitioning, and interleaved local/remote
+processing.
+
+You should exploit Hopper-generation GPU features where applicable:
+- **TMA (Tensor Memory Accelerator)**: Use `cp.async.bulk` / TMA descriptors
+  for efficient bulk loading of local neighbor embeddings from global to
+  shared memory. TMA's hardware address generation is especially beneficial
+  for the irregular access patterns in CSR-based SpMM, replacing the baseline's
+  manual coalescing logic.
+- **Distributed shared memory (DSMEM)**: Use thread block clusters with
+  cross-SM shared memory access for sharing fetched remote embeddings across
+  cooperating SMs. When multiple SMs process nodes that share remote neighbors,
+  DSMEM avoids redundant NVSHMEM fetches by allowing one SM to fetch and
+  others to read via cluster-level shared memory.
+- **Thread block clusters**: Launch cooperating thread blocks as clusters to
+  coordinate cross-GPU data fetching. Clusters can collectively manage the
+  pipeline of NVSHMEM remote gets, distributing fetch work across SMs and
+  pooling the results in DSMEM.
+- **Asynchronous barriers**: Use `cp.async.mbarrier` for producer-consumer
+  synchronization between warps fetching remote data (NVSHMEM gets) and
+  warps accumulating local neighbor features. This replaces software-managed
+  pipeline stages with hardware-accelerated barriers.
+- **Warp specialization**: Dedicate producer warps to issuing NVSHMEM remote
+  gets and TMA local loads, while consumer warps perform the SpMM accumulation.
+  This naturally maps to MGG's interleaved local/remote processing pattern
+  but with hardware-backed overlap.
+- **Enhanced async pipelines**: Combine TMA + NVSHMEM non-blocking gets
+  (`nvshmemx_float_get_nbi_warp`) with async barriers to build a multi-stage
+  software pipeline where local TMA loads and remote NVSHMEM fetches proceed
+  concurrently, both feeding into consumer warps via shared memory.
+
+## Architecture
+
+4-GPU GCN with NVSHMEM:
+- Graph is partitioned across GPUs (nodes divided evenly)
+- Each GPU holds embeddings for its local nodes in NVSHMEM symmetric memory
+- CSR is split into local edges (neighbor on same GPU) and remote edges
+- SpMM kernel processes local edges from GPU memory, remote edges via
+  `nvshmemx_float_get_warp()` to fetch from remote GPUs
+
+Pipeline per iteration:
+1. Dense layer 1: cuBLAS SGEMM (input_dim -> hidden_dim)
+2. SpMM layer 1: multi-GPU neighbor aggregation (YOUR kernel)
+3. Dense layer 2: cuBLAS SGEMM (hidden_dim -> output_dim)
+4. SpMM layer 2: multi-GPU neighbor aggregation (YOUR kernel)
+5. Softmax: cuDNN softmax
+
+## Solution Files
+
+The LLM optimizes the multi-GPU SpMM kernel in:
+- `src/include/neighbor_utils.cuh` -- contains `mgg_SAG_np_div_cuda` kernel
+  and `mgg_SAG_np_div` host launcher
+
+Key kernel: `mgg_SAG_np_div_cuda` processes each node in one thread block:
+1. Local phase: iterate local edges, accumulate neighbor embeddings in shared memory
+2. Remote phase: iterate remote edges, use `nvshmemx_float_get_warp()` to fetch
+   embeddings from remote GPUs, accumulate in shared memory
+3. Write results to output with atomicAdd
+
+## Key NVSHMEM APIs
+
+```cuda
+// Warp-level collective get: all 32 threads in a warp cooperatively
+// fetch `nelems` floats from PE `pe` into local shared memory
+nvshmemx_float_get_warp(float* dest, const float* source, size_t nelems, int pe);
+
+// Block-level version
+nvshmemx_float_get_block(float* dest, const float* source, size_t nelems, int pe);
+
+// Non-blocking warp-level get
+nvshmemx_float_get_nbi_warp(float* dest, const float* source, size_t nelems, int pe);
+
+// Allocate symmetric memory visible to all PEs
+float* buf = (float*)nvshmem_malloc(size);
+```
+
+## Parameters
+
+- `partSize`: neighbor partition size per warp (default: 16)
+- `warpPerBlock`: warps per thread block (default: 4)
+- `interleaved_dist`: interleaving distance for pipeline (default: 16)
+
+## Test Configuration
+
+- Graph: ogbn-papers100M (111M nodes, 1.6B edges)
+- Model: 2-layer GCN, input_dim=128, hidden=16, output=64
+- GPUs: 4x NVIDIA RTX PRO 6000 Blackwell (96GB each)
+- Launch: `mpirun -np 4` with NVSHMEM
+- Profiling: 100 iterations, report average per-iteration time
+
+## Build & Run
+
+```bash
+bash prepare_data.sh /path/to/MGG_data
+MGG_DATA_DIR=/path/to/MGG_data python run.py
+```
+
+## Dependencies
+
+- NVSHMEM 3.6.5 (device + host libraries)
+- OpenMPI 4.1.x
+- cuBLAS, cuDNN
+- CUDA 13.0+
+
+## Reference
+
+MGG: Accelerating Graph Neural Networks with Fine-Grained Intra-Kernel
+Communication-Computation Pipelining on Multi-GPU Platforms (OSDI'23).

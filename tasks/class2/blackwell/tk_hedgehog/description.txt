@@ -1,0 +1,51 @@
+# Task: tk_hedgehog
+
+## Target Hardware
+NVIDIA Blackwell GPU (SM100).
+
+
+Hedgehog Attention on B200, matching ThunderKittens performance.
+
+Hybrid attention combining sliding window (softmax) + linear attention with learned feature maps.
+D=128 (head dim), hardcoded.
+
+## Function Signature
+
+Implement in solution.h:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
+void HedgehogAttention(
+    __nv_bfloat16 *Q, __nv_bfloat16 *K, __nv_bfloat16 *V, __nv_bfloat16 *O,
+    __nv_bfloat16 *Q_map, __nv_bfloat16 *K_map,
+    float *alphas, float *betas,
+    int B, int H, int N);
+```
+
+## Operation
+
+For each position, combines:
+1. Sliding window attention: standard softmax attention on recent context (weighted by betas)
+2. Linear attention: uses learned feature maps Q_map/K_map with KV state (weighted by alphas)
+
+Where:
+- Q, K, V: [B, H, N, 128] bf16
+- O: [B, H, N, 128] bf16 output
+- Q_map: [H, 128, 64] bf16 learned query feature map
+- K_map: [H, 128, 64] bf16 learned key feature map
+- alphas: [H] float, linear attention weight per head
+- betas: [H] float, sliding window weight per head
+
+## Build & Test
+
+```bash
+conda activate attn
+python gentests.py randn
+make test
+./test randn.txt
+```
+
+Requires B200 GPU (SM100a). ThunderKittens headers on include path.

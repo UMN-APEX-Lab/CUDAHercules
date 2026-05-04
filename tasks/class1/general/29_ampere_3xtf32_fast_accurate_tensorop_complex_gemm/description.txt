@@ -1,0 +1,61 @@
+# Task: 29_ampere_3xtf32_fast_accurate_tensorop_complex_gemm
+
+Complex float GEMM with 3xTF32 accuracy. A is column-major, B/C/D are row-major.
+Complex numbers stored as interleaved (real, imag) float pairs.
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+
+cudaError_t ComplexGemm(
+    int M, int N, int K,
+    float alpha_real, float alpha_imag,
+    float const *A, int lda,
+    float const *B, int ldb,
+    float beta_real, float beta_imag,
+    float const *C, int ldc,
+    float *D, int ldd);
+```
+
+## Operation
+
+D = alpha * A * B + beta * C  (complex arithmetic)
+
+Where:
+- A is M x K (column-major complex)
+- B is K x N (row-major complex)
+- C is M x N (row-major complex)
+- D is M x N (row-major complex)
+
+## Data Types
+
+All matrices use `float` pairs for complex numbers. Each complex element occupies 2 consecutive floats: (real, imaginary).
+
+## Memory Layout
+
+Complex numbers are stored as interleaved (real, imag) pairs.
+lda/ldb/ldc/ldd are in units of complex elements (not floats).
+
+- A (column-major): Element (i,k) at `A[(i + k*lda)*2]` (real), `A[(i + k*lda)*2+1]` (imag). lda >= M.
+- B (row-major): Element (k,j) at `B[(k*ldb + j)*2]` (real), `B[(k*ldb + j)*2+1]` (imag). ldb >= N.
+- C (row-major): Element (i,j) at `C[(i*ldc + j)*2]` (real), `C[(i*ldc + j)*2+1]` (imag). ldc >= N.
+- D (row-major): Element (i,j) at `D[(i*ldd + j)*2]` (real), `D[(i*ldd + j)*2+1]` (imag). ldd >= N.
+
+## Build & Test
+
+```bash
+make test                       # requires solution.h in task directory
+./test                          # default: runs small/medium/large sizes
+./test 1024 1024 1024           # custom single size: M N K
+./test 1024 1024 1024 1.0 0.0 0.0 0.0 20  # M N K alpha_re alpha_im beta_re beta_im iterations
+```
+
+Correctness is verified against a reference implementation at multiple problem sizes
+(small: 1024x1024x1024, medium: 4096x4096x4096, large: 8192x8192x8192).
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

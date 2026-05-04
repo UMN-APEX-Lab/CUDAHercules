@@ -1,0 +1,60 @@
+# Task: flash_attn4_bwd (Class 4 - Unsolved)
+
+Implement the FlashAttention-4 backward pass using CUDA/PTX code for NVIDIA
+Blackwell (SM100) GPUs, without using CuTe DSL or existing flash-attention
+backward kernels.
+
+## Goal
+
+Given upstream gradient dO and saved forward tensors Q, K, V, O, and LSE,
+compute dQ, dK, and dV for BF16 FlashAttention-4.
+
+The expected PyTorch extension entry point is:
+
+```c++
+std::vector<torch::Tensor> flash_attn4_bwd(
+    torch::Tensor Q,       // [batch, seqlen_q, num_heads, head_dim] BF16
+    torch::Tensor K,       // [batch, seqlen_k, num_heads_k, head_dim] BF16
+    torch::Tensor V,       // [batch, seqlen_k, num_heads_k, head_dim] BF16
+    torch::Tensor O,       // saved forward output, BF16
+    torch::Tensor dO,      // upstream gradient, BF16
+    torch::Tensor LSE,     // [batch, num_heads, seqlen_q] FP32
+    bool is_causal
+);
+```
+
+Return `{dQ, dK, dV}` with shapes matching Q, K, and V.
+
+## Required Algorithmic Work
+
+- Recompute attention scores from Q and K tiles without materializing the full
+  attention matrix.
+- Use saved LSE to reconstruct softmax probabilities.
+- Compute dV = P^T dO and dS = P * (dP - rowsum(dO * O)).
+- Accumulate dQ and dK through tiled QK recomputation.
+- Support causal and non-causal masking.
+- Support GQA, where `num_heads_k` may be smaller than `num_heads`.
+- Target Blackwell-specific FA4 scheduling: TMA loads, tcgen05 MMA, TMEM
+  accumulators, and warp-specialized producer/consumer pipelines.
+
+## Supported Configurations
+
+- Precision: BF16 inputs and gradients, FP32 accumulation.
+- Head dimensions: 64, 128, 256.
+- Sequence lengths: 1K to 32K in the full challenge setting.
+- Causal and non-causal attention.
+- GQA with `num_heads % num_heads_k == 0`.
+
+## Metrics
+
+- Correctness: dQ, dK, and dV are compared against PyTorch SDPA autograd with
+  atol=5e-2 and rtol=5e-2.
+- Performance: total backward kernel time, with PyTorch SDPA autograd reported
+  as a baseline when available.
+
+## Reference Materials
+
+The forward task in `../flash_attn4_fwd` includes the FA4 paper and official
+CuTe DSL forward reference. The backward task intentionally does not provide a
+CuTe backward implementation; the challenge is to derive and implement the
+tiled backward pass in hand-written CUDA/PTX.

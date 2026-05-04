@@ -1,0 +1,109 @@
+# Task: parafrost_sat (Blackwell)
+
+Generate a self-contained GPU-accelerated SAT solver project,
+leveraging Blackwell (SM100+) architecture features.
+
+## Goal
+
+Maximize SAT solving throughput with a custom CUDA SAT backend.
+The benchmark does not require compatibility with the upstream ParaFROST
+source tree. Instead, you generate a standalone project under
+`generated_project/` that builds and runs through the benchmark contract.
+
+You should exploit Blackwell-generation GPU features where applicable:
+- **TMA (Tensor Memory Accelerator)**: Use `cp.async.bulk` / TMA descriptors
+  to efficiently stream the clause database between global and shared memory.
+  Clause access during BVE resolution, subsumption checks, and occurrence
+  table construction involves bulk sequential reads of variable-length clauses
+  -- TMA's hardware-managed transfers eliminate software loop overhead and
+  improve memory bandwidth utilization.
+- **Warp specialization**: Separate producer warps (prefetching clauses and
+  occurrence lists via TMA) from consumer warps (performing resolution,
+  subsumption checks, or equivalence detection). This is particularly effective
+  for BVE where clause pairs must be loaded, resolved, and written back --
+  producers can stream the next clause pair while consumers process the current
+  one.
+- **Asynchronous barriers**: Use `cp.async.mbarrier` to coordinate between
+  solver and inprocessor phases. Within BVE, async barriers synchronize the
+  multi-phase pipeline (candidate counting -> prefix scan -> resolvent
+  generation) without costly global synchronization. Within subsumption,
+  barriers coordinate parallel clause-pair checking across warps.
+- **Thread block clusters**: Use clusters for cooperative clause processing
+  during BVE. When eliminating a variable, all clauses containing that variable
+  must be resolved pairwise -- distributing this work across a cluster of
+  thread blocks allows shared access to the occurrence table via DSMEM.
+- **Distributed shared memory (DSMEM)**: Pool shared memory across SMs in a
+  cluster to hold larger portions of the occurrence table or clause database
+  during variable elimination. High-degree variables generate many resolvent
+  candidates -- DSMEM avoids spilling to global memory.
+- **Tensor Cores / accelerated reductions**: While SAT solving is primarily
+  integer/bitwise, the histogram computation and variable scoring phases
+  involve large reductions that may benefit from batched matrix-like
+  reformulations or other Blackwell-friendly reduction primitives when
+  profitable.
+
+## GPU Inprocessing Pipeline
+
+Each simplification round on GPU:
+1. **Occurrence table construction**: Build literal->clause lookup tables
+2. **Variable scoring**: Compute elimination priority for each variable
+3. **Variable elimination (BVE)**: Resolve clauses containing selected variables
+   - Phase 1: Compute resolution candidates and count products
+   - Phase 2: Prefix scan for memory allocation
+   - Phase 3: Generate resolvent clauses
+4. **Subsumption**: Remove clauses that are supersets of others
+5. **Blocked clause elimination**: Remove clauses that cannot participate in proofs
+6. **Equivalence reasoning**: Detect and merge equivalent variables
+7. **Redundancy elimination**: Remove logically redundant clauses
+8. **Memory recycling**: Garbage collection and compaction
+
+## Test Instances
+
+Real-world SAT Competition formulas (2013–2021) from Zenodo 5138008
+("Large SAT Benchmark Suite", the exact dataset used in the ParaFROST
+FMSD'24 paper §12.1). A curated 10-instance subset is provided, stratified
+across difficulty tiers:
+
+| Tier | Count | ParaFROST reference time |
+|---|---|---|
+| small | 6 | 5–30 s each |
+| medium | 2 | 100–500 s each |
+| large | 2 | 500–1800 s each |
+
+Instances span multiple applications (hardware/software BMC, combinational
+equivalence, planning/scheduling, cryptographic, graph coloring, etc.) and
+include both SAT and UNSAT cases. Exact filenames are provided in
+`<INPUT_DIR>/instances.json` at evaluation time — do not hard-code them.
+
+## Correctness
+
+Your solver must produce the same SAT/UNSAT verdict as the benchmark-owned
+reference on all supplied instances. Each SAT verdict must include a
+satisfying assignment that is verified clause-by-clause against the original
+CNF. UNSAT verdicts cannot be faked — random local-search (WalkSAT/GSAT/PPS)
+solvers fail this gate because they cannot prove UNSAT; the search core must
+be complete (CDCL or equivalent).
+
+Per-instance timeout: **1800 s** (aligned with paper §12.1).
+
+## Deliverable
+
+Generate a complete project under:
+
+- `generated_project/`
+
+The benchmark first asks for `project_manifest.json`, then asks for the listed
+files one by one. See `build_contract.md` and `project_manifest_example.json`
+for the exact interface.
+
+## Build & Run Contract
+
+The benchmark invokes your project through:
+
+```bash
+bash build.sh
+bash run.sh --input-dir <INPUT_DIR> --output-dir <OUTPUT_DIR> [--ref-time-ms <FLOAT>]
+```
+
+The benchmark owns the SAT instances and passes them through `<INPUT_DIR>`.
+Your project must not read the upstream `src/`, `dep/`, or `data/` trees.

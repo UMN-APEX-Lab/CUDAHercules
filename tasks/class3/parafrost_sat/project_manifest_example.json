@@ -1,0 +1,26 @@
+{
+  "build_script": "build.sh",
+  "run_script": "run.sh",
+  "files": [
+    "build.sh",
+    "run.sh",
+    "src/main.cu",
+    "src/sat_core.cu",
+    "src/dimacs_parser.cpp",
+    "src/common.h"
+  ],
+  "cuda_sources": [
+    "src/main.cu",
+    "src/sat_core.cu"
+  ],
+  "ops": {
+    "occurrence_table": "src/sat_core.cu",
+    "variable_scoring": "src/sat_core.cu",
+    "elimination": "src/sat_core.cu",
+    "subsumption": "src/sat_core.cu",
+    "blocked_clause_elimination": "src/sat_core.cu",
+    "equivalence_reasoning": "src/sat_core.cu",
+    "redundancy_elimination": "src/sat_core.cu",
+    "memory_recycling": "src/sat_core.cu"
+  }
+}

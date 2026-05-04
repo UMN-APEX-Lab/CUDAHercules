@@ -1,0 +1,55 @@
+# Task: icicle_zk (Blackwell)
+
+Optimize end-to-end performance of NTT and MSM — the two core
+computational primitives in zero-knowledge proof systems — leveraging
+Blackwell architecture features.
+
+## Goal
+
+Implement high-performance CUDA kernels for NTT (Number Theoretic Transform)
+and MSM (Multi-Scalar Multiplication) on the BN254 elliptic curve. Performance
+is measured across multiple input sizes and compared against both a CPU
+baseline and an optimized CUDA reference (Icicle).
+
+You should exploit Blackwell-generation GPU features where applicable.
+
+## Operations
+
+### NTT (Number Theoretic Transform)
+- Finite-field FFT over BN254 scalar field (254-bit prime)
+- Sizes: 2^16, 2^18, 2^20, 2^22, 2^24 elements
+- Forward transform with Cooley-Tukey butterfly
+
+### MSM (Multi-Scalar Multiplication)
+- Compute sum of scalar[i] * point[i] on BN254 G1 curve
+- Sizes: 2^14, 2^16, 2^18, 2^20, 2^22 points
+- Requires 256-bit modular arithmetic and elliptic curve operations
+
+## Metrics
+
+- **Kernel time**: E2E total = NTT total + MSM total across all sizes
+- **Per-op breakdown**: Individual NTT and MSM times at each size
+- **Correctness**: All results must match CPU reference exactly
+
+## Solution
+
+You are writing exactly one file: `custom_cuda_backend/backend.cu`.
+
+The benchmark compiles this file into a shared library and calls it through the
+fixed exported ABI declared in `custom_backend_api.h`.
+
+Important implications:
+- you do **not** need to generate `build.sh` or `CMakeLists.txt`
+- you do **not** need to implement Icicle backend registration
+- your code receives the benchmark's actual NTT/MSM inputs directly
+- correctness is checked against the CPU reference
+- performance is compared against the provided GPU reference backend
+
+Blackwell-specific optimization is allowed, but robustness and ABI correctness
+still come first.
+
+## Build & Run
+
+```bash
+python run.py
+```

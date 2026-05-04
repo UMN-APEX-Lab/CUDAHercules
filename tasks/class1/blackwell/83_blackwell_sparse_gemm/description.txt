@@ -1,0 +1,195 @@
+# Task: 83_blackwell_sparse_gemm
+
+## Target Hardware
+NVIDIA Blackwell GPU (SM100/SM120).
+
+
+Blackwell SM100 Sparse GEMM test harness — 2:4 structured sparsity
+Half-precision input, float output
+Based on CUTLASS example 62_hopper_sparse_gemm adapted for Blackwell SM100
+The LLM must implement:
+  cudaError_t BlackwellSparseGemm(int M, int N, int K, float alpha,
+      __half const *A_compressed, uint16_t const *A_metadata,
+      __half const *B, int ldb, float beta,
+      float *D, int ldd);
+A is 2:4 sparse compressed: A_compressed is M x (K/2) row-major,
+A_metadata encodes which 2 of every 4 elements are non-zero.
+B is column-major [K, N] (ldb = K), D is row-major [M, N] (ldd = N).
+FP16 input, FP32 output.
+Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * Blackwell SM100 Sparse GEMM test harness — 2:4 structured sparsity
+ * Half-precision input, float output
+ * Based on CUTLASS example 62_hopper_sparse_gemm adapted for Blackwell SM100
+ *
+ * The LLM must implement:
+ *   cudaError_t BlackwellSparseGemm(int M, int N, int K, float alpha,
+ *       __half const *A_compressed, uint16_t const *A_metadata,
+ *       __half const *B, int ldb, float beta,
+ *       float *D, int ldd);
+ *
+ * A is 2:4 sparse compressed: A_compressed is M x (K/2) row-major,
+ * A_metadata encodes which 2 of every 4 elements are non-zero.
+ * B is column-major [K, N] (ldb = K), D is row-major [M, N] (ldd = N).
+ * FP16 input, FP32 output.
+ *
+ * Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+ */
+
+#include <cuda_fp16.h>
+#include <iostream>
+#include <vector>
+#include <cstdint>
+#include <cmath>
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status)                                              \
+  {                                                                     \
+    cudaError_t error = status;                                         \
+    if (error != cudaSuccess) {                                         \
+      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
+                << " at line: " << __LINE__ << std::endl;               \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
+  }
+
+extern cudaError_t BlackwellSparseGemm(
+  int M, int N, int K, float alpha,
+  __half const *A_compressed, uint16_t const *A_metadata,
+  __half const *B, int ldb, float beta,
+  float *D, int ldd);
+
+/// CPU reference: dense GEMM for correctness
+/// A: row-major dense (M x K), B: column-major (K x N), D: row-major (M x N)
+void reference_gemm(int M, int N, int K, float alpha,
+  std::vector<float> const &A, int lda,
+  std::vector<float> const &B, int ldb,
+  float beta,
+  std::vector<float> &D, int ldd) {
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      float acc = 0;
+      for (int k = 0; k < K; ++k)
+        acc += A[i * lda + k] * B[k + j * ldb];
+      D[i * ldd + j] = alpha * acc + beta * D[i * ldd + j];
+    }
+}
+
+/// Create dense matrix with 2:4 sparsity: positions 1,3 in each group of 4 are zero
+void create_dense_2_4(std::vector<float> &dense, int M, int K) {
+  for (int i = 0; i < M; ++i)
+    for (int k = 0; k < K; ++k) {
+      int pos = k % 4;
+      if (pos == 1 || pos == 3)
+        dense[i * K + k] = 0.0f;
+      else
+        dense[i * K + k] = float(((i * K + k) * 16807 % 16) - 8) * 0.01f;
+    }
+}
+
+/// Compress dense 2:4 matrix into compressed + metadata format
+void create_sparse_2_4(
+  std::vector<float> const &dense, int M, int K,
+  std::vector<float> &compressed, std::vector<uint16_t> &metadata) {
+  int K_comp = K / 2;
+  compressed.resize(M * K_comp);
+  int meta_cols = K / 16;
+  if (meta_cols == 0) meta_cols = 1;
+  metadata.resize(M * meta_cols, 0);
+
+  for (int i = 0; i < M; ++i) {
+    int ci = 0;
+    for (int kg = 0; kg < K; kg += 4) {
+      // Positions 0 and 2 are non-zero
+      int idx0 = 0, idx1 = 2;
+      compressed[i * K_comp + ci]     = dense[i * K + kg + idx0];
+      compressed[i * K_comp + ci + 1] = dense[i * K + kg + idx1];
+      ci += 2;
+      int group = kg / 4;
+      int meta_word = group / 4;
+      int meta_shift = (group % 4) * 4;
+      uint16_t bits = (uint16_t)((idx0 & 0x3) | ((idx1 & 0x3) << 2));
+      metadata[i * meta_cols + meta_word] |= (bits << meta_shift);
+    }
+  }
+}
+
+int main() {
+  int M = 128, N = 128, K = 256;
+  int ldb = K, ldd = N;
+  float alpha = 1.0f, beta = 0.0f;
+
+  std::vector<float> fA_dense(M * K), fB(K * N), fD(M * N, 0), fRef(M * N, 0);
+  create_dense_2_4(fA_dense, M, K);
+  for (int i = 0; i < K * N; ++i)
+    fB[i] = float((i * 48271 % 16) - 8) * 0.01f;
+
+  std::vector<float> fA_comp;
+  std::vector<uint16_t> h_meta;
+  create_sparse_2_4(fA_dense, M, K, fA_comp, h_meta);
+
+  int K_comp = K / 2;
+  int meta_cols = K / 16;
+  if (meta_cols == 0) meta_cols = 1;
+
+  // Convert to half
+  std::vector<__half> hA_comp(M * K_comp), hB(K * N);
+  for (int i = 0; i < M * K_comp; ++i) hA_comp[i] = __float2half(fA_comp[i]);
+  for (int i = 0; i < K * N; ++i) hB[i] = __float2half(fB[i]);
+
+  __half *dA_comp, *dB;
+  float *dD;
+  uint16_t *dA_meta;
+  CUDA_CHECK(cudaMalloc(&dA_comp, M * K_comp * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dA_meta, M * meta_cols * sizeof(uint16_t)));
+  CUDA_CHECK(cudaMalloc(&dB, K * N * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dD, M * N * sizeof(float)));
+
+  CUDA_CHECK(cudaMemcpy(dA_comp, hA_comp.data(), M * K_comp * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dA_meta, h_meta.data(), M * meta_cols * sizeof(uint16_t), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB, hB.data(), K * N * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(dD, 0, M * N * sizeof(float)));
+
+  cudaError_t r = BlackwellSparseGemm(M, N, K, alpha, dA_comp, dA_meta, dB, ldb, beta, dD, ldd);
+  if (r != cudaSuccess) {
+    std::cerr << "BlackwellSparseGemm failed: " << cudaGetErrorString(r) << std::endl;
+    cudaFree(dA_comp); cudaFree(dA_meta); cudaFree(dB); cudaFree(dD);
+    return -1;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && r == cudaSuccess) {
+      kh_benchmark([&]() { BlackwellSparseGemm(M, N, K, alpha, dA_comp, dA_meta, dB, ldb, beta, dD, ldd); }, _kh_trials);
+    }
+  }
+
+
+  std::vector<float> hD(M * N);
+  CUDA_CHECK(cudaMemcpy(hD.data(), dD, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+  cudaFree(dA_comp); cudaFree(dA_meta); cudaFree(dB); cudaFree(dD);
+
+  for (int i = 0; i < M * N; ++i) fD[i] = hD[i];
+  reference_gemm(M, N, K, alpha, fA_dense, K, fB, ldb, beta, fRef, ldd);
+
+  float max_diff = 0;
+  for (int i = 0; i < M * N; ++i)
+    max_diff = fmaxf(max_diff, fabsf(fD[i] - fRef[i]));
+  if (max_diff > 1.0f) {
+    std::cerr << "Results incorrect. Max diff: " << max_diff << std::endl;
+    return -1;
+  }
+  std::cout << "Passed." << std::endl;
+  return 0;
+}
+```

@@ -1,0 +1,308 @@
+#include <iostream>
+#include <string>
+#include <fstream>
+
+#ifdef KH_TEST_SOLUTION
+#include "solution.h"
+#endif
+
+#define ATTN_B 32
+#define ATTN_N 2048
+#define ATTN_H 16 // launches
+#define ATTN_D 64 // make sure to change in the kernel rotary.cu as well
+using rope_t = rotary_template<ATTN_D>;
+
+const int ATTN_D_2 = ATTN_D / 2;
+
+#define CudaCheckError()    __cudaCheckError( __FILE__, __LINE__ )
+inline void __cudaCheckError( const char *file, const int line ) {
+    cudaError err = cudaGetLastError();
+    if ( cudaSuccess != err )
+    {
+        fprintf( stderr, "cudaCheckError() failed at %s:%i : %s\n",
+                file, line, cudaGetErrorString( err ) );
+        exit( -1 );
+    }
+    // More careful checking. However, this will affect performance.
+    // Comment away if needed.
+    err = cudaDeviceSynchronize();
+    if( cudaSuccess != err )
+    {
+        fprintf( stderr, "cudaCheckError() with sync failed at %s:%i : %s\n",
+                file, line, cudaGetErrorString( err ) );
+        exit( -1 );
+    }
+}
+
+// Function to calculate the number of floating-point operations
+long long flops(int batch, int seqlen, int headdim, int nheads) {
+    // feature map
+    long long f = batch * static_cast<long long>(seqlen) * nheads * (headdim / 2);
+    f += batch * static_cast<long long>(seqlen) * nheads * (headdim / 2);
+    f += batch * static_cast<long long>(seqlen) * nheads * (headdim / 2);
+    return f;
+}
+
+// Function to calculate the efficiency in teraflops
+double efficiency(long long flop, double time) {
+    // Convert flop to teraflops and time to milliseconds
+    double tflops = flop / 1e12;
+    double time_ms = time / 1e6;
+    return tflops / time_ms;
+}
+
+// Helper to launch the TK rotary kernel
+void launch_tk_rotary(bf16 *d_o, bf16 *d_x, bf16 *d_sin_in, bf16 *d_cos_in) {
+    unsigned long mem_size = (MAX_SHARED_MEMORY-2048);
+    cudaFuncSetAttribute(
+        kittens::prototype::lcsf::kernel<rope_t>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        mem_size
+    );
+
+    constexpr int BATCHES_PER_BLOCK = 4;
+    rope_t::layout::seq_global Og{d_o, ATTN_B, ATTN_H, ATTN_N, nullptr};
+    rope_t::layout::seq_global Xg{d_x, ATTN_B, ATTN_H, ATTN_N, nullptr};
+    rope_t::layout::rope_global SINg{d_sin_in, nullptr, nullptr, ATTN_N, nullptr};
+    rope_t::layout::rope_global COSg{d_cos_in, nullptr, nullptr, ATTN_N, nullptr};
+    rope_t::layout::globals g{Og, Xg, SINg, COSg, BATCHES_PER_BLOCK};
+
+    constexpr int ROWS_PER_BLOCK = rope_t::NUM_CONSUMER_WARPS * rope_t::layout::seq_tile::rows;
+    dim3 grid((ATTN_N+ROWS_PER_BLOCK-1)/ROWS_PER_BLOCK, (ATTN_B+BATCHES_PER_BLOCK-1)/BATCHES_PER_BLOCK);
+    dim3 block(kittens::prototype::detail::NUM_THREADS_v<rope_t>);
+    kittens::prototype::lcsf::kernel<rope_t><<<grid, block, mem_size>>>(g);
+}
+
+int main(int argc, char **argv) {
+    std::cout << "Entered main!" << std::endl;
+
+    // create dummy variables that are the right size
+    constexpr int TOTAL_ELEMENTS_X = ATTN_B*ATTN_H*ATTN_N*ATTN_D;
+    constexpr int TOTAL_ELEMENTS_O = ATTN_B*ATTN_H*ATTN_N*ATTN_D;
+    constexpr int TOTAL_UNIQUE_ELEMENTS_X = ATTN_N*ATTN_D;
+    constexpr int TOTAL_UNIQUE_ELEMENTS_O = ATTN_N*ATTN_D;
+
+    float *x = new float[TOTAL_UNIQUE_ELEMENTS_X];
+    bf16 *x_bf = new bf16[TOTAL_ELEMENTS_X];
+
+    float *o_ref = new float[TOTAL_UNIQUE_ELEMENTS_O];
+    bf16 *o_bf = new bf16[TOTAL_ELEMENTS_O];
+    float *o = new float[TOTAL_ELEMENTS_O];
+
+    constexpr int TOTAL_ELEMENTS_COS_IN = ATTN_N*ATTN_D_2;
+    float *cos_in = new float[TOTAL_ELEMENTS_COS_IN];
+    bf16  *cos_in_bf = new bf16[TOTAL_ELEMENTS_COS_IN];
+    float *sin_in = new float[TOTAL_ELEMENTS_COS_IN];
+    bf16  *sin_in_bf = new bf16[TOTAL_ELEMENTS_COS_IN];
+
+    // set the inputs
+    if(argc > 1) {
+        std::ifstream infile(argv[1]);
+        printf("Loading from %s\n", argv[1]);
+        std::cout << "Starting to enter!" << std::endl;
+        for(int i = 0; i < TOTAL_UNIQUE_ELEMENTS_X; i++) {
+            infile >> x[i];
+            // if (i < 5)  { std::cout << x[i] << std::endl; }
+        }
+        std::cout << "Finished loading X" << std::endl;
+        for(int i = 0; i < TOTAL_UNIQUE_ELEMENTS_O; i++) {
+            infile >> o_ref[i];
+            // o_ref[i] = x[i];
+            // if (i < 5)  { std::cout << o_ref[i] << std::endl; }
+        }
+        std::cout << "Finished loading O_REF" << std::endl;
+
+        for(int i = 0; i < TOTAL_ELEMENTS_COS_IN; i++) {
+            infile >> cos_in[i];
+            // if (i < 5)  { std::cout << cos_in[i] << std::endl; }
+        }
+        std::cout << "Finished loading COS_IN" << std::endl;
+        for(int i = 0; i < TOTAL_ELEMENTS_COS_IN; i++) {
+            infile >> sin_in[i];
+            // if (i < 50)  { std::cout << sin_in[i] << std::endl; }
+        }
+        std::cout << "Finished loading SIN_IN" << std::endl;
+
+        std::cout << "Finished loading file from " << argv[1] << "!" << std::endl;
+    }
+    else {
+        // No input file: generate random data on host
+        srand(42);
+        for(int i = 0; i < TOTAL_UNIQUE_ELEMENTS_X; i++) {
+            x[i] = ((float)rand() / RAND_MAX) * 2.0f - 1.0f;
+        }
+        // Generate sin/cos tables
+        const float base = 10000.0f;
+        for(int pos = 0; pos < ATTN_N; pos++) {
+            for(int d = 0; d < ATTN_D_2; d++) {
+                float freq = 1.0f / powf(base, (float)(2 * d) / (float)ATTN_D);
+                float angle = pos * freq;
+                cos_in[pos * ATTN_D_2 + d] = cosf(angle);
+                sin_in[pos * ATTN_D_2 + d] = sinf(angle);
+            }
+        }
+    }
+
+    // set the inputs
+    for(int i = 0; i < TOTAL_ELEMENTS_X; i++) {
+        x_bf[i] = __float2bfloat16(x[i % TOTAL_UNIQUE_ELEMENTS_X]);
+        // if (i < 5) { std::cout << x[i % TOTAL_UNIQUE_ELEMENTS_X] << std::endl; }
+    }
+    for(int i = 0; i < TOTAL_ELEMENTS_COS_IN; i++) {
+        cos_in_bf[i] = __float2bfloat16(cos_in[i % TOTAL_ELEMENTS_COS_IN]);
+        // if (i < 5) { std::cout << __bfloat162float(cos_in_bf[i]) << std::endl; }
+        sin_in_bf[i] = __float2bfloat16(sin_in[i % TOTAL_ELEMENTS_COS_IN]);
+    }
+
+    bf16 *d_x, *d_o;
+    cudaMalloc(&d_x, TOTAL_ELEMENTS_X * sizeof(bf16));
+    cudaMalloc(&d_o, TOTAL_ELEMENTS_O * sizeof(bf16));
+    cudaMemcpy(d_x, x_bf, TOTAL_ELEMENTS_X * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_o, o_bf, TOTAL_ELEMENTS_O * sizeof(bf16), cudaMemcpyHostToDevice);
+
+    bf16 *d_cos_in, *d_sin_in;
+    cudaMalloc(&d_cos_in, TOTAL_ELEMENTS_COS_IN * sizeof(bf16));
+    cudaMalloc(&d_sin_in, TOTAL_ELEMENTS_COS_IN * sizeof(bf16));
+    cudaMemcpy(d_cos_in, cos_in_bf, TOTAL_ELEMENTS_COS_IN * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sin_in, sin_in_bf, TOTAL_ELEMENTS_COS_IN * sizeof(bf16), cudaMemcpyHostToDevice);
+
+    cudaDeviceSynchronize();
+    CudaCheckError();
+
+    std::cout << "Starting kernel\n";
+    launch_tk_rotary(d_o, d_x, d_sin_in, d_cos_in);
+    cudaDeviceSynchronize();
+    CudaCheckError();
+    std::cout << "Finished kernel\n";
+
+    // check correctness
+    cudaMemcpy(o_bf, d_o, TOTAL_ELEMENTS_O * sizeof(bf16), cudaMemcpyDeviceToHost);
+    for(int i = 0; i < TOTAL_ELEMENTS_O; i++) { o[i] = __bfloat162float(o_bf[i]); }
+
+    // Calculate efficiency
+    long long f = flops(ATTN_B, ATTN_N, ATTN_D, ATTN_H);
+    std::cout << "FLOPS: " << f << std::endl;
+
+#ifdef KH_TEST_SOLUTION
+    // --- Solution testing block ---
+    bf16 *d_o_solution;
+    cudaMalloc(&d_o_solution, TOTAL_ELEMENTS_O * sizeof(bf16));
+
+    // Run solution kernel
+    FusedRotary(
+        reinterpret_cast<__nv_bfloat16*>(d_o_solution),
+        reinterpret_cast<__nv_bfloat16*>(d_x),
+        reinterpret_cast<__nv_bfloat16*>(d_sin_in),
+        reinterpret_cast<__nv_bfloat16*>(d_cos_in),
+        ATTN_B, ATTN_H, ATTN_N, ATTN_D);
+    cudaDeviceSynchronize();
+    CudaCheckError();
+
+    // Compare solution output vs TK output
+    bf16 *sol_bf = new bf16[TOTAL_ELEMENTS_O];
+    float *sol_f = new float[TOTAL_ELEMENTS_O];
+    cudaMemcpy(sol_bf, d_o_solution, TOTAL_ELEMENTS_O * sizeof(bf16), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < TOTAL_ELEMENTS_O; i++) {
+        sol_f[i] = __bfloat162float(sol_bf[i]);
+    }
+
+    printf("\n=== rotary: B=%d, H=%d, N=%d, D=%d ===\n", ATTN_B, ATTN_H, ATTN_N, ATTN_D);
+    bool sol_correct = true;
+    int sol_diff_counter = 0;
+    float sol_max_diff = 0.0f;
+    constexpr float TOLERANCE = 0.1f;
+
+    for (int i = 0; i < TOTAL_ELEMENTS_O; i++) {
+        float diff = fabsf(sol_f[i] - o[i]);
+        if (isnan(diff) || isinf(sol_f[i]) || diff > TOLERANCE) {
+            sol_correct = false;
+            sol_diff_counter++;
+        }
+        sol_max_diff = fmaxf(sol_max_diff, diff);
+    }
+
+    if (sol_correct) {
+        printf("Passed\n");
+    } else {
+        printf("Failed (%d elements differ, max diff: %f)\n", sol_diff_counter, sol_max_diff);
+        printf("Incorrect\n");
+        return -1;
+    }
+
+    // CUDA event timing
+    const int WARMUP = 3;
+    const int TIMED = 10;
+    cudaEvent_t ev_start, ev_stop;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+
+    // --- Time TK reference kernel ---
+    for (int i = 0; i < WARMUP; i++) {
+        launch_tk_rotary(d_o, d_x, d_sin_in, d_cos_in);
+    }
+    cudaDeviceSynchronize();
+
+    float ref_total_ms = 0.0f;
+    float ref_min_ms = 1e9f;
+    for (int i = 0; i < TIMED; i++) {
+        cudaEventRecord(ev_start);
+        launch_tk_rotary(d_o, d_x, d_sin_in, d_cos_in);
+        cudaEventRecord(ev_stop);
+        cudaEventSynchronize(ev_stop);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, ev_start, ev_stop);
+        ref_total_ms += ms;
+        if (ms < ref_min_ms) ref_min_ms = ms;
+    }
+    float ref_avg_ms = ref_total_ms / TIMED;
+
+    // --- Time solution kernel ---
+    for (int i = 0; i < WARMUP; i++) {
+        FusedRotary(
+            reinterpret_cast<__nv_bfloat16*>(d_o_solution),
+            reinterpret_cast<__nv_bfloat16*>(d_x),
+            reinterpret_cast<__nv_bfloat16*>(d_sin_in),
+            reinterpret_cast<__nv_bfloat16*>(d_cos_in),
+            ATTN_B, ATTN_H, ATTN_N, ATTN_D);
+    }
+    cudaDeviceSynchronize();
+
+    float sol_total_ms = 0.0f;
+    float sol_min_ms = 1e9f;
+    for (int i = 0; i < TIMED; i++) {
+        cudaEventRecord(ev_start);
+        FusedRotary(
+            reinterpret_cast<__nv_bfloat16*>(d_o_solution),
+            reinterpret_cast<__nv_bfloat16*>(d_x),
+            reinterpret_cast<__nv_bfloat16*>(d_sin_in),
+            reinterpret_cast<__nv_bfloat16*>(d_cos_in),
+            ATTN_B, ATTN_H, ATTN_N, ATTN_D);
+        cudaEventRecord(ev_stop);
+        cudaEventSynchronize(ev_stop);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, ev_start, ev_stop);
+        sol_total_ms += ms;
+        if (ms < sol_min_ms) sol_min_ms = ms;
+    }
+    float sol_avg_ms = sol_total_ms / TIMED;
+
+    printf("Ref time: %.4f ms (avg over %d trials, min: %.4f ms)\n", ref_avg_ms, TIMED, ref_min_ms);
+    printf("Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n", sol_avg_ms, TIMED, sol_min_ms);
+    printf("Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
+
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
+    delete[] sol_bf;
+    delete[] sol_f;
+    cudaFree(d_o_solution);
+#endif
+
+    cudaFree(d_x);
+    cudaFree(d_sin_in);
+    cudaFree(d_cos_in);
+    cudaFree(d_o);
+
+    delete[] x, o, o_ref, x_bf, o_bf;
+    delete[] sin_in, sin_in_bf, cos_in, cos_in_bf;
+    return 0;
+}

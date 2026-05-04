@@ -1,0 +1,78 @@
+# Task: 41_fused_multi_head_attention
+
+Fused Multi-Head Attention on half-precision (FP16) data.
+
+## Operation
+
+For each batch and head:
+  1. S[i,j] = sum_d(Q[i,d] * K[j,d]) * scale      (scale = 1/sqrt(head_dim))
+  2. P[i,j] = softmax(S[i,:])_j                    (row-wise softmax)
+  3. O[i,d] = sum_j(P[i,j] * V[j,d])               (weighted sum of values)
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+cudaError_t fmha_solution(
+    int batch_size, int seq_q, int seq_kv,
+    int num_heads, int head_dim, int head_dim_v,
+    __half const *Q, __half const *K, __half const *V, __half *O,
+    int q_strideB, int q_strideM, int q_strideH,
+    int k_strideB, int k_strideM, int k_strideH,
+    int v_strideB, int v_strideM, int v_strideH,
+    int o_strideM,
+    bool causal);
+```
+
+## Data Types
+
+All input/output matrices are `__half` (FP16). Use FP32 accumulation for numerical stability.
+
+## Memory Layout (BMHK format)
+
+Tensors are stored in **BMHK** format: [batch, seq_len, num_heads, head_dim].
+
+Element access with strides:
+- Q[b, m, h, k] at `Q[b * q_strideB + m * q_strideM + h * q_strideH + k]`
+- K[b, m, h, k] at `K[b * k_strideB + m * k_strideM + h * k_strideH + k]`
+- V[b, m, h, k] at `V[b * v_strideB + m * v_strideM + h * v_strideH + k]`
+- O[b, m, h, k] at `O[b * (seq_q * o_strideM) + m * o_strideM + h * head_dim_v + k]`
+
+Typical stride values:
+- `q_strideH = head_dim`, `q_strideM = num_heads * head_dim`, `q_strideB = seq_q * q_strideM`
+- Same pattern for K and V.
+- `o_strideM = num_heads * head_dim_v`
+
+## Causal Masking
+
+When `causal=true`, for query position i, only attend to key positions j <= i.
+Equivalently, set S[i,j] = -infinity for j > i before softmax.
+
+## Dimensions
+
+- `batch_size`: number of independent sequences
+- `seq_q`: query sequence length
+- `seq_kv`: key/value sequence length (usually equals seq_q)
+- `num_heads`: number of attention heads
+- `head_dim`: dimension of Q and K per head
+- `head_dim_v`: dimension of V and O per head (usually equals head_dim)
+
+## Build & Test
+
+```bash
+make test                             # requires solution.h in task directory
+./test                                # default: runs small/medium/large sizes
+./test --batch_size=4 --seq_length=256 --head_number=8 --head_size=64  # custom
+./test --iterations=50                # more profiling iterations (default: 20)
+```
+
+Correctness is verified against a reference implementation at multiple problem sizes
+(small: batch=4 seq=128, medium: batch=16 seq=512, large: batch=4 seq=2048).
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

@@ -1,0 +1,58 @@
+# Task: 48_hopper_warp_specialized_gemm
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+TF32 Warp-Specialized GEMM on Hopper architecture (CUTLASS 3.0).
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+
+cudaError_t HopperGemm(
+    int M, int N, int K,
+    float alpha,
+    float const *A, int lda,
+    float const *B, int ldb,
+    float beta,
+    float *C, int ldc);
+```
+
+## Operation
+
+C = alpha * A * B + beta * C
+
+Where:
+- A is M x K (row-major)
+- B is K x N (column-major)
+- C is M x N (column-major)
+
+## Data Types
+
+All matrices are `float` (FP32). The reference uses TF32 tensor cores internally.
+
+## Memory Layout
+
+- A: Row-major. Element (i,k) at `A[i * lda + k]`. lda >= K.
+- B: Column-major. Element (k,j) at `B[k + j * ldb]`. ldb >= K.
+- C: Column-major. Element (i,j) at `C[i + j * ldc]`. ldc >= M.
+
+## Build & Test
+
+```bash
+make test                    # requires solution.h in task directory
+./test                       # default: runs small/medium/large sizes
+./test 1024 1024 1024        # custom single size: M N K
+./test 1024 1024 1024 1.0 0.0 20  # M N K alpha beta iterations
+```
+
+Correctness is verified against a CUTLASS reference at multiple problem sizes
+(small: 1024, medium: 4096, large: 8192). TF32 tolerance (1% relative error).
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

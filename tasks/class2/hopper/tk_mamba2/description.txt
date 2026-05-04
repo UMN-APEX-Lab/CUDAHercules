@@ -1,0 +1,50 @@
+# Task: tk_mamba2
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+Mamba2 SSM Forward Pass on H100, matching ThunderKittens performance.
+
+Mamba2 state space model with per-position exponential decay factors.
+D=64 (head dim), hardcoded.
+
+## Function Signature
+
+Implement in solution.h:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
+void Mamba2Forward(
+    __nv_bfloat16 *Q, __nv_bfloat16 *K, __nv_bfloat16 *V,
+    __nv_bfloat16 *O, float *A,
+    int B, int H, int N);
+```
+
+## Operation
+
+Selective state space model with decay:
+- For each chunk of sequence, computes causal Q@K^T with exponential decay
+- A contains log-space decay factors per position
+- Maintains running KV state across chunks with decay
+
+Where:
+- Q: [B, 1, N, 64] bf16 queries (shared across heads via groups)
+- K: [B, 1, N, 64] bf16 keys (shared across heads)
+- V: [B, H, N, 64] bf16 values
+- A: [B, H, N] float decay factors (log-space)
+- O: [B, H, N, 64] bf16 output
+
+## Build & Test
+
+```bash
+conda activate attn
+python gentests.py randn
+make test
+./test randn.txt
+```
+
+Requires H100 GPU (SM90a). ThunderKittens headers on include path.

@@ -1,0 +1,51 @@
+# Task: 49_hopper_gemm_with_collective_builder
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+Half-precision GEMM using CUTLASS 3.0 CollectiveBuilder on Hopper.
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+cudaError_t HopperCollectiveGemm(
+    int M, int N, int K, float alpha,
+    __half const *A, int lda,
+    __half const *B, int ldb,
+    float beta,
+    __half *D, int ldd);
+```
+
+## Operation
+
+D = alpha * A * B + beta * D
+
+Where:
+- A is M x K (row-major, half)
+- B is K x N (column-major, half)
+- D is M x N (column-major, half)
+
+## Memory Layout
+
+- A: Row-major. Element (i,k) at `A[i * lda + k]`. lda >= K.
+- B: Column-major. Element (k,j) at `B[k + j * ldb]`. ldb >= K.
+- D: Column-major. Element (i,j) at `D[i + j * ldd]`. ldd >= M.
+
+## Build & Test
+
+```bash
+make test
+./test
+./test 1024 1024 1024
+```
+
+Correctness verified at small (1024), medium (4096), large (8192) sizes.
+
+CUTLASS headers are available on the include path.

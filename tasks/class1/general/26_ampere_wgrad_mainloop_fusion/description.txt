@@ -1,0 +1,62 @@
+# Task: 26_ampere_wgrad_mainloop_fusion
+
+Conv2D Weight Gradient (wgrad) with fused per-channel scale + bias + ReLU activation.
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+cudaError_t Conv2dWgradScaleBias(
+    __half const *input, __half const *grad_output,
+    __half const *scale, __half const *bias,
+    float *grad_weight,
+    int N, int C, int H, int W, int K, int R, int S,
+    int pad_h, int pad_w, int stride_h, int stride_w);
+```
+
+## Operation
+
+Fused conv2d weight gradient with per-channel scale, bias, and ReLU applied to the input
+activations BEFORE computing the weight gradient:
+
+1. Transform input:  transformed[n][h][w][c] = max(0, scale[c] * input[n][h][w][c] + bias[c])
+2. Compute wgrad:    grad_weight[k][r][s][c] = sum_{n,p,q} grad_output[n][p][q][k] * transformed[n][h][w][c]
+
+Where h = p*stride_h + r - pad_h, w = q*stride_w + s - pad_w.
+Output dimensions: P = (H + 2*pad_h - R) / stride_h + 1, Q = (W + 2*pad_w - S) / stride_w + 1.
+
+## Data Types
+
+- input:       `__half` (FP16) -- NHWC layout, the forward-pass activations
+- grad_output: `__half` (FP16) -- NHWC layout (N x P x Q x K)
+- scale:       `__half` (FP16) -- 1D vector of length C
+- bias:        `__half` (FP16) -- 1D vector of length C
+- grad_weight: `float`  (FP32) -- NHWC-style layout (K x R x S x C)
+
+## Memory Layout
+
+NHWC layout for all 4D tensors:
+- input:       N x H x W x C. Element (n,h,w,c) at offset ((n*H+h)*W+w)*C+c.
+- grad_output: N x P x Q x K. Element (n,p,q,k) at offset ((n*P+p)*Q+q)*K+k.
+- grad_weight: K x R x S x C. Element (k,r,s,c) at offset ((k*R+r)*S+s)*C+c.
+- scale, bias: 1D vectors indexed by channel c.
+
+## Build & Test
+
+```bash
+make test                    # requires solution.h in task directory
+./test                       # default: runs small/medium/large sizes
+./test 1 56 56 64 64 3 3     # custom: N H W C K R S
+./test 1 56 56 64 64 3 3 20  # custom with iteration count
+```
+
+Correctness is verified against a reference implementation at multiple problem sizes
+(small: N=1 56x56 C=64 K=64, medium: N=1 112x112 C=128 K=128, large: N=4 56x56 C=256 K=256).
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

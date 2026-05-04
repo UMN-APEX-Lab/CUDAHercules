@@ -1,0 +1,48 @@
+schema_version: 1
+task_id: class1/general/29_ampere_3xtf32_fast_accurate_tensorop_complex_gemm
+name: 29_ampere_3xtf32_fast_accurate_tensorop_complex_gemm
+task_class: 1
+domain: ml
+tags:
+- gemm
+hardware:
+  min_sm: 80
+  tested_sms:
+  - 80
+  required_features: []
+runner:
+  backend: class1_make
+  workdir: tasks/class1/general/29_ampere_3xtf32_fast_accurate_tensorop_complex_gemm
+  timeout_sec: 180
+  env:
+    KH_BENCHMARK: '20'
+  solution_file: solution.h
+build:
+  cmd: make test
+  clean_cmd: make clean
+execute:
+  cmd: ./test
+  success:
+    exit_code: 0
+    stdout_regex: Passed
+correctness:
+  mode: stdout_or_exit
+  tolerances:
+    atol: 0.01
+    rtol: 0.01
+performance:
+  enabled: true
+  parser:
+    kernel_time_ms_regex: Kernel time:\s*([0-9.]+)\s*ms
+    ref_time_ms_regex: Ref time:\s*([0-9.]+)\s*ms
+  metric: speedup_ref_over_sol
+source:
+  repo: NVIDIA/cutlass
+  files: []
+  commit: ''
+  license: BSD-3-Clause
+anti_cheat:
+  blocked_patterns:
+  required_patterns:
+  - __global__\s+void
+  - <<<.*>>>

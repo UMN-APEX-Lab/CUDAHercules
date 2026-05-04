@@ -1,0 +1,195 @@
+# Task: 76_blackwell_conv
+
+## Target Hardware
+NVIDIA Blackwell GPU (SM100/SM120).
+
+
+Blackwell SM100 3D Convolution forward test harness — NDHWC layout, half precision
+Based on CUTLASS example 76_blackwell_conv
+The LLM must implement:
+  cudaError_t BlackwellConv3dFprop(int N, int D, int H, int W, int C,
+      int K, int T, int R, int S,
+      int pad_d, int pad_h, int pad_w,
+      int stride_d, int stride_h, int stride_w,
+      __half const *input, __half const *filter, __half *output);
+Input:  NDHWC layout [N, D, H, W, C]
+Filter: KTRSC layout [K, T, R, S, C]
+Output: NDHWC layout [N, Z, P, Q, K]
+  Z = (D + 2*pad_d - T) / stride_d + 1
+  P = (H + 2*pad_h - R) / stride_h + 1
+  Q = (W + 2*pad_w - S) / stride_w + 1
+Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
+         -gencode arch=compute_100a,code=sm_100a harness.cu solution.cu -o test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * Blackwell SM100 3D Convolution forward test harness — NDHWC layout, half precision
+ * Based on CUTLASS example 76_blackwell_conv
+ *
+ * The LLM must implement:
+ *   cudaError_t BlackwellConv3dFprop(int N, int D, int H, int W, int C,
+ *       int K, int T, int R, int S,
+ *       int pad_d, int pad_h, int pad_w,
+ *       int stride_d, int stride_h, int stride_w,
+ *       __half const *input, __half const *filter, __half *output);
+ *
+ * Input:  NDHWC layout [N, D, H, W, C]
+ * Filter: KTRSC layout [K, T, R, S, C]
+ * Output: NDHWC layout [N, Z, P, Q, K]
+ *   Z = (D + 2*pad_d - T) / stride_d + 1
+ *   P = (H + 2*pad_h - R) / stride_h + 1
+ *   Q = (W + 2*pad_w - S) / stride_w + 1
+ *
+ * Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
+ *          -gencode arch=compute_100a,code=sm_100a harness.cu solution.cu -o test
+ */
+
+#include <cuda_fp16.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status)                                              \
+  {                                                                     \
+    cudaError_t error = status;                                         \
+    if (error != cudaSuccess) {                                         \
+      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
+                << " at line: " << __LINE__ << std::endl;               \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
+  }
+
+extern cudaError_t BlackwellConv3dFprop(
+  int N, int D, int H, int W, int C,
+  int K, int T, int R, int S,
+  int pad_d, int pad_h, int pad_w,
+  int stride_d, int stride_h, int stride_w,
+  __half const *input, __half const *filter, __half *output);
+
+/// CPU reference: 3D conv fprop, NDHWC layout
+/// output[n][z][p][q][k] = sum_{t,r,s,c} input[n][d][h][w][c] * filter[k][t][r][s][c]
+///   where d = z*stride_d + t - pad_d, h = p*stride_h + r - pad_h, w = q*stride_w + s - pad_w
+void reference_conv3d_fprop(
+  int N, int D, int H, int W, int C,
+  int K, int T, int R, int S,
+  int Z, int P, int Q,
+  int pad_d, int pad_h, int pad_w,
+  int stride_d, int stride_h, int stride_w,
+  std::vector<float> const &input,
+  std::vector<float> const &filter,
+  std::vector<float> &output) {
+  for (int n = 0; n < N; ++n)
+    for (int z = 0; z < Z; ++z)
+      for (int p = 0; p < P; ++p)
+        for (int q = 0; q < Q; ++q)
+          for (int k = 0; k < K; ++k) {
+            float acc = 0.0f;
+            for (int t = 0; t < T; ++t)
+              for (int r = 0; r < R; ++r)
+                for (int s = 0; s < S; ++s)
+                  for (int c = 0; c < C; ++c) {
+                    int d = z * stride_d + t - pad_d;
+                    int h = p * stride_h + r - pad_h;
+                    int w = q * stride_w + s - pad_w;
+                    if (d >= 0 && d < D && h >= 0 && h < H && w >= 0 && w < W) {
+                      // input NDHWC: [n][d][h][w][c]
+                      int in_idx = ((((n * D + d) * H + h) * W + w) * C + c);
+                      // filter KTRSC: [k][t][r][s][c]
+                      int fi_idx = ((((k * T + t) * R + r) * S + s) * C + c);
+                      acc += input[in_idx] * filter[fi_idx];
+                    }
+                  }
+            // output NDHWC: [n][z][p][q][k]
+            int out_idx = ((((n * Z + z) * P + p) * Q + q) * K + k);
+            output[out_idx] = acc;
+          }
+}
+
+int main() {
+  int N = 2, D = 4, H = 8, W = 8, C = 32;
+  int K = 32, T = 1, R = 3, S = 3;
+  int pad_d = 0, pad_h = 1, pad_w = 1;
+  int stride_d = 1, stride_h = 1, stride_w = 1;
+
+  int Z = (D + 2 * pad_d - T) / stride_d + 1;
+  int P = (H + 2 * pad_h - R) / stride_h + 1;
+  int Q = (W + 2 * pad_w - S) / stride_w + 1;
+
+  int input_count  = N * D * H * W * C;
+  int filter_count = K * T * R * S * C;
+  int output_count = N * Z * P * Q * K;
+
+  // Generate input data on host
+  std::vector<float> fInput(input_count), fFilter(filter_count);
+  std::vector<float> fOutput(output_count, 0.0f), fRef(output_count, 0.0f);
+
+  for (int i = 0; i < input_count; ++i)
+    fInput[i] = float(((i) * 16807 % 16) - 8) * 0.05f;
+  for (int i = 0; i < filter_count; ++i)
+    fFilter[i] = float(((i) * 48271 % 16) - 8) * 0.05f;
+
+  // Convert to half
+  std::vector<__half> hInput(input_count), hFilter(filter_count), hOutput(output_count);
+  for (int i = 0; i < input_count; ++i) hInput[i] = __float2half(fInput[i]);
+  for (int i = 0; i < filter_count; ++i) hFilter[i] = __float2half(fFilter[i]);
+
+  __half *dInput, *dFilter, *dOutput;
+  CUDA_CHECK(cudaMalloc(&dInput,  input_count  * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dFilter, filter_count * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dOutput, output_count * sizeof(__half)));
+
+  CUDA_CHECK(cudaMemcpy(dInput,  hInput.data(),  input_count  * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dFilter, hFilter.data(), filter_count * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(dOutput, 0, output_count * sizeof(__half)));
+
+  cudaError_t result = BlackwellConv3dFprop(
+    N, D, H, W, C, K, T, R, S,
+    pad_d, pad_h, pad_w, stride_d, stride_h, stride_w,
+    dInput, dFilter, dOutput);
+  if (result != cudaSuccess) {
+    std::cerr << "BlackwellConv3dFprop failed: " << cudaGetErrorString(result) << std::endl;
+    cudaFree(dInput); cudaFree(dFilter); cudaFree(dOutput);
+    return -1;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && result == cudaSuccess) {
+      kh_benchmark([&]() { BlackwellConv3dFprop(
+    N, D, H, W, C, K, T, R, S,
+    pad_d, pad_h, pad_w, stride_d, stride_h, stride_w,
+    dInput, dFilter, dOutput); }, _kh_trials);
+    }
+  }
+
+
+  CUDA_CHECK(cudaMemcpy(hOutput.data(), dOutput, output_count * sizeof(__half), cudaMemcpyDeviceToHost));
+  cudaFree(dInput); cudaFree(dFilter); cudaFree(dOutput);
+
+  for (int i = 0; i < output_count; ++i) fOutput[i] = __half2float(hOutput[i]);
+  reference_conv3d_fprop(N, D, H, W, C, K, T, R, S, Z, P, Q,
+    pad_d, pad_h, pad_w, stride_d, stride_h, stride_w,
+    fInput, fFilter, fRef);
+
+  float max_diff = 0.0f;
+  for (int i = 0; i < output_count; ++i)
+    max_diff = fmaxf(max_diff, fabsf(fOutput[i] - fRef[i]));
+
+  float tolerance = 1.0f;
+  if (max_diff > tolerance) {
+    std::cerr << "Results incorrect. Max diff: " << max_diff << std::endl;
+    return -1;
+  }
+  std::cout << "Passed." << std::endl;
+  return 0;
+}
+```

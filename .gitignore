@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+
+# Local environments
+.env
+.venv/
+venv/
+
+# Evaluation outputs and temporary workspaces
+results/
+.tmp/
+.tmp_*/
+.tmp_torch_extensions*/
+torch_extensions/
+cuda_build/
+.cache/
+tasks/class3/**/.blackbox_inputs_v1/
+
+# Class 3 input datasets and downloaded runtime blobs.
+# They are prepared by tasks/class3/<app>/prepare_data.sh or
+# scripts/prepare_class3_inputs.py and should not be committed.
+tasks/class3/**/data/
+tasks/class3/**/ref_data/
+tasks/class3/**/cuda_backend/
+tasks/class3/parafrost_sat/subset_j2021_v1/
+tasks/class3/**/*.pdf
+
+# CUDA/C++ build artifacts
+*.o
+*.a
+*.cubin
+*.fatbin
+*.ptx
+*.nsys-rep
+*.ncu-rep
+build/
+cmake-build-*/
+
+# Generated binaries commonly produced by task harnesses
+tasks/**/test
+tasks/**/ref
+tasks/class3/gpumd/src/md_bench
+tasks/class3/parafrost_sat/src/parafrost
+tasks/class3/llmc/src/train_gpt2cu
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

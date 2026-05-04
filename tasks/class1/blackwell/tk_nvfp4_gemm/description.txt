@@ -1,0 +1,51 @@
+# Task: tk_nvfp4_gemm
+
+## Target Hardware
+NVIDIA Blackwell GPU (SM100/SM120).
+
+
+NVFP4 (4-bit Floating Point) General Matrix Multiply on B200, matching ThunderKittens Blackwell performance.
+
+Uses packed FP4 E2M1 data with FP8E4M3 local block scales (block size = 16) and float per-tensor global scales. This is NVIDIA's native FP4 format for Blackwell tensor cores.
+
+## Function Signature
+
+Implement in solution.h:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <cuda_fp4.h>
+
+void Nvfp4Gemm(
+    __nv_fp4x2_e2m1 *A, __nv_fp4x2_e2m1 *B,
+    __nv_fp8_e4m3 *A_scale, __nv_fp8_e4m3 *B_scale,
+    float *A_scale_global, float *B_scale_global,
+    __nv_bfloat16 *C, int M, int N, int K);
+```
+
+## Operation
+
+C = global_scale_A * global_scale_B * (A_dequant * B_dequant^T)
+
+Where:
+- A is M×(K/2) packed (FP4 E2M1, 2 values per byte)
+- B is N×(K/2) packed (FP4 E2M1, 2 values per byte)
+- A_scale is per-block FP8E4M3 local scales (block size = 16, swizzled layout)
+- B_scale is per-block FP8E4M3 local scales (block size = 16, swizzled layout)
+- A_scale_global is a single float per-tensor scale
+- B_scale_global is a single float per-tensor scale
+- C is M×N (row-major, BF16 output)
+
+Dequantization: value = fp4_raw * local_scale * global_scale
+
+## Build & Test
+
+```bash
+make test
+./test
+```
+
+Requires B200 GPU (SM100a). ThunderKittens headers on include path.

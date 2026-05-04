@@ -1,0 +1,53 @@
+schema_version: 1
+task_id: class4/groth16_prover
+name: groth16_prover
+task_class: 4
+domain: zero-knowledge
+tags:
+- groth16
+- zksnark
+- ntt
+- msm
+- bn254
+- elliptic-curve
+- cryptography
+- end-to-end
+- unsolved
+hardware:
+  min_sm: 80
+  tested_sms: []
+  required_features: []
+runner:
+  backend: class4_challenge
+  workdir: tasks/class4/groth16_prover
+  timeout_sec: 600
+  env: {}
+  solution_file: solution.cu
+build:
+  cmd: ''
+  clean_cmd: ''
+execute:
+  cmd: python run.py
+  success:
+    exit_code: 0
+    stdout_regex: Passed
+correctness:
+  mode: proof_verification
+  tolerances: {}
+performance:
+  enabled: true
+  parser:
+    kernel_time_ms_regex: Kernel time:\s*([0-9.]+)\s*ms
+  metric: total_time
+  baseline: Icicle Groth16 (GPU backend)
+source:
+  repo: N/A (original implementation)
+  paper: Groth16 (https://eprint.iacr.org/2016/260)
+  files: []
+  commit: ''
+  license: ''
+anti_cheat:
+  blocked_patterns: []
+  required_patterns:
+  - __global__\s+void
+  - <<<.*>>>

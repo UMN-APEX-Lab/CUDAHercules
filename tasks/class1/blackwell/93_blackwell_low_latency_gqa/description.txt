@@ -1,0 +1,198 @@
+# Task: 93_blackwell_low_latency_gqa
+
+## Target Hardware
+NVIDIA Blackwell GPU (SM100/SM120).
+
+
+Blackwell SM100 Low-Latency Grouped Query Attention test harness
+Based on CUTLASS example 93_blackwell_low_latency_gqa
+The LLM must implement:
+  cudaError_t BlackwellGQA(int batch, int kv_heads, int q_heads,
+      int seq_len, int head_dim,
+      __half const *Q, __half const *K, __half const *V, __half *O);
+GQA decoding: single query position attending to seq_len KV positions.
+q_heads = kv_heads * q_heads_per_kv (each KV head serves multiple Q heads).
+Q: [batch, q_heads, 1, head_dim]
+K: [batch, kv_heads, seq_len, head_dim]
+V: [batch, kv_heads, seq_len, head_dim]
+O: [batch, q_heads, 1, head_dim]
+O = softmax(Q * K^T / sqrt(head_dim)) * V, computed per KV-head group.
+Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
+         -gencode arch=compute_100a,code=sm_100a harness.cu solution.cu -o test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * Blackwell SM100 Low-Latency Grouped Query Attention test harness
+ * Based on CUTLASS example 93_blackwell_low_latency_gqa
+ *
+ * The LLM must implement:
+ *   cudaError_t BlackwellGQA(int batch, int kv_heads, int q_heads,
+ *       int seq_len, int head_dim,
+ *       __half const *Q, __half const *K, __half const *V, __half *O);
+ *
+ * GQA decoding: single query position attending to seq_len KV positions.
+ * q_heads = kv_heads * q_heads_per_kv (each KV head serves multiple Q heads).
+ *
+ * Q: [batch, q_heads, 1, head_dim]
+ * K: [batch, kv_heads, seq_len, head_dim]
+ * V: [batch, kv_heads, seq_len, head_dim]
+ * O: [batch, q_heads, 1, head_dim]
+ *
+ * O = softmax(Q * K^T / sqrt(head_dim)) * V, computed per KV-head group.
+ *
+ * Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
+ *          -gencode arch=compute_100a,code=sm_100a harness.cu solution.cu -o test
+ */
+
+#include <cuda_fp16.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <cstdlib>
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status)                                              \
+  {                                                                     \
+    cudaError_t error = status;                                         \
+    if (error != cudaSuccess) {                                         \
+      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
+                << " at line: " << __LINE__ << std::endl;               \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
+  }
+
+extern cudaError_t BlackwellGQA(
+  int batch, int kv_heads, int q_heads,
+  int seq_len, int head_dim,
+  __half const *Q, __half const *K, __half const *V, __half *O);
+
+/// CPU reference: Grouped Query Attention (single query position decoding)
+void reference_gqa(
+  int batch, int kv_heads, int q_heads,
+  int seq_len, int head_dim,
+  std::vector<float> const &fQ,
+  std::vector<float> const &fK,
+  std::vector<float> const &fV,
+  std::vector<float> &fO) {
+
+  int q_per_kv = q_heads / kv_heads;
+  float scale = 1.0f / sqrtf((float)head_dim);
+
+  for (int b = 0; b < batch; ++b) {
+    for (int qh = 0; qh < q_heads; ++qh) {
+      int kvh = qh / q_per_kv;
+
+      // Q[b, qh, 0, :] — single query vector
+      int q_off = ((b * q_heads + qh) * 1) * head_dim;
+
+      // Compute attention scores: score[t] = Q . K[b, kvh, t, :] * scale
+      std::vector<float> scores(seq_len);
+      float max_score = -1e30f;
+      for (int t = 0; t < seq_len; ++t) {
+        int k_off = ((b * kv_heads + kvh) * seq_len + t) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+          dot += fQ[q_off + d] * fK[k_off + d];
+        }
+        scores[t] = dot * scale;
+        if (scores[t] > max_score) max_score = scores[t];
+      }
+
+      // Softmax
+      float sum_exp = 0.0f;
+      for (int t = 0; t < seq_len; ++t) {
+        scores[t] = expf(scores[t] - max_score);
+        sum_exp += scores[t];
+      }
+      for (int t = 0; t < seq_len; ++t) {
+        scores[t] /= sum_exp;
+      }
+
+      // O[b, qh, 0, :] = sum_t scores[t] * V[b, kvh, t, :]
+      int o_off = ((b * q_heads + qh) * 1) * head_dim;
+      for (int d = 0; d < head_dim; ++d) {
+        float acc = 0.0f;
+        for (int t = 0; t < seq_len; ++t) {
+          int v_off = ((b * kv_heads + kvh) * seq_len + t) * head_dim;
+          acc += scores[t] * fV[v_off + d];
+        }
+        fO[o_off + d] = acc;
+      }
+    }
+  }
+}
+
+int main() {
+  int batch = 1, kv_heads = 8, q_heads = 64, seq_len = 256, head_dim = 128;
+
+  int sz_Q = batch * q_heads * 1 * head_dim;
+  int sz_K = batch * kv_heads * seq_len * head_dim;
+  int sz_V = batch * kv_heads * seq_len * head_dim;
+  int sz_O = batch * q_heads * 1 * head_dim;
+
+  // Generate float data
+  std::vector<float> fQ(sz_Q), fK(sz_K), fV(sz_V), fO(sz_O, 0.0f), fRef(sz_O, 0.0f);
+  for (int i = 0; i < sz_Q; ++i) fQ[i] = float((i * 16807 % 16) - 8) * 0.01f;
+  for (int i = 0; i < sz_K; ++i) fK[i] = float((i * 48271 % 16) - 8) * 0.01f;
+  for (int i = 0; i < sz_V; ++i) fV[i] = float((i * 12345 % 16) - 8) * 0.01f;
+
+  // Convert to half
+  std::vector<__half> hQ(sz_Q), hK(sz_K), hV(sz_V), hO(sz_O);
+  for (int i = 0; i < sz_Q; ++i) hQ[i] = __float2half(fQ[i]);
+  for (int i = 0; i < sz_K; ++i) hK[i] = __float2half(fK[i]);
+  for (int i = 0; i < sz_V; ++i) hV[i] = __float2half(fV[i]);
+
+  // Allocate device memory
+  __half *dQ, *dK, *dV, *dO;
+  CUDA_CHECK(cudaMalloc(&dQ, sz_Q * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dK, sz_K * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dV, sz_V * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dO, sz_O * sizeof(__half)));
+  CUDA_CHECK(cudaMemcpy(dQ, hQ.data(), sz_Q * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dK, hK.data(), sz_K * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dV, hV.data(), sz_V * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(dO, 0, sz_O * sizeof(__half)));
+
+  cudaError_t r = BlackwellGQA(batch, kv_heads, q_heads, seq_len, head_dim, dQ, dK, dV, dO);
+  if (r != cudaSuccess) {
+    std::cerr << "BlackwellGQA failed: " << cudaGetErrorString(r) << std::endl;
+    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
+    return -1;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && r == cudaSuccess) {
+      kh_benchmark([&]() { BlackwellGQA(batch, kv_heads, q_heads, seq_len, head_dim, dQ, dK, dV, dO); }, _kh_trials);
+    }
+  }
+
+
+  CUDA_CHECK(cudaMemcpy(hO.data(), dO, sz_O * sizeof(__half), cudaMemcpyDeviceToHost));
+  cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
+
+  for (int i = 0; i < sz_O; ++i) fO[i] = __half2float(hO[i]);
+
+  // CPU reference
+  reference_gqa(batch, kv_heads, q_heads, seq_len, head_dim, fQ, fK, fV, fRef);
+
+  float max_diff = 0;
+  for (int i = 0; i < sz_O; ++i)
+    max_diff = fmaxf(max_diff, fabsf(fO[i] - fRef[i]));
+
+  if (max_diff > 0.1f) {
+    std::cerr << "Results incorrect. Max diff: " << max_diff << std::endl;
+    return -1;
+  }
+  std::cout << "Passed." << std::endl;
+  return 0;
+}
+```

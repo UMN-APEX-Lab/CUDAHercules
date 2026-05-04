@@ -1,0 +1,210 @@
+# Task: 56_hopper_ptr_array_batched_gemm
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+Hopper Pointer-Array Batched GEMM test harness
+Based on CUTLASS example 56_hopper_ptr_array_batched_gemm
+Half-precision pointer-array batched GEMM.
+A row-major [M, K] per batch (lda = K), pointer array A_ptrs[batch].
+B column-major [K, N] per batch (ldb = K), pointer array B_ptrs[batch].
+D column-major [M, N] per batch (ldd = M), pointer array D_ptrs[batch].
+The LLM must implement:
+  cudaError_t HopperPtrArrayBatchedGemm(
+      int M, int N, int K, int batch, float alpha,
+      __half const **A_ptrs, int lda,
+      __half const **B_ptrs, int ldb,
+      float beta,
+      __half **D_ptrs, int ldd);
+Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * Hopper Pointer-Array Batched GEMM test harness
+ * Based on CUTLASS example 56_hopper_ptr_array_batched_gemm
+ *
+ * Half-precision pointer-array batched GEMM.
+ * A row-major [M, K] per batch (lda = K), pointer array A_ptrs[batch].
+ * B column-major [K, N] per batch (ldb = K), pointer array B_ptrs[batch].
+ * D column-major [M, N] per batch (ldd = M), pointer array D_ptrs[batch].
+ *
+ * The LLM must implement:
+ *   cudaError_t HopperPtrArrayBatchedGemm(
+ *       int M, int N, int K, int batch, float alpha,
+ *       __half const **A_ptrs, int lda,
+ *       __half const **B_ptrs, int ldb,
+ *       float beta,
+ *       __half **D_ptrs, int ldd);
+ *
+ * Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+ */
+
+#include <cuda_fp16.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status)                                              \
+  {                                                                     \
+    cudaError_t error = status;                                         \
+    if (error != cudaSuccess) {                                         \
+      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
+                << " at line: " << __LINE__ << std::endl;               \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
+  }
+
+extern cudaError_t HopperPtrArrayBatchedGemm(
+  int M, int N, int K, int batch,
+  float alpha,
+  __half const **A_ptrs, int lda,
+  __half const **B_ptrs, int ldb,
+  float beta,
+  __half **D_ptrs, int ldd);
+
+/// CPU reference for a single GEMM.
+/// A row-major: A[i,k] = A[i * lda + k]
+/// B col-major: B[k,j] = B[k + j * ldb]
+/// D col-major: D[i,j] = D[i + j * ldd]
+void reference_gemm(
+  int M, int N, int K, float alpha,
+  std::vector<float> const &A, int lda,
+  std::vector<float> const &B, int ldb,
+  float beta,
+  std::vector<float> &D, int ldd) {
+
+  for (int i = 0; i < M; ++i) {
+    for (int j = 0; j < N; ++j) {
+      float acc = 0.0f;
+      for (int k = 0; k < K; ++k) {
+        acc += A[i * lda + k] * B[k + j * ldb];
+      }
+      D[i + j * ldd] = alpha * acc + beta * D[i + j * ldd];
+    }
+  }
+}
+
+int main() {
+  int M = 256, N = 256, K = 128, batch = 4;
+  int lda = K, ldb = K, ldd = M;
+  float alpha = 1.0f, beta = 0.0f;
+
+  int cA = M * K;
+  int cB = K * N;
+  int cD = M * N;
+
+  // Host-side data: one buffer per batch element
+  std::vector<std::vector<float>> fA(batch), fB(batch), fRef(batch);
+  std::vector<std::vector<__half>> hA(batch), hB(batch);
+
+  for (int b = 0; b < batch; ++b) {
+    fA[b].resize(cA);
+    fB[b].resize(cB);
+    fRef[b].resize(cD, 0.0f);
+    hA[b].resize(cA);
+    hB[b].resize(cB);
+
+    for (int i = 0; i < cA; ++i) {
+      fA[b][i] = float(((i + b * cA) * 16807 % 16) - 8) * 0.01f;
+      hA[b][i] = __float2half(fA[b][i]);
+    }
+    for (int i = 0; i < cB; ++i) {
+      fB[b][i] = float(((i + b * cB) * 48271 % 16) - 8) * 0.01f;
+      hB[b][i] = __float2half(fB[b][i]);
+    }
+  }
+
+  // Device allocations per batch
+  std::vector<__half *> d_A_vec(batch), d_B_vec(batch), d_D_vec(batch);
+  for (int b = 0; b < batch; ++b) {
+    CUDA_CHECK(cudaMalloc(&d_A_vec[b], cA * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_B_vec[b], cB * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_D_vec[b], cD * sizeof(__half)));
+
+    CUDA_CHECK(cudaMemcpy(d_A_vec[b], hA[b].data(), cA * sizeof(__half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B_vec[b], hB[b].data(), cB * sizeof(__half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_D_vec[b], 0, cD * sizeof(__half)));
+  }
+
+  // Build device pointer arrays
+  __half const **d_A_ptrs;
+  __half const **d_B_ptrs;
+  __half **d_D_ptrs;
+  CUDA_CHECK(cudaMalloc(&d_A_ptrs, batch * sizeof(__half const *)));
+  CUDA_CHECK(cudaMalloc(&d_B_ptrs, batch * sizeof(__half const *)));
+  CUDA_CHECK(cudaMalloc(&d_D_ptrs, batch * sizeof(__half *)));
+
+  // Copy host pointer arrays to device
+  std::vector<__half const *> h_A_ptrs(batch), h_B_ptrs(batch);
+  std::vector<__half *> h_D_ptrs(batch);
+  for (int b = 0; b < batch; ++b) {
+    h_A_ptrs[b] = d_A_vec[b];
+    h_B_ptrs[b] = d_B_vec[b];
+    h_D_ptrs[b] = d_D_vec[b];
+  }
+  CUDA_CHECK(cudaMemcpy(d_A_ptrs, h_A_ptrs.data(), batch * sizeof(__half const *), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_B_ptrs, h_B_ptrs.data(), batch * sizeof(__half const *), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_D_ptrs, h_D_ptrs.data(), batch * sizeof(__half *), cudaMemcpyHostToDevice));
+
+  cudaError_t result = HopperPtrArrayBatchedGemm(
+    M, N, K, batch, alpha, d_A_ptrs, lda, d_B_ptrs, ldb, beta, d_D_ptrs, ldd);
+  if (result != cudaSuccess) {
+    std::cerr << "HopperPtrArrayBatchedGemm failed: " << cudaGetErrorString(result) << std::endl;
+    for (int b = 0; b < batch; ++b) { cudaFree(d_A_vec[b]); cudaFree(d_B_vec[b]); cudaFree(d_D_vec[b]); }
+    cudaFree(d_A_ptrs); cudaFree(d_B_ptrs); cudaFree(d_D_ptrs);
+    return -1;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && result == cudaSuccess) {
+      kh_benchmark([&]() { HopperPtrArrayBatchedGemm(
+    M, N, K, batch, alpha, d_A_ptrs, lda, d_B_ptrs, ldb, beta, d_D_ptrs, ldd); }, _kh_trials);
+    }
+  }
+
+
+  // Copy results back and compare per batch
+  float global_max_diff = 0.0f;
+  for (int b = 0; b < batch; ++b) {
+    std::vector<__half> hD(cD);
+    CUDA_CHECK(cudaMemcpy(hD.data(), d_D_vec[b], cD * sizeof(__half), cudaMemcpyDeviceToHost));
+
+    std::vector<float> fD_out(cD);
+    for (int i = 0; i < cD; ++i) fD_out[i] = __half2float(hD[i]);
+
+    // CPU reference
+    reference_gemm(M, N, K, alpha, fA[b], lda, fB[b], ldb, beta, fRef[b], ldd);
+
+    for (int i = 0; i < cD; ++i) {
+      float diff = std::fabs(fD_out[i] - fRef[b][i]);
+      global_max_diff = std::fmax(global_max_diff, diff);
+    }
+  }
+
+  // Cleanup
+  for (int b = 0; b < batch; ++b) {
+    cudaFree(d_A_vec[b]); cudaFree(d_B_vec[b]); cudaFree(d_D_vec[b]);
+  }
+  cudaFree(d_A_ptrs); cudaFree(d_B_ptrs); cudaFree(d_D_ptrs);
+
+  float tolerance = 1.0f;
+  if (global_max_diff > tolerance) {
+    std::cerr << "Results incorrect. Max diff: " << global_max_diff << std::endl;
+    return -1;
+  }
+
+  std::cout << "Passed." << std::endl;
+  return 0;
+}
+```

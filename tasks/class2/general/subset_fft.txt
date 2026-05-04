@@ -1,0 +1,14 @@
+# Class 2 General — FFT-only subset (10 tasks)
+# Used for re-timing after cuFFT baseline switch (commit 87a9b37, 2026-04-19).
+# Subset of subset_44.txt.
+# Usage: --task-list tasks/class2/general/subset_fft.txt
+
+fft_c2c_1d_1024_fp32
+fft_c2c_1d_16384_fp32
+fft_c2c_1d_65536_fp32
+fft_c2c_1d_1024_fp64
+fft_c2c_1d_4096_fp64
+fft_c2c_2d_1024x1024_fp32
+fft_c2c_3d_64x64x64_fp32
+fft_r2c_1d_1024_fp32
+fft_r2c_1d_65536_fp32

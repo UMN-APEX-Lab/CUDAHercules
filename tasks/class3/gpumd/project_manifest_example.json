@@ -1,0 +1,24 @@
+{
+  "build_script": "build.sh",
+  "run_script": "run.sh",
+  "files": [
+    "build.sh",
+    "run.sh",
+    "src/main.cu",
+    "src/md_core.cu",
+    "src/md_types.h"
+  ],
+  "cuda_sources": [
+    "src/main.cu",
+    "src/md_core.cu"
+  ],
+  "ops": {
+    "neighbor_list": "src/md_core.cu",
+    "integration": "src/md_core.cu",
+    "kinetic_energy": "src/md_core.cu",
+    "lennard_jones": "src/md_core.cu",
+    "tersoff": "src/md_core.cu",
+    "coulomb_real": "src/md_core.cu",
+    "coulomb_kspace": "src/md_core.cu"
+  }
+}

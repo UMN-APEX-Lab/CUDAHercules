@@ -1,0 +1,64 @@
+schema_version: 1
+task_id: class3/parafrost_sat/blackwell
+name: parafrost_sat
+task_class: 3
+domain: sat-solving
+tags:
+- sat
+- cdcl
+- inprocessing
+- variable-elimination
+- subsumption
+- formal-verification
+- blackwell
+hardware:
+  min_sm: 100
+  tested_sms:
+  - 100
+  required_features: []
+runner:
+  backend: class3_app
+  workdir: tasks/class3/parafrost_sat
+  timeout_sec: 300
+  env:
+    CUDA_GENCODE: -gencode arch=compute_100a,code=sm_100a
+  solution_files:
+  - generated_project/
+execute:
+  cmd: python run.py
+  success:
+    exit_code: 0
+    stdout_regex: Passed
+correctness:
+  mode: stdout_or_exit
+  tolerances: {}
+performance:
+  enabled: true
+  parser:
+    kernel_time_ms_regex: Kernel time:\s*([0-9.]+)\s*ms
+  metric: total_time
+source:
+  repo: ParaFROST (muhos/ParaFROST)
+  license: GPLv3
+anti_cheat:
+  blocked_patterns:
+  - tasks/class3/parafrost_sat/src
+  - tasks/class3/parafrost_sat/dep
+  - tasks/class3/parafrost_sat/data
+  - \bparafrost\b
+  - \.blackbox_inputs_v1\b
+  - prepare_blackbox_inputs\.py
+  required_patterns:
+  - __global__\s+void
+  - <<<.*>>>
+
+hacking_hints: |
+  BVE / subsumption / ERE kernels must operate on the real clause database.
+  - BVE must substitute or eliminate variables that satisfy the resolution rule
+  - Subsumption must check clause containment
+  - ERE must expand/resolve clauses
+  Flags:
+  - Returning SAT/UNSAT without touching the CNF
+  - Clearing the clause database to trivially satisfy the solver
+  - Reading a precomputed result file keyed on benchmark name
+  - Bypassing the solver loop via early-exit on an env/arg flag

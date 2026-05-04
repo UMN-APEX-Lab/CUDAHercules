@@ -1,0 +1,11 @@
+# Zenodo zip cache (~7 GB) - populated by prepare_data.py, override loc with PARAFROST_DATA_ROOT
+_zenodo_cache/
+
+# Benchmark-owned standardized inputs generated outside the release fixtures.
+.blackbox_inputs_v1/
+
+# Build artifacts in src/
+src/*.o
+src/*.cuda.o
+src/libparafrost.a
+src/parafrost

@@ -1,0 +1,207 @@
+# Task: 55_hopper_mixed_dtype_gemm
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+Hopper Mixed Dtype GEMM test harness
+Based on CUTLASS example 55_hopper_mixed_dtype_gemm
+A is half-precision row-major [M, K] (lda = K).
+B is int8 quantized column-major [K, N] (ldb = K), with per-group
+  scale and zero-point in half precision.
+scale_B is row-major [N, K/group_size], zero_B is row-major [N, K/group_size].
+D is half-precision row-major [M, N] (ldd = N).
+Dequantization: B_dequant[k,n] = scale_B[n, k/group_size] *
+                (B[k,n] - zero_B[n, k/group_size])
+The LLM must implement:
+  cudaError_t HopperMixedDtypeGemm(
+      int M, int N, int K, float alpha,
+      __half const *A, int lda,
+      int8_t const *B, int ldb,
+      __half const *scale_B, __half const *zero_B, int group_size,
+      float beta,
+      __half *D, int ldd);
+Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * Hopper Mixed Dtype GEMM test harness
+ * Based on CUTLASS example 55_hopper_mixed_dtype_gemm
+ *
+ * A is half-precision row-major [M, K] (lda = K).
+ * B is int8 quantized column-major [K, N] (ldb = K), with per-group
+ *   scale and zero-point in half precision.
+ * scale_B is row-major [N, K/group_size], zero_B is row-major [N, K/group_size].
+ * D is half-precision row-major [M, N] (ldd = N).
+ *
+ * Dequantization: B_dequant[k,n] = scale_B[n, k/group_size] *
+ *                 (B[k,n] - zero_B[n, k/group_size])
+ *
+ * The LLM must implement:
+ *   cudaError_t HopperMixedDtypeGemm(
+ *       int M, int N, int K, float alpha,
+ *       __half const *A, int lda,
+ *       int8_t const *B, int ldb,
+ *       __half const *scale_B, __half const *zero_B, int group_size,
+ *       float beta,
+ *       __half *D, int ldd);
+ *
+ * Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+ */
+
+#include <cuda_fp16.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <cstdint>
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status)                                              \
+  {                                                                     \
+    cudaError_t error = status;                                         \
+    if (error != cudaSuccess) {                                         \
+      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
+                << " at line: " << __LINE__ << std::endl;               \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
+  }
+
+extern cudaError_t HopperMixedDtypeGemm(
+  int M, int N, int K,
+  float alpha,
+  __half const *A, int lda,
+  int8_t const *B, int ldb,
+  __half const *scale_B,
+  __half const *zero_B,
+  int group_size,
+  float beta,
+  __half *D, int ldd);
+
+/// CPU reference for mixed-dtype GEMM with per-group quantized B.
+/// A row-major: A[i,k] = A[i * lda + k]
+/// B col-major: B[k,n] = B[k + n * ldb]  (int8)
+/// scale_B row-major [N, num_groups]: scale_B[n, g] = scale_B[n * num_groups + g]
+/// zero_B  row-major [N, num_groups]: zero_B[n, g]  = zero_B[n * num_groups + g]
+/// D row-major: D[i,j] = D[i * ldd + j]
+void reference_mixed_gemm(
+  int M, int N, int K, float alpha,
+  std::vector<float> const &A, int lda,
+  std::vector<int8_t> const &B, int ldb,
+  std::vector<float> const &scale_B,
+  std::vector<float> const &zero_B,
+  int group_size,
+  float beta,
+  std::vector<float> &D, int ldd) {
+
+  int num_groups = K / group_size;
+  for (int i = 0; i < M; ++i) {
+    for (int j = 0; j < N; ++j) {
+      float acc = 0.0f;
+      for (int k = 0; k < K; ++k) {
+        int g = k / group_size;
+        float s = scale_B[j * num_groups + g];
+        float z = zero_B[j * num_groups + g];
+        float b_val = s * (float(B[k + j * ldb]) - z);
+        acc += A[i * lda + k] * b_val;
+      }
+      D[i * ldd + j] = alpha * acc + beta * D[i * ldd + j];
+    }
+  }
+}
+
+int main() {
+  int M = 128, N = 128, K = 256;
+  int group_size = 64;
+  int lda = K, ldb = K, ldd = N;
+  float alpha = 1.0f, beta = 0.0f;
+
+  int num_groups = K / group_size;
+  int cA = M * K;
+  int cB = K * N;
+  int cD = M * N;
+  int cScale = N * num_groups;
+
+  // Host data in float
+  std::vector<float> fA(cA), fScale(cScale), fZero(cScale), fD(cD, 0.0f), fRef(cD, 0.0f);
+  std::vector<int8_t> iB(cB);
+
+  for (int i = 0; i < cA; ++i) fA[i] = float((i * 16807 % 16) - 8) * 0.01f;
+  for (int i = 0; i < cB; ++i) iB[i] = int8_t((i * 48271 % 16) - 8);
+  for (int i = 0; i < cScale; ++i) fScale[i] = float((i * 31337 % 8) + 1) * 0.1f;
+  for (int i = 0; i < cScale; ++i) fZero[i] = float((i * 12345 % 5)) * 0.5f;
+
+  // Convert A, scale, zero to half
+  std::vector<__half> hA(cA), hScale(cScale), hZero(cScale);
+  for (int i = 0; i < cA; ++i) hA[i] = __float2half(fA[i]);
+  for (int i = 0; i < cScale; ++i) hScale[i] = __float2half(fScale[i]);
+  for (int i = 0; i < cScale; ++i) hZero[i] = __float2half(fZero[i]);
+
+  // Device allocations
+  __half *dA, *dScale, *dZero, *dD;
+  int8_t *dB;
+  CUDA_CHECK(cudaMalloc(&dA, cA * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dB, cB * sizeof(int8_t)));
+  CUDA_CHECK(cudaMalloc(&dScale, cScale * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dZero, cScale * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dD, cD * sizeof(__half)));
+
+  CUDA_CHECK(cudaMemcpy(dA, hA.data(), cA * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB, iB.data(), cB * sizeof(int8_t), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dScale, hScale.data(), cScale * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dZero, hZero.data(), cScale * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(dD, 0, cD * sizeof(__half)));
+
+  cudaError_t result = HopperMixedDtypeGemm(
+    M, N, K, alpha, dA, lda, dB, ldb, dScale, dZero, group_size, beta, dD, ldd);
+  if (result != cudaSuccess) {
+    std::cerr << "HopperMixedDtypeGemm failed: " << cudaGetErrorString(result) << std::endl;
+    cudaFree(dA); cudaFree(dB); cudaFree(dScale); cudaFree(dZero); cudaFree(dD);
+    return -1;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && result == cudaSuccess) {
+      kh_benchmark([&]() { HopperMixedDtypeGemm(
+    M, N, K, alpha, dA, lda, dB, ldb, dScale, dZero, group_size, beta, dD, ldd); }, _kh_trials);
+    }
+  }
+
+
+  std::vector<__half> hD(cD);
+  CUDA_CHECK(cudaMemcpy(hD.data(), dD, cD * sizeof(__half), cudaMemcpyDeviceToHost));
+  cudaFree(dA); cudaFree(dB); cudaFree(dScale); cudaFree(dZero); cudaFree(dD);
+
+  std::vector<float> fD_out(cD);
+  for (int i = 0; i < cD; ++i) fD_out[i] = __half2float(hD[i]);
+
+  // CPU reference
+  reference_mixed_gemm(M, N, K, alpha, fA, lda, iB, ldb, fScale, fZero, group_size, beta, fRef, ldd);
+
+  // Compare — mixed precision with quantized B, moderate tolerance
+  float max_rel_diff = 0.0f;
+  for (int i = 0; i < cD; ++i) {
+    float diff = std::fabs(fD_out[i] - fRef[i]);
+    float rel = diff / (std::fabs(fRef[i]) + 1e-6f);
+    max_rel_diff = std::fmax(max_rel_diff, rel);
+  }
+
+  // Half precision with int8 quantization: generous tolerance
+  float tolerance = 0.1f;
+  if (max_rel_diff > tolerance) {
+    std::cerr << "Results incorrect. Max relative diff: " << max_rel_diff << std::endl;
+    return -1;
+  }
+
+  std::cout << "Passed." << std::endl;
+  return 0;
+}
+```

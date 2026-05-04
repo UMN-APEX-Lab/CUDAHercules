@@ -1,0 +1,164 @@
+# Task: 61_hopper_gemm_with_topk_and_softmax
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+Hopper GEMM + TopK + Softmax test harness
+Based on CUTLASS example 61_hopper_gemm_with_topk_and_softmax
+The LLM must implement:
+  cudaError_t HopperGemmTopkSoftmax(int M, int N, int K, float alpha,
+      __half const *A, int lda, __half const *B, int ldb,
+      __half *D, int ldd, int topk);
+A is row-major [M, K] (lda = K), B is column-major [K, N] (ldb = K),
+D is row-major [M, N] (ldd = N).
+For each row of the GEMM result (alpha * A * B), keep only the top-K values,
+set the rest to 0, then apply softmax over the top-K positions.
+Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * Hopper GEMM + TopK + Softmax test harness
+ * Based on CUTLASS example 61_hopper_gemm_with_topk_and_softmax
+ *
+ * The LLM must implement:
+ *   cudaError_t HopperGemmTopkSoftmax(int M, int N, int K, float alpha,
+ *       __half const *A, int lda, __half const *B, int ldb,
+ *       __half *D, int ldd, int topk);
+ *
+ * A is row-major [M, K] (lda = K), B is column-major [K, N] (ldb = K),
+ * D is row-major [M, N] (ldd = N).
+ * For each row of the GEMM result (alpha * A * B), keep only the top-K values,
+ * set the rest to 0, then apply softmax over the top-K positions.
+ *
+ * Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+ */
+
+#include <cuda_fp16.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status)                                              \
+  {                                                                     \
+    cudaError_t error = status;                                         \
+    if (error != cudaSuccess) {                                         \
+      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
+                << " at line: " << __LINE__ << std::endl;               \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
+  }
+
+extern cudaError_t HopperGemmTopkSoftmax(
+  int M, int N, int K, float alpha,
+  __half const *A, int lda,
+  __half const *B, int ldb,
+  __half *D, int ldd,
+  int topk);
+
+/// CPU reference: GEMM + top-K + softmax
+void reference(int M, int N, int K, float alpha,
+  std::vector<float> const &A, int lda,
+  std::vector<float> const &B, int ldb,
+  std::vector<float> &D, int ldd, int topk) {
+  // GEMM: A row-major, B col-major, result row-major
+  std::vector<float> C(M * N, 0.0f);
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      float acc = 0;
+      for (int k = 0; k < K; ++k)
+        acc += A[i * lda + k] * B[k + j * ldb];
+      C[i * N + j] = alpha * acc;
+    }
+  // Per-row top-K + softmax
+  for (int i = 0; i < M; ++i) {
+    // Find top-K indices
+    std::vector<std::pair<float, int>> vals(N);
+    for (int j = 0; j < N; ++j)
+      vals[j] = {C[i * N + j], j};
+    std::partial_sort(vals.begin(), vals.begin() + topk, vals.end(),
+      [](auto &a, auto &b) { return a.first > b.first; });
+    // Zero out non-top-K, compute softmax on top-K
+    std::vector<bool> is_topk(N, false);
+    float max_val = -1e30f;
+    for (int t = 0; t < topk; ++t) {
+      is_topk[vals[t].second] = true;
+      max_val = fmaxf(max_val, vals[t].first);
+    }
+    float sum_exp = 0;
+    for (int t = 0; t < topk; ++t)
+      sum_exp += expf(vals[t].first - max_val);
+    for (int j = 0; j < N; ++j) {
+      if (is_topk[j])
+        D[i * ldd + j] = expf(C[i * N + j] - max_val) / sum_exp;
+      else
+        D[i * ldd + j] = 0.0f;
+    }
+  }
+}
+
+int main() {
+  int M = 128, N = 64, K = 128;
+  int lda = K, ldb = K, ldd = N;
+  int topk = 8;
+  float alpha = 1.0f;
+
+  int cA = M * K, cB = K * N, cD = M * N;
+  std::vector<float> fA(cA), fB(cB), fD(cD, 0), fRef(cD, 0);
+  for (int i = 0; i < cA; ++i) fA[i] = float((i * 16807 % 16) - 8) * 0.01f;
+  for (int i = 0; i < cB; ++i) fB[i] = float((i * 48271 % 16) - 8) * 0.01f;
+
+  std::vector<__half> hA(cA), hB(cB), hD(cD);
+  for (int i = 0; i < cA; ++i) hA[i] = __float2half(fA[i]);
+  for (int i = 0; i < cB; ++i) hB[i] = __float2half(fB[i]);
+
+  __half *dA, *dB, *dD;
+  CUDA_CHECK(cudaMalloc(&dA, cA * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dB, cB * sizeof(__half)));
+  CUDA_CHECK(cudaMalloc(&dD, cD * sizeof(__half)));
+  CUDA_CHECK(cudaMemcpy(dA, hA.data(), cA * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB, hB.data(), cB * sizeof(__half), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(dD, 0, cD * sizeof(__half)));
+
+  cudaError_t r = HopperGemmTopkSoftmax(M, N, K, alpha, dA, lda, dB, ldb, dD, ldd, topk);
+  if (r != cudaSuccess) {
+    std::cerr << "HopperGemmTopkSoftmax failed: " << cudaGetErrorString(r) << std::endl;
+    cudaFree(dA); cudaFree(dB); cudaFree(dD);
+    return -1;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && r == cudaSuccess) {
+      kh_benchmark([&]() { HopperGemmTopkSoftmax(M, N, K, alpha, dA, lda, dB, ldb, dD, ldd, topk); }, _kh_trials);
+    }
+  }
+
+
+  CUDA_CHECK(cudaMemcpy(hD.data(), dD, cD * sizeof(__half), cudaMemcpyDeviceToHost));
+  cudaFree(dA); cudaFree(dB); cudaFree(dD);
+
+  for (int i = 0; i < cD; ++i) fD[i] = __half2float(hD[i]);
+  reference(M, N, K, alpha, fA, lda, fB, ldb, fRef, ldd, topk);
+
+  float max_diff = 0;
+  for (int i = 0; i < cD; ++i)
+    max_diff = fmaxf(max_diff, fabsf(fD[i] - fRef[i]));
+  if (max_diff > 0.05f) {
+    std::cerr << "Results incorrect. Max diff: " << max_diff << std::endl;
+    return -1;
+  }
+  std::cout << "Passed." << std::endl;
+  return 0;
+}
+```

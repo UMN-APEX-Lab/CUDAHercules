@@ -1,0 +1,54 @@
+# Task: 31_basic_syrk
+
+Double-precision Symmetric Rank-K Update (SYRK), column-major layout.
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+
+cudaError_t Dsyrk(
+    int N, int K,
+    double alpha,
+    double const *A, int lda,
+    double beta,
+    double *C, int ldc);
+```
+
+## Operation
+
+C = alpha * A * A^T + beta * C
+
+Only the **lower triangle** of C is computed (elements where i >= j).
+
+Where:
+- A is N x K
+- C is N x N (symmetric, lower fill)
+
+## Data Types
+
+All matrices are `double` (FP64).
+
+## Memory Layout
+
+All matrices are **column-major**:
+- A: Element (i,k) at `A[i + k * lda]`.  lda >= N.
+- C: Element (i,j) at `C[i + j * ldc]`.  ldc >= N.
+
+## Build & Test
+
+```bash
+make test                    # requires solution.h in task directory
+./test                       # default: runs small/medium/large sizes
+./test 1024 1024             # custom single size: N K
+./test 1024 1024 1.0 0.0 20 # N K alpha beta iterations
+```
+
+Correctness is verified against a reference implementation at multiple problem sizes
+(small: N=K=1024, medium: N=K=4096, large: N=4096 K=8192).
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

@@ -1,0 +1,37 @@
+# Task: layernorm_parallel_bwd_256
+
+## Description
+
+Implement a CUDA kernel for the backward pass of fused residual + LayerNorm.
+
+Given upstream gradient dz, saved x (= x0 + residual), mean mu, reciprocal std rs, gamma:
+
+  x_hat = (x - mu) * rs
+  dgamma = sum_rows(dz * x_hat)
+  dbeta = sum_rows(dz)
+  dx = rs * (dz*gamma - (ds*x_hat + db) / cols)
+  dx0 = dx
+  dresidual = dx  (gradient flows through both branches)
+
+Dimensions: rows=16384, cols=256
+
+
+## Function Signature
+
+```c
+void launch_layernorm_parallel_bwd(
+    const float* dz,         // [rows, cols] upstream gradient
+    const float* x,          // [rows, cols] saved x0+residual from forward
+    const float* mu,         // [rows] saved mean
+    const float* rs,         // [rows] saved reciprocal std
+    const float* gamma,      // [cols] scale weight
+    float* dx0,              // [rows, cols] gradient w.r.t. x0
+    float* dresidual,        // [rows, cols] gradient w.r.t. residual
+    float* dgamma,           // [cols] gradient w.r.t. gamma
+    float* dbeta,            // [cols] gradient w.r.t. beta
+    int rows,
+    int cols,
+    cudaStream_t stream
+);
+
+```

@@ -1,0 +1,63 @@
+# Task: 21_quaternion_gemm
+
+Quaternion General Matrix Multiply (QGEMM).
+
+A quaternion q = w + x*i + y*j + z*k is stored as 4 consecutive floats in order (x, y, z, w).
+Quaternion multiplication uses the Hamilton product:
+  result.x = a.w*b.x + b.w*a.x + a.y*b.z - a.z*b.y
+  result.y = a.w*b.y + b.w*a.y + a.z*b.x - a.x*b.z
+  result.z = a.w*b.z + b.w*a.z + a.x*b.y - a.y*b.x
+  result.w = a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+
+cudaError_t QuaternionGemm(
+    int M, int N, int K,
+    float alpha,
+    float const *A, int lda,
+    float const *B, int ldb,
+    float beta,
+    float *C, int ldc);
+```
+
+## Operation
+
+C = alpha * A * B + beta * C
+
+Where:
+- A is M x K quaternions (row-major)
+- B is K x N quaternions (column-major)
+- C is M x N quaternions (row-major)
+- Multiplication between quaternion elements uses the Hamilton product
+- alpha and beta are real scalars applied component-wise to the quaternion result
+
+## Data Types
+
+All data is `float` (FP32). Each quaternion element occupies 4 consecutive floats in order (x, y, z, w).
+
+## Memory Layout
+
+- A: **Row-major**. Quaternion (i,k) starts at `A[(i * lda + k) * 4]`.  lda >= K.
+- B: **Column-major**. Quaternion (k,j) starts at `B[(k + j * ldb) * 4]`.  ldb >= K.
+- C: **Row-major**. Quaternion (i,j) starts at `C[(i * ldc + j) * 4]`.  ldc >= N.
+
+## Build & Test
+
+```bash
+make test                    # requires solution.h in task directory
+./test                       # default: runs small/medium/large sizes
+./test 1024 1024 1024        # custom single size: M N K
+./test 1024 1024 1024 1.0 0.0 20  # M N K alpha beta iterations
+```
+
+Correctness is verified against a reference implementation at multiple problem sizes
+(small: 1024x1024x1024, medium: 4096x4096x4096, large: 8192x8192x8192).
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

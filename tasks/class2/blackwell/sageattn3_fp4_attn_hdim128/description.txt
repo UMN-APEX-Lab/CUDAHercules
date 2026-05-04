@@ -1,0 +1,57 @@
+# Task: sageattn3_fp4_attn_hdim128
+
+## Target Hardware
+NVIDIA Blackwell GPU (SM120).
+
+## Description
+
+Implement a CUDA kernel for FP4 quantized attention on Blackwell GPUs (SM120).
+
+This is a SageAttention v3 pipeline: quantize FP16 Q/K/V to NVFP4 (E2M1) with
+per-16-element FP8 block scales, then compute attention using BlockScaled FP4
+FP4 matrix multiply.
+
+Full pipeline:
+  1. Quantize Q [B,H,S,D] FP16 -> FP4 packed [B,H,S,D/2] + FP8 scales [B,H,S,D/16]
+  2. Quantize K with permutation for efficient access pattern
+  3. Quantize V with transpose: [B,H,S,D] -> [B,H,D,S] (column-wise for P@V)
+  4. Run BlockScaled FP4 attention:
+     a. S = Q_fp4 @ K_fp4^T
+     b. P = softmax(S * sm_scale) 
+     c. O = P @ V_fp4
+  5. Output O in BF16
+
+Parameters:
+  Q:  [2 * 16 * 1024 * 128] float16 -- queries
+  K:  [2 * 16 * 1024 * 128] float16 -- keys
+  V:  [2 * 16 * 1024 * 128] float16 -- values
+  O:  [2 * 16 * 1024 * 128] bfloat16 -- output
+  batch_size:   2
+  num_heads:    16
+  qo_len:       1024
+  kv_len:       1024
+  sm_scale:     1/sqrt(128) = 0.088388
+  is_causal:    0
+
+
+Head dimension: 128
+
+
+## Function Signature
+
+```c
+void sageattn3_fp4_attn_hdim128(
+    const void* Q,
+    const void* K,
+    const void* V,
+    void* O,
+    int batch_size,
+    int num_heads,
+    int qo_len,
+    int kv_len,
+    float sm_scale,
+    int is_causal,
+    cudaStream_t stream
+);
+
+```

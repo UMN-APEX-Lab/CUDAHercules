@@ -1,0 +1,33 @@
+# Task: layernorm_parallel_fwd_1024
+
+## Description
+
+Implement a CUDA kernel for fused residual addition + LayerNorm forward pass.
+
+  x[i,j] = x0[i,j] + residual[i,j]
+  mu[i] = mean(x[i, :])
+  rs[i] = rsqrt(var(x[i, :]) + eps)
+  z[i,j] = (x[i,j] - mu[i]) * rs[i] * gamma[j] + beta[j]
+
+Dimensions: rows=16384, cols=1024, eps=1e-05
+
+
+## Function Signature
+
+```c
+void launch_layernorm_parallel_fwd(
+    const float* x0,       // [rows, cols] new activation
+    const float* residual, // [rows, cols] residual stream
+    const float* gamma,    // [cols] scale weight
+    const float* beta,     // [cols] bias weight
+    float* z,              // [rows, cols] normalized output
+    float* x,              // [rows, cols] x0 + residual (saved for backward)
+    float* mu,             // [rows] per-row mean
+    float* rs,             // [rows] per-row reciprocal std
+    int rows,
+    int cols,
+    float eps,
+    cudaStream_t stream
+);
+
+```

@@ -1,0 +1,48 @@
+# Task: tk_rotary
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+Fused Rotary Position Embeddings (RoPE) on H100, matching ThunderKittens performance.
+
+Applies rotation matrix to query/key embeddings using precomputed sin/cos tables.
+
+## Function Signature
+
+Implement in solution.h:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
+void FusedRotary(
+    __nv_bfloat16 *out, __nv_bfloat16 *x,
+    __nv_bfloat16 *sin_table, __nv_bfloat16 *cos_table,
+    int B, int H, int N, int D);
+```
+
+## Operation
+
+For each position n and head dimension pair (2i, 2i+1):
+  out[..., 2i]   = x[..., 2i] * cos[n, i] - x[..., 2i+1] * sin[n, i]
+  out[..., 2i+1] = x[..., 2i] * sin[n, i] + x[..., 2i+1] * cos[n, i]
+
+Where:
+- x: [B, H, N, D] bf16 input embeddings
+- sin_table: [N, D/2] bf16 precomputed sine values
+- cos_table: [N, D/2] bf16 precomputed cosine values
+- out: [B, H, N, D] bf16 rotated embeddings
+- D = 64 or 128 (head dimension)
+
+## Build & Test
+
+```bash
+conda activate attn
+python gentests.py randn
+make test
+./test randn.txt
+```
+
+Requires H100 GPU (SM90a). ThunderKittens headers on include path.

@@ -1,0 +1,104 @@
+# Task: mgg_agnn (Hopper)
+
+End-to-end AGNN (Attention GNN) training optimization, leveraging Hopper
+(SM90) architecture features.
+
+## Overview
+
+Optimize the full AGNN layer implementation used in attention-based GCN training. Unlike
+standard GCN which uses simple SpMM (sum of neighbors), AGNN computes
+cosine-similarity attention weights between connected nodes and performs
+attention-weighted neighbor aggregation.
+
+The solution is responsible for the complete layer primitive, not just the
+sparse attention kernel. Each layer includes GEMM projection, AGNN attention +
+aggregation, and optional ReLU. The extension runs in both forward and
+backward passes.
+
+You should exploit Hopper-generation GPU features where applicable:
+- **SM90 Tensor Cores (wgmma)**: Use `wgmma` instructions for the attention
+  score computation. Batched cosine-similarity dot products across neighbors
+  can be cast as small matrix multiplies suitable for wgmma (TF32/FP16
+  accumulation). The weighted aggregation (attention * features) is also a
+  natural fit for Tensor Core acceleration.
+- **TMA (Tensor Memory Accelerator)**: Use `cp.async.bulk` / TMA descriptors
+  to efficiently stream sparse graph data (CSR row pointers, column indices,
+  feature vectors) from global to shared memory. TMA's hardware address
+  generation eliminates software overhead for irregular access patterns.
+- **Warp specialization**: Separate producer warps (prefetching neighbor
+  features via TMA) from consumer warps (computing attention scores and
+  aggregation). This overlaps data movement with the attention computation
+  pipeline — critical because AGNN's two-phase forward (attention + aggregate)
+  naturally decomposes into producer-consumer stages.
+- **Asynchronous barriers**: Use `cp.async.mbarrier` to synchronize between
+  producer warps loading the next batch of neighbor features and consumer
+  warps processing the current batch.
+- **Distributed shared memory**: For high-degree nodes whose neighbor data
+  exceeds a single SM's shared memory, use DSMEM via thread block clusters
+  to pool shared memory across SMs.
+
+## Function Signatures
+
+Implement the following in `solution.cu`:
+
+### Forward: complete AGNN layer
+```cuda
+std::vector<torch::Tensor> agnn_forward_cuda(
+    torch::Tensor input,        // [N, in_dim] float32, GPU
+    torch::Tensor weights,      // [in_dim, out_dim] float32, GPU
+    torch::Tensor row_pointers, // [N+1] int32, GPU (CSR)
+    torch::Tensor column_index, // [E] int32, GPU (CSR)
+    int num_nodes,
+    int num_edges,
+    bool apply_relu
+);
+// Returns {output, edge_attention}
+```
+
+The implementation must perform GEMM projection, AGNN attention +
+aggregation, and optional ReLU in one layer primitive.
+
+### Backward: complete AGNN layer
+```cuda
+std::vector<torch::Tensor> agnn_backward_cuda(
+    torch::Tensor grad_output,    // [N, out_dim] float32, GPU
+    torch::Tensor input,          // [N, in_dim] float32, GPU
+    torch::Tensor weights,        // [in_dim, out_dim] float32, GPU
+    torch::Tensor edge_attention, // [E] float32, GPU (from forward)
+    torch::Tensor layer_output,   // [N, out_dim] float32, GPU
+    torch::Tensor row_pointers,   // [N+1] int32, GPU
+    torch::Tensor column_index,   // [E] int32, GPU
+    int num_nodes,
+    int num_edges,
+    bool apply_relu
+);
+// Returns {grad_input, grad_weights}
+```
+
+## Training Pipeline
+
+4-layer AGNN, each layer:
+The Python harness only owns the outer training loop, optimizer, and loss.
+Your extension owns the full layer implementation used inside the model.
+
+Training: Adam optimizer, cross-entropy loss, symmetric undirected graph.
+
+## Test Configuration
+
+- Graph: amazon0505 (410K nodes, 4.88M edges, from TC-GNN paper Type III)
+- Model: 4-layer AGNN, input_dim=96, hidden=32, classes=22
+- Training: 10 warmup + 200 timed epochs
+
+## Build & Run
+
+```bash
+bash prepare_data.sh
+python run.py
+```
+
+## Reference
+
+MGG: Accelerating Graph Neural Networks with Fine-Grained Intra-Kernel
+Communication-Computation Pipelining on Multi-GPU Platforms (OSDI'23).
+Baseline: warp-per-node AGNN kernel with warp shuffle reductions for
+attention computation.

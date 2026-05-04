@@ -1,0 +1,115 @@
+# Task: ExaChem CCSD(T) Fully-Fused GPU Kernel Optimization (Hopper)
+
+Optimize the fully-fused CCSD(T) perturbative triples kernel from ExaChem, a production
+quantum chemistry application for exascale computing developed at Pacific Northwest National
+Laboratory, leveraging Hopper (SM90) architecture features. This kernel won the Best Paper
+award at SC'24.
+
+## Overview
+
+Coupled-cluster with singles, doubles, and perturbative triples — CCSD(T) — is the "gold
+standard" of computational quantum chemistry for calculating molecular electronic correlation
+energies. The perturbative triples correction is the most compute-intensive step, scaling as
+O(N^7) with system size. This kernel fuses all tensor contraction equations into a single
+GPU launch, using NVIDIA 3rd-generation Tensor Cores for FP64 matrix-multiply-accumulate
+operations.
+
+You should exploit Hopper-generation GPU features where applicable:
+- **SM90 FP64 Tensor Cores (wgmma)**: Replace SM80 `mma.sync.aligned.m8n8k4` with
+  Hopper `wgmma` (warpgroup MMA) instructions for higher FP64 throughput per SM,
+  utilizing the 4th-generation Tensor Core datapath
+- **TMA (Tensor Memory Accelerator)**: Use TMA descriptors and `cp.async.bulk` to
+  load tensor tiles (t2/v2 slices) from global to shared memory, replacing the
+  manual G2S device functions with hardware-accelerated multi-dimensional copies
+- **Enhanced asynchronous pipeline**: Upgrade from 2-stage `cuda::pipeline` to
+  Hopper's native TMA-based multi-stage pipeline with `cp.async.bulk` and
+  `mbarrier`, enabling more pipeline stages to better hide memory latency
+- **Thread Block Clusters**: Coordinate MMA computation across multiple SMs in a
+  cluster to share intermediate tensor tiles via distributed shared memory,
+  reducing redundant global memory loads for shared orbital indices
+- **Warp specialization**: Dedicate producer warpgroups to TMA-driven data loading
+  and consumer warpgroups to wgmma accumulation, overlapping data movement with
+  FP64 Tensor Core compute
+
+The kernel computes three types of residual equations for a given set of orbital tile indices
+(h1, h2, h3, p4, p5, p6):
+- **Singles (S1):** 9 equation variants — direct t1 x v2 products
+- **Doubles-1 (D1):** 9 equations x noab occupied blocks — t2 x v2 contractions over h7
+- **Doubles-2 (D2):** 9 equations x nvab virtual blocks — t2 x v2 contractions over p7
+
+Each equation loads tensor tiles from global memory to shared memory via an asynchronous
+pipeline, then performs Tensor Core MMA operations to accumulate a 6-dimensional output
+tensor T3. The final energy contributions are computed by dividing T3 elements by orbital
+energy denominators and reducing across the thread block.
+
+## Solution Files
+
+You must optimize the following files (all three may be modified):
+
+### solution.cu
+The main kernel and driver. Contains:
+- `fully_fused_kernel_ccsd_t_nvidia_tc_fp64<T>()` — the `__global__` kernel (256 threads,
+  16x16 block, 3 resident blocks per SM)
+- `launch_ccsd_t_kernel()` — the driver that copies constant memory and launches the kernel
+- Helper device functions: `zero_shared()`, `rt_store_fixed()`, `rt_load_fixed()`
+- Constant memory declarations for execution flags and orbital dimensions
+
+### ccsd_t_g2s_device_functions.cu
+Global-to-shared (G2S) memory transfer device functions. These load tensor tiles from global
+memory into shared memory using `cuda::memcpy_async` with specific stride patterns for each
+equation variant. Functions include `g2s_d1_t2_1` through `g2s_d2_v2_9`.
+
+### tensor_core_helper.cuh
+Tensor Core helper structures:
+- `MmaOperandA`, `MmaOperandB`, `MmaOperandC` — register-level operand management
+- `mma()`, `mma_t()` — inline PTX wrappers for `mma.sync.aligned.m8n8k4.row.col.f64`
+- `WarpRegisterMapping` — maps thread IDs to warp/lane positions
+
+## Kernel Architecture
+
+- **Thread Block:** 16x16 = 256 threads, `__launch_bounds__(256, 3)`
+- **Grid:** Product of CEIL(dim/4) for all 6 orbital dimensions
+- **Shared Memory:** `2 x NUM_STAGE x 8 x STAGE_OFFSET` bytes (dynamic), ~33 KB
+- **Constant Memory:** Execution flags and h7b/p7b dimensions (< 8 KB)
+- **Pipeline:** 2-stage asynchronous pipeline with `cuda::pipeline<thread_scope_thread>`
+- **MMA Instructions:** `mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64`
+- **Register Transpose:** Between equation groups via shared memory staging
+
+## Constraints
+
+- Data type: FP64 (double precision) — required for quantum chemistry accuracy
+- Minimum GPU: SM 9.0 (Hopper) for this variant
+- The kernel must implement `launch_ccsd_t_kernel()` with the exact signature in
+  `kernel_interface.cuh`
+- Energy results must match the reference within relative tolerance 1e-6
+- Must use `__global__` kernel functions and Tensor Core MMA instructions
+
+## Build & Test
+
+```bash
+cd src && make ref      # Build reference kernel
+cd src && make test     # Build with solution kernel
+cd .. && python run.py  # Full benchmark: build, run, compare, time
+```
+
+## Test Configuration
+
+Three test cases from real molecular systems (ccsdt_tilesize=40):
+
+| Test Case | Molecule | noab | nvab | h dims | p dims | Grid Blocks |
+|-----------|----------|------|------|--------|--------|-------------|
+| 1 | H2O / cc-pvdz | 1 | 1 | 5,5,5 | 19,19,19 | 1,000 |
+| 2 | Ubiquitin / 6-31g | 4 | 7 | 40,40,40 | 40,40,40 | 1,000,000 |
+| 3 | Water-53 / cc-pvdz | 6 | 26 | 40,40,35 | 40,40,7 | 180,000 |
+
+- Total GPU memory: up to ~12 GB for tensor data
+- Total kernel time (reference): ~55 seconds across all 3 test cases
+
+## Reference
+
+Bagusetty, A. et al. "Fully-Fused Multi-Head Tensor Contraction Kernels for 3rd Generation
+Tensor Cores." Proceedings of the International Conference for High Performance Computing,
+Networking, Storage, and Analysis (SC'24). Best Paper Award.
+
+ExaChem: Open Source Exascale Computational Chemistry Software.
+https://github.com/ExaChem/exachem — Apache 2.0 License.

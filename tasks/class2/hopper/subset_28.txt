@@ -1,0 +1,33 @@
+# Class 2 Hopper sampled subset (28 tasks)
+# FA3 fwd/bwd/fwd_split × 2 hdims {64,256} × 2 dtypes × 2 causal = 24
+# + 4 ThunderKittens SM90a tasks
+# Usage: --task-list tasks/class2/hopper/subset_28.txt
+
+class2/hopper/fa3_fwd_hdim64_fp16
+class2/hopper/fa3_fwd_hdim64_fp16_causal
+class2/hopper/fa3_fwd_hdim64_bf16
+class2/hopper/fa3_fwd_hdim64_bf16_causal
+class2/hopper/fa3_fwd_hdim256_fp16
+class2/hopper/fa3_fwd_hdim256_fp16_causal
+class2/hopper/fa3_fwd_hdim256_bf16
+class2/hopper/fa3_fwd_hdim256_bf16_causal
+class2/hopper/fa3_bwd_hdim64_fp16
+class2/hopper/fa3_bwd_hdim64_fp16_causal
+class2/hopper/fa3_bwd_hdim64_bf16
+class2/hopper/fa3_bwd_hdim64_bf16_causal
+class2/hopper/fa3_bwd_hdim256_fp16
+class2/hopper/fa3_bwd_hdim256_fp16_causal
+class2/hopper/fa3_bwd_hdim256_bf16
+class2/hopper/fa3_bwd_hdim256_bf16_causal
+class2/hopper/fa3_fwd_split_hdim64_fp16
+class2/hopper/fa3_fwd_split_hdim64_fp16_causal
+class2/hopper/fa3_fwd_split_hdim64_bf16
+class2/hopper/fa3_fwd_split_hdim64_bf16_causal
+class2/hopper/fa3_fwd_split_hdim256_fp16
+class2/hopper/fa3_fwd_split_hdim256_fp16_causal
+class2/hopper/fa3_fwd_split_hdim256_bf16
+class2/hopper/fa3_fwd_split_hdim256_bf16_causal
+class2/hopper/tk_based
+class2/hopper/tk_hedgehog
+class2/hopper/tk_linear_attention
+class2/hopper/tk_mamba2

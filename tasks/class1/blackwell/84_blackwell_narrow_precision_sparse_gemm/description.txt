@@ -1,0 +1,205 @@
+# Task: 84_blackwell_narrow_precision_sparse_gemm
+
+## Target Hardware
+NVIDIA Blackwell GPU (SM100/SM120).
+
+
+Blackwell SM100 Narrow Precision (NVFP4) Sparse GEMM test harness
+2:4 structured sparsity, FP4 data + scales, BF16 output
+Based on CUTLASS example 84_blackwell_narrow_precision_sparse_gemm
+The LLM must implement:
+  cudaError_t BlackwellNvfp4SparseBf16Gemm(int M, int N, int K, float alpha,
+      cutlass::float_e2m1_t const *A_compressed, int lda_comp,
+      float const *A_scales, int scale_lda,
+      uint16_t const *A_metadata,
+      cutlass::float_e2m1_t const *B, int ldb,
+      float const *B_scales, int scale_ldb,
+      float beta, __nv_bfloat16 *D, int ldd);
+A is 2:4 sparse compressed: A_compressed M x (K/2) in FP4 E2M1, one element per byte.
+A_metadata encodes which 2 of every 4 elements are non-zero.
+A_scales: [M, ceil(K/32)] row-major per-block scales.
+B is column-major [K, N] in FP4 E2M1, one element per byte.
+B_scales: [N, ceil(K/32)] row-major per-block scales.
+D is row-major [M, N] in BF16.
+Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
+         -I<cutlass>/include harness.cu solution.cu -o test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * Blackwell SM100 Narrow Precision (NVFP4) Sparse GEMM test harness
+ * 2:4 structured sparsity, FP4 data + scales, BF16 output
+ * Based on CUTLASS example 84_blackwell_narrow_precision_sparse_gemm
+ *
+ * The LLM must implement:
+ *   cudaError_t BlackwellNvfp4SparseBf16Gemm(int M, int N, int K, float alpha,
+ *       cutlass::float_e2m1_t const *A_compressed, int lda_comp,
+ *       float const *A_scales, int scale_lda,
+ *       uint16_t const *A_metadata,
+ *       cutlass::float_e2m1_t const *B, int ldb,
+ *       float const *B_scales, int scale_ldb,
+ *       float beta, __nv_bfloat16 *D, int ldd);
+ *
+ * A is 2:4 sparse compressed: A_compressed M x (K/2) in FP4 E2M1, one element per byte.
+ * A_metadata encodes which 2 of every 4 elements are non-zero.
+ * A_scales: [M, ceil(K/32)] row-major per-block scales.
+ * B is column-major [K, N] in FP4 E2M1, one element per byte.
+ * B_scales: [N, ceil(K/32)] row-major per-block scales.
+ * D is row-major [M, N] in BF16.
+ *
+ * Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
+ *          -I<cutlass>/include harness.cu solution.cu -o test
+ */
+
+#include <cuda_bf16.h>
+#include <iostream>
+#include <vector>
+#include <cstdint>
+#include <cmath>
+#include "cutlass/numeric_types.h"
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status)                                              \
+  {                                                                     \
+    cudaError_t error = status;                                         \
+    if (error != cudaSuccess) {                                         \
+      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
+                << " at line: " << __LINE__ << std::endl;               \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
+  }
+
+static constexpr int kGroupSize = 32;
+
+extern cudaError_t BlackwellNvfp4SparseBf16Gemm(
+  int M, int N, int K, float alpha,
+  cutlass::float_e2m1_t const *A_compressed, int lda_comp,
+  float const *A_scales, int scale_lda,
+  uint16_t const *A_metadata,
+  cutlass::float_e2m1_t const *B, int ldb,
+  float const *B_scales, int scale_ldb,
+  float beta,
+  __nv_bfloat16 *D, int ldd);
+
+void reference_gemm(int M, int N, int K, float alpha,
+  std::vector<float> const &A, int lda,
+  std::vector<float> const &B, int ldb,
+  float beta, std::vector<float> &D, int ldd) {
+  for (int i = 0; i < M; ++i)
+    for (int j = 0; j < N; ++j) {
+      float acc = 0;
+      for (int k = 0; k < K; ++k) acc += A[i*lda+k] * B[k+j*ldb];
+      D[i*ldd+j] = alpha * acc + beta * D[i*ldd+j];
+    }
+}
+
+int main() {
+  int M = 128, N = 128, K = 256;
+  int ldb = K, ldd = N, lda_comp = K / 2;
+  float alpha = 1.0f, beta = 0.0f;
+  int k_groups = (K + kGroupSize - 1) / kGroupSize;
+  int K_comp = K / 2;
+
+  // Create dense matrix with 2:4 sparsity
+  std::vector<float> fA_dense(M * K);
+  for (int i = 0; i < M; ++i)
+    for (int k = 0; k < K; ++k) {
+      int pos = k % 4;
+      if (pos == 1 || pos == 3) fA_dense[i*K+k] = 0.0f;
+      else fA_dense[i*K+k] = float(((i*K+k) * 16807 % 6) - 3) * 0.5f;
+    }
+
+  // Compress to FP4 + metadata
+  std::vector<cutlass::float_e2m1_t> hA_comp(M * K_comp);
+  int meta_cols = K / 16; if (meta_cols == 0) meta_cols = 1;
+  std::vector<uint16_t> h_meta(M * meta_cols, 0);
+
+  std::vector<float> fA_ref(M * K, 0);
+  for (int i = 0; i < M; ++i) {
+    int ci = 0;
+    for (int kg = 0; kg < K; kg += 4) {
+      int idx0 = 0, idx1 = 2;
+      hA_comp[i*K_comp+ci]   = cutlass::float_e2m1_t(fA_dense[i*K+kg+idx0]);
+      hA_comp[i*K_comp+ci+1] = cutlass::float_e2m1_t(fA_dense[i*K+kg+idx1]);
+      fA_ref[i*K+kg+idx0] = float(hA_comp[i*K_comp+ci]);
+      fA_ref[i*K+kg+idx1] = float(hA_comp[i*K_comp+ci+1]);
+      ci += 2;
+      int group = kg / 4, meta_word = group / 4, meta_shift = (group % 4) * 4;
+      uint16_t bits = (uint16_t)((idx0 & 0x3) | ((idx1 & 0x3) << 2));
+      h_meta[i*meta_cols+meta_word] |= (bits << meta_shift);
+    }
+  }
+
+  // FP4 B
+  std::vector<cutlass::float_e2m1_t> hB(K * N);
+  std::vector<float> fB(K * N);
+  for (int i = 0; i < K * N; ++i) {
+    hB[i] = cutlass::float_e2m1_t(float((i * 48271 % 6) - 3) * 0.5f);
+    fB[i] = float(hB[i]);
+  }
+
+  std::vector<float> sA(M * k_groups, 1.0f), sB(N * k_groups, 1.0f);
+
+  cutlass::float_e2m1_t *dA_comp, *dB; uint16_t *dA_meta;
+  float *dsA, *dsB; __nv_bfloat16 *dD;
+  CUDA_CHECK(cudaMalloc(&dA_comp, M*K_comp*sizeof(cutlass::float_e2m1_t)));
+  CUDA_CHECK(cudaMalloc(&dA_meta, M*meta_cols*sizeof(uint16_t)));
+  CUDA_CHECK(cudaMalloc(&dsA, M*k_groups*sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&dB, K*N*sizeof(cutlass::float_e2m1_t)));
+  CUDA_CHECK(cudaMalloc(&dsB, N*k_groups*sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&dD, M*N*sizeof(__nv_bfloat16)));
+
+  CUDA_CHECK(cudaMemcpy(dA_comp, hA_comp.data(), M*K_comp*sizeof(cutlass::float_e2m1_t), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dA_meta, h_meta.data(), M*meta_cols*sizeof(uint16_t), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsA, sA.data(), M*k_groups*sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB, hB.data(), K*N*sizeof(cutlass::float_e2m1_t), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dsB, sB.data(), N*k_groups*sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(dD, 0, M*N*sizeof(__nv_bfloat16)));
+
+  cudaError_t r = BlackwellNvfp4SparseBf16Gemm(
+    M, N, K, alpha, dA_comp, lda_comp, dsA, k_groups, dA_meta, dB, ldb, dsB, k_groups, beta, dD, ldd);
+  if (r != cudaSuccess) {
+    std::cerr << "Sparse GEMM failed: " << cudaGetErrorString(r) << std::endl;
+    cudaFree(dA_comp); cudaFree(dA_meta); cudaFree(dsA); cudaFree(dB); cudaFree(dsB); cudaFree(dD);
+    return -1;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && r == cudaSuccess) {
+      kh_benchmark([&]() { BlackwellNvfp4SparseBf16Gemm(
+    M, N, K, alpha, dA_comp, lda_comp, dsA, k_groups, dA_meta, dB, ldb, dsB, k_groups, beta, dD, ldd); }, _kh_trials);
+    }
+  }
+
+
+  std::vector<__nv_bfloat16> hD(M*N);
+  CUDA_CHECK(cudaMemcpy(hD.data(), dD, M*N*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+  cudaFree(dA_comp); cudaFree(dA_meta); cudaFree(dsA); cudaFree(dB); cudaFree(dsB); cudaFree(dD);
+
+  std::vector<float> fD(M*N), fRef(M*N, 0);
+  for (int i = 0; i < M*N; ++i) fD[i] = __bfloat162float(hD[i]);
+  reference_gemm(M, N, K, alpha, fA_ref, K, fB, ldb, beta, fRef, ldd);
+
+  float max_rel = 0; int mm = 0;
+  for (int i = 0; i < M*N; ++i) {
+    float d = std::fabs(fD[i]-fRef[i]), den = std::fmax(std::fabs(fRef[i]),1e-6f);
+    float rel = d/den; max_rel = std::fmax(max_rel, rel);
+    if (rel > 0.3f) mm++;
+  }
+  if (float(mm)/float(M*N) > 0.01f) {
+    std::cerr << "Results incorrect. Max relative diff: " << max_rel
+              << ", mismatch rate: " << float(mm)/float(M*N) << std::endl;
+    return -1;
+  }
+  std::cout << "Passed." << std::endl;
+  return 0;
+}
+```

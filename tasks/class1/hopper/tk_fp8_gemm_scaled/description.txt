@@ -1,0 +1,43 @@
+# Task: tk_fp8_gemm_scaled
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+FP8 (E4M3) General Matrix Multiply with per-row/per-column scaling on H100, matching ThunderKittens performance.
+
+## Function Signature
+
+Implement in solution.h:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_fp8.h>
+
+void Fp8GemmScaled(__nv_fp8_e4m3 *A, __nv_fp8_e4m3 *B, float *C, float *A_scale, float *B_scale, int M, int N, int K);
+```
+
+## Operation
+
+C = diag(A_scale) * (A * B^T) * diag(B_scale)
+
+Where:
+- A is M×K (row-major, FP8 E4M3)
+- B is N×K (to be transposed, i.e. column-major, FP8 E4M3)
+- C is M×N (row-major, float)
+- A_scale is a float vector of length M (per-row scale for A)
+- B_scale is a float vector of length N (per-column scale for B)
+
+The FP8 inputs are pre-scaled: A_quantized = A_original / A_scale, B_quantized = B_original / B_scale.
+The kernel must dequantize by multiplying the raw FP8 dot product by the corresponding scales.
+
+## Build & Test
+
+```bash
+# Generate test data (no external data needed - self-contained)
+make test
+./test
+```
+
+Requires H100 GPU (SM90a). ThunderKittens headers on include path.

@@ -1,0 +1,69 @@
+# Task: 17_fprop_per_channel_bias
+
+Conv2D Forward Propagation (Fprop) with per-channel bias and ReLU activation.
+Half-precision input/filter, single-precision output, NHWC layout.
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+cudaError_t Conv2dFpropBiasRelu(
+    __half const *input, __half const *filter,
+    float const *bias, float *output,
+    int N, int C, int H, int W, int K, int R, int S,
+    int pad_h, int pad_w, int stride_h, int stride_w,
+    float alpha);
+```
+
+## Operation
+
+output = max(0, alpha * Conv2d(input, filter) + bias)
+
+Where for each output element:
+  output[n][p][q][k] = max(0, alpha * sum_{c,r,s} input[n][h][w][c] * filter[k][r][s][c] + bias[k])
+
+With h = p * stride_h + r - pad_h, w = q * stride_w + s - pad_w (skip if out of bounds).
+
+Output spatial dimensions:
+  P = (H + 2 * pad_h - R) / stride_h + 1
+  Q = (W + 2 * pad_w - S) / stride_w + 1
+
+The per-channel bias vector has K elements, one per output channel.
+ReLU is applied after adding the bias: output = max(0, result).
+
+## Data Types
+
+- Input tensor: `__half` (FP16)
+- Filter tensor: `__half` (FP16)
+- Bias vector: `float` (FP32), length K
+- Output tensor: `float` (FP32)
+- Accumulation: `float` (FP32)
+- Alpha: `float`
+
+## Memory Layout
+
+All tensors use **NHWC** layout:
+- Input: `input[((n * H + h) * W + w) * C + c]` with shape (N, H, W, C)
+- Filter: `filter[((k * R + r) * S + s) * C + c]` with shape (K, R, S, C)
+- Bias: `bias[k]` with shape (K,)
+- Output: `output[((n * P + p) * Q + q) * K + k]` with shape (N, P, Q, K)
+
+## Build & Test
+
+```bash
+make test                    # requires solution.h in task directory
+./test                       # default: runs small/medium/large sizes
+./test 1 56 56 64 64 3 3     # custom single size: N H W C K R S
+./test 1 56 56 64 64 3 3 1.0 20  # N H W C K R S alpha iterations
+```
+
+Correctness is verified against a reference implementation at multiple problem sizes
+(small: N=1 H=W=56 C=K=64, medium: N=1 H=W=112 C=K=128, large: N=4 H=W=56 C=K=256).
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

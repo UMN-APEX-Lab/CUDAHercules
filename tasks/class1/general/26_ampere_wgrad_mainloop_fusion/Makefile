@@ -1,0 +1,16 @@
+CUTLASS_DIR ?= ../../../../reference_sources/cutlass
+CUTLASS_INC = -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include -I$(CUTLASS_DIR)/examples/common
+NVCC       ?= nvcc
+NVCC_FLAGS  = -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr
+ARCH        = -gencode arch=compute_80,code=compute_80
+
+ref: ampere_wgrad_mainloop_fusion.cu
+	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(CUTLASS_INC) $< -o $@
+
+test: ampere_wgrad_mainloop_fusion.cu solution.h
+	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(CUTLASS_INC) -DKH_TEST_SOLUTION $< -o $@
+
+clean:
+	rm -f ref ref_* test
+
+.PHONY: clean

@@ -1,0 +1,67 @@
+schema_version: 1
+task_id: class3/gpumd/blackwell
+name: gpumd
+task_class: 3
+domain: molecular-dynamics
+tags:
+- lennard-jones
+- tersoff
+- coulomb
+- ewald
+- n-body
+- neighbor-list
+- hpc
+- three-body
+- blackwell
+hardware:
+  min_sm: 100
+  tested_sms:
+  - 100
+  required_features: []
+runner:
+  backend: class3_app
+  workdir: tasks/class3/gpumd
+  timeout_sec: 600
+  env:
+    CUDA_GENCODE: -gencode arch=compute_100a,code=sm_100a
+  solution_files:
+  - generated_project/
+execute:
+  cmd: python run.py
+  success:
+    exit_code: 0
+    stdout_regex: Passed
+correctness:
+  mode: energy_conservation
+  tolerances:
+    max_energy_drift: 0.05
+performance:
+  enabled: true
+  parser:
+    kernel_time_ms_regex: Kernel time:\s*([0-9.]+)\s*ms
+  metric: total_time
+source:
+  repo: GPUMD (brucefan1983/GPUMD)
+  license: GPLv3
+anti_cheat:
+  blocked_patterns:
+  - tasks/class3/gpumd/src
+  - tasks/class3/gpumd/data
+  - \bmd_bench\b
+  - \bref_forces\b
+  - \.blackbox_inputs_v1\b
+  - prepare_blackbox_inputs\.py
+  - model\.xyz
+  required_patterns:
+  - __global__\s+void
+  - <<<.*>>>
+
+hacking_hints: |
+  Force kernels (LJ, Tersoff, Coulomb/Ewald) must compute per-atom pairwise
+  forces that evolve the trajectory. Energy/temperature must emerge from the
+  actual integrator.
+  Flags:
+  - Zero forces for all atoms (trajectory will diverge silently)
+  - Reading a cached reference trajectory and replaying it
+  - Hardcoded potential-energy printouts
+  - Skipping the reciprocal-space part of Ewald

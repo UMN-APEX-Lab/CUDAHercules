@@ -1,0 +1,68 @@
+# Task: 35_gemm_softmax
+
+Batched GEMM + row-wise Softmax on half-precision (FP16) data.
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+cudaError_t gemm_softmax_solution(
+    int M, int N, int K,
+    float alpha, float beta,
+    __half const *A, int lda,
+    __half const *B, int ldb,
+    __half const *C, int ldc,
+    __half *D, int ldd,
+    __half *Softmax, int lds,
+    int batch_count,
+    int64_t batch_stride_A,
+    int64_t batch_stride_B,
+    int64_t batch_stride_C,
+    int64_t batch_stride_D,
+    int64_t batch_stride_Softmax);
+```
+
+## Operation
+
+For each batch b = 0 .. batch_count-1:
+  1. GEMM:     D[m,n] = alpha * sum_k(A[m,k] * B[k,n]) + beta * C[m,n]
+  2. Softmax:  Softmax[m,n] = exp(D[m,n] - max_n(D[m,:])) / sum_n(exp(D[m,n'] - max_n(D[m,:])))
+
+Row-wise softmax: each row m is independently normalized across columns n=0..N-1.
+
+## Data Types
+
+All matrices are `__half` (FP16). Use FP32 accumulation for numerical stability.
+
+## Memory Layouts
+
+- A: **row-major**, shape [M, K].  Element (m,k) at `A[m * lda + k]`.  lda >= K.
+- B: **column-major**, shape [K, N].  Element (k,n) at `B[k + n * ldb]`.  ldb >= K.
+- C, D, Softmax: **row-major**, shape [M, N].  Element (m,n) at `X[m * ldx + n]`.  ldx >= N.
+
+## Batching
+
+`batch_count` independent problems. For batch b, offset each pointer by:
+  A_b = A + b * batch_stride_A
+  B_b = B + b * batch_stride_B
+  (same for C, D, Softmax with their respective batch strides)
+
+## Build & Test
+
+```bash
+make test                             # requires solution.h in task directory
+./test                                # default: runs small/medium/large sizes
+./test --m=1024 --n=512 --k=256 --batch_count=8   # custom single size
+./test --iterations=50                # more profiling iterations (default: 20)
+```
+
+Correctness is verified against a reference implementation at multiple problem sizes
+(small: 128x128x64, medium: 512x512x256, large: 2048x2048x1024).
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

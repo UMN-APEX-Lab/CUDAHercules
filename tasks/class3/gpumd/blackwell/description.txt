@@ -1,0 +1,42 @@
+# Task: gpumd (Blackwell Black-Box Project Generation)
+
+Generate a complete self-contained CUDA/C++ molecular dynamics project under:
+
+- `generated_project/`
+
+Target NVIDIA Blackwell-class GPUs. You are NOT patching upstream
+`md_kernels.cuh` or any existing GPUMD source files.
+
+## Goal
+
+Build an end-to-end GPU molecular dynamics application that runs all benchmark
+workloads and minimizes total runtime while preserving correctness.
+
+## Material Systems
+
+Your project must handle:
+
+1. Argon with Lennard-Jones pairwise interactions
+2. Silicon with a Tersoff-style three-body potential
+3. NaCl with Coulomb real-space plus reciprocal-space / Ewald-style forces
+
+## Benchmark-Owned Inputs
+
+The benchmark owns the data loader and provides standardized binary workload
+files. Your project must consume the provided workload format instead of
+parsing upstream `.xyz` files.
+
+## Required CUDA Coverage
+
+Your project must contain real custom CUDA implementations for:
+
+- neighbor list construction
+- Velocity Verlet integration
+- kinetic energy calculation
+- Lennard-Jones force evaluation
+- Tersoff force evaluation
+- Coulomb real-space force evaluation
+- Coulomb reciprocal-space / k-space work
+
+Read `build_contract.md` carefully for the manifest schema, input format,
+output format, and `build.sh` / `run.sh` requirements.

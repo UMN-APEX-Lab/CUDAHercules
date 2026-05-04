@@ -1,0 +1,61 @@
+# Class 2 General pinned subset (43 tasks)
+# Covers all kernel types, sizes, precisions, causal/non.
+# 4 SageAttention v1 INT8 QK × FP16 PV tasks excluded — reference is a
+# ported SM80 kernel that produces unstable numerics on Blackwell SM120.
+# 1 FFT task removed 2026-04-22: fft_c2c_2d_256x256_fp32 — cuFFT reference
+# was catastrophically slow on small 2D FFTs (173× hand-rolled wins distort
+# fast_p / geomean without reflecting real optimization skill).
+# Usage: --task-list tasks/class2/general/subset_44.txt
+
+# Flash Attention 2 — fwd (6)
+flash_attn_fwd_hdim32_fp16
+flash_attn_fwd_hdim64_bf16
+flash_attn_fwd_hdim96_fp16_causal
+flash_attn_fwd_hdim128_bf16
+flash_attn_fwd_hdim192_fp16
+flash_attn_fwd_hdim256_bf16_causal
+
+# Flash Attention 2 — bwd (6)
+flash_attn_bwd_hdim32_bf16
+flash_attn_bwd_hdim64_fp16
+flash_attn_bwd_hdim96_bf16_causal
+flash_attn_bwd_hdim128_fp16
+flash_attn_bwd_hdim192_bf16
+flash_attn_bwd_hdim256_fp16_causal
+
+# Flash Attention 2 — fwd_split (6)
+flash_attn_fwd_split_hdim32_fp16
+flash_attn_fwd_split_hdim64_bf16
+flash_attn_fwd_split_hdim96_fp16_causal
+flash_attn_fwd_split_hdim128_bf16
+flash_attn_fwd_split_hdim192_fp16
+flash_attn_fwd_split_hdim256_bf16_causal
+
+# FFT (9)
+fft_c2c_1d_1024_fp32
+fft_c2c_1d_16384_fp32
+fft_c2c_1d_65536_fp32
+fft_c2c_1d_1024_fp64
+fft_c2c_1d_4096_fp64
+fft_c2c_2d_1024x1024_fp32
+fft_c2c_3d_64x64x64_fp32
+fft_r2c_1d_1024_fp32
+fft_r2c_1d_65536_fp32
+
+# LayerNorm (16)
+layernorm_fwd_256
+layernorm_fwd_1024
+layernorm_fwd_4096
+layernorm_fwd_8192
+layernorm_bwd_256
+layernorm_bwd_1024
+layernorm_bwd_4096
+layernorm_bwd_8192
+layernorm_parallel_fwd_256
+layernorm_parallel_fwd_1024
+layernorm_parallel_fwd_4096
+layernorm_parallel_fwd_8192
+layernorm_parallel_bwd_256
+layernorm_parallel_bwd_1024
+layernorm_parallel_bwd_4096
+layernorm_parallel_bwd_8192

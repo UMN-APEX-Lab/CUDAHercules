@@ -1,0 +1,65 @@
+# Task: 52_hopper_gather_scatter_fusion
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+Hopper GEMM with N-mode gather/scatter fusion. Gather selects columns from B,
+scatter writes result columns into D using index arrays.
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+cudaError_t HopperGatherScatterGemm(
+    int M, int index_size, int K, float alpha,
+    __half const *A, int lda,
+    __half const *B, int ldb,
+    int const *gather_indices,
+    float beta,
+    __half *D, int ldd,
+    int const *scatter_indices);
+```
+
+## Operation
+
+For each j in [0, index_size):
+  D[:, scatter_indices[j]] = alpha * A * B[:, gather_indices[j]] + beta * D[:, scatter_indices[j]]
+
+Where:
+- A is M x K (no gather, full matrix)
+- B is K x N_orig, but only index_size columns are gathered via gather_indices
+- D is M x N_orig, but only index_size columns are written via scatter_indices
+- The logical GEMM dimension is M x index_size x K
+
+## Data Types
+
+- All matrices A, B, D: `__half` (FP16)
+- Scalars alpha, beta: `float`
+- Index arrays: `int`
+
+## Memory Layout
+
+- A is **row-major** [M, K]: Element (i,k) at `A[i * lda + k]`.  lda = K.
+- B is **column-major** [K, N_orig]: Element (k,j) at `B[k + j * ldb]`.  ldb = K.
+- D is **column-major** [M, N_orig]: Element (i,j) at `D[i + j * ldd]`.  ldd = M.
+- gather_indices[j]: column index in B for logical column j
+- scatter_indices[j]: column index in D for logical column j
+
+## Test Sizes
+
+- small: M=1024, N_orig=1024, K=512, index_size=512
+- medium: M=4096, N_orig=4096, K=2048, index_size=2048
+- large: M=8192, N_orig=8192, K=4096, index_size=4096
+
+## Compilation
+
+```bash
+make test    # compiles with solution.h, needs CUTLASS headers
+./test       # runs correctness check + profiling
+```

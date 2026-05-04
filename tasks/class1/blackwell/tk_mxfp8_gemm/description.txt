@@ -1,0 +1,47 @@
+# Task: tk_mxfp8_gemm
+
+## Target Hardware
+NVIDIA Blackwell GPU (SM100/SM120).
+
+
+MXFP8 (Microscaling FP8) General Matrix Multiply on B200, matching ThunderKittens Blackwell performance.
+
+Uses FP8 E4M3 data with E8M0 block scaling factors (block size = 128). The hardware MXFP8 format stores scales in a swizzled layout for efficient tensor core access.
+
+## Function Signature
+
+Implement in solution.h:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+
+void Mxfp8Gemm(
+    __nv_fp8_e4m3 *A, __nv_fp8_e4m3 *B,
+    __nv_fp8_e8m0 *A_scale, __nv_fp8_e8m0 *B_scale,
+    __nv_bfloat16 *C, int M, int N, int K);
+```
+
+## Operation
+
+C = (A * diag(A_scale)) * (B * diag(B_scale))^T
+
+Where:
+- A is M×K (row-major, FP8 E4M3)
+- B is N×K (to be transposed, FP8 E4M3)
+- A_scale is [M/128, K/128, 32, 16] (E8M0 block scales, swizzled layout)
+- B_scale is [N/128, K/128, 32, 16] (E8M0 block scales, swizzled layout)
+- C is M×N (row-major, BF16 output)
+
+Each 128-element block of data is scaled by its corresponding E8M0 scale factor.
+
+## Build & Test
+
+```bash
+make test
+./test
+```
+
+Requires B200 GPU (SM100a). ThunderKittens headers on include path.

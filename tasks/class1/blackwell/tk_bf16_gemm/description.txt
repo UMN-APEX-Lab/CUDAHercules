@@ -1,0 +1,47 @@
+# Task: tk_bf16_gemm
+
+## Target Hardware
+NVIDIA Blackwell GPU (SM100/SM120).
+
+
+BF16 General Matrix Multiply on B200, matching ThunderKittens Blackwell performance.
+
+## Function Signature
+
+Implement in solution.h:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+
+void Bf16Gemm(__nv_bfloat16 *A, __nv_bfloat16 *B, __nv_bfloat16 *C, int M, int N, int K);
+```
+
+## Operation
+
+C = A * B^T
+
+Where A is M×K, B is N×K (transposed), C is M×N. All row-major, BF16.
+
+**IMPORTANT**: B is stored as [N,K]. The GEMM computes C = A * B^T.
+
+## Problem Sizes
+
+The benchmark runs multiple square problem sizes:
+- 1024x1024x1024
+- 2048x2048x2048
+- 4096x4096x4096
+- 8192x8192x8192
+- 16384x16384x16384
+
+Correctness and performance are checked at each size.
+
+## Build & Test
+
+```bash
+make test
+./test
+```
+
+Requires B200 GPU (SM100a). ThunderKittens headers are on the include path.

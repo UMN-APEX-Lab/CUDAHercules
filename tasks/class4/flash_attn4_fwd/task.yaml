@@ -1,0 +1,63 @@
+schema_version: 1
+task_id: class4/flash_attn4_fwd
+name: flash_attn4_fwd
+task_class: 4
+domain: attention
+tags:
+- flash-attention
+- blackwell
+- sm100
+- warp-specialization
+- tma
+- wgmma
+- tensor-memory
+- unsolved
+hardware:
+  min_sm: 100
+  tested_sms: []
+  required_features:
+  - tcgen05_mma
+  - tensor_memory
+  - tma
+  - 2cta_mma
+runner:
+  backend: class4_challenge
+  workdir: tasks/class4/flash_attn4_fwd
+  timeout_sec: 600
+  env: {}
+  solution_file: solution.cu
+build:
+  cmd: python run.py --build-only
+  clean_cmd: ''
+execute:
+  cmd: python run.py
+  success:
+    exit_code: 0
+    stdout_regex: Passed
+correctness:
+  mode: numerical
+  tolerances:
+    atol: 0.01
+    rtol: 0.01
+performance:
+  enabled: true
+  parser:
+    kernel_time_ms_regex: Kernel time:\s*([0-9.]+)\s*ms
+  metric: total_time
+  baseline: FA4 CuTe DSL (flash-attn package)
+source:
+  repo: flash-attention (Dao-AILab)
+  paper: FlashAttention4.pdf
+  files:
+  - reference/flash_fwd_sm100.py
+  - reference/softmax.py
+  - reference/blackwell_helpers.py
+  commit: ''
+  license: BSD-3-Clause
+anti_cheat:
+  blocked_patterns:
+  - from\s+cute\s+import
+  - CuTeDSL
+  required_patterns:
+  - __global__\s+void
+  - <<<.*>>>

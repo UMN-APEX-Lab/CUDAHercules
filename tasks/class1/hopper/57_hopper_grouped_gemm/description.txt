@@ -1,0 +1,260 @@
+# Task: 57_hopper_grouped_gemm
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+Hopper FP8 Grouped GEMM test harness
+Based on CUTLASS example 57_hopper_grouped_gemm
+FP8 E4M3 pointer-array grouped GEMM with variable problem sizes.
+A[i] row-major [Ms[i], Ks[i]] (ldas[i] = Ks[i]).
+B[i] column-major [Ks[i], Ns[i]] (ldbs[i] = Ks[i]).
+D[i] row-major [Ms[i], Ns[i]] (ldds[i] = Ns[i]).
+FP8 E4M3 inputs, half-precision output.
+The LLM must implement:
+  cudaError_t HopperGroupedGemm(
+      int problem_count,
+      int const *Ms, int const *Ns, int const *Ks,
+      float alpha,
+      __nv_fp8_e4m3 const **A_ptrs, int const *ldas,
+      __nv_fp8_e4m3 const **B_ptrs, int const *ldbs,
+      float beta,
+      __half **D_ptrs, int const *ldds);
+Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+
+---
+## Test Harness (harness.cu)
+
+Your solution will be compiled and linked with this test harness.
+Study it to understand the exact function signature, data types, and verification logic.
+
+```cuda
+/*
+ * Hopper FP8 Grouped GEMM test harness
+ * Based on CUTLASS example 57_hopper_grouped_gemm
+ *
+ * FP8 E4M3 pointer-array grouped GEMM with variable problem sizes.
+ * A[i] row-major [Ms[i], Ks[i]] (ldas[i] = Ks[i]).
+ * B[i] column-major [Ks[i], Ns[i]] (ldbs[i] = Ks[i]).
+ * D[i] row-major [Ms[i], Ns[i]] (ldds[i] = Ns[i]).
+ * FP8 E4M3 inputs, half-precision output.
+ *
+ * The LLM must implement:
+ *   cudaError_t HopperGroupedGemm(
+ *       int problem_count,
+ *       int const *Ms, int const *Ns, int const *Ks,
+ *       float alpha,
+ *       __nv_fp8_e4m3 const **A_ptrs, int const *ldas,
+ *       __nv_fp8_e4m3 const **B_ptrs, int const *ldbs,
+ *       float beta,
+ *       __half **D_ptrs, int const *ldds);
+ *
+ * Compile: nvcc -O3 harness.cu solution.cu -o test && ./test
+ */
+
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <cstdint>
+#include "../../include/kh_benchmark.h"
+
+#define CUDA_CHECK(status)                                              \
+  {                                                                     \
+    cudaError_t error = status;                                         \
+    if (error != cudaSuccess) {                                         \
+      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
+                << " at line: " << __LINE__ << std::endl;               \
+      exit(EXIT_FAILURE);                                               \
+    }                                                                   \
+  }
+
+extern cudaError_t HopperGroupedGemm(
+  int problem_count,
+  int const *Ms, int const *Ns, int const *Ks,
+  float alpha,
+  __nv_fp8_e4m3 const **A_ptrs, int const *ldas,
+  __nv_fp8_e4m3 const **B_ptrs, int const *ldbs,
+  float beta,
+  __half **D_ptrs, int const *ldds);
+
+/// CPU reference for a single GEMM: FP8 inputs, float accumulation, half output.
+/// A row-major: A[i,k] = A[i * lda + k]
+/// B col-major: B[k,j] = B[k + j * ldb]
+/// D row-major: D[i,j] = D[i * ldd + j]
+void reference_fp8_gemm(
+  int M, int N, int K, float alpha,
+  std::vector<float> const &A, int lda,
+  std::vector<float> const &B, int ldb,
+  float beta,
+  std::vector<float> &D, int ldd) {
+
+  for (int i = 0; i < M; ++i) {
+    for (int j = 0; j < N; ++j) {
+      float acc = 0.0f;
+      for (int k = 0; k < K; ++k) {
+        acc += A[i * lda + k] * B[k + j * ldb];
+      }
+      D[i * ldd + j] = alpha * acc + beta * D[i * ldd + j];
+    }
+  }
+}
+
+int main() {
+  int problem_count = 4;
+  // Variable-sized problems
+  std::vector<int> Ms = {128, 64, 256, 96};
+  std::vector<int> Ns = {64, 128, 64, 128};
+  std::vector<int> Ks = {64, 64, 128, 64};
+  float alpha = 1.0f, beta = 0.0f;
+
+  std::vector<int> ldas(problem_count), ldbs(problem_count), ldds(problem_count);
+  for (int p = 0; p < problem_count; ++p) {
+    ldas[p] = Ks[p];  // row-major A
+    ldbs[p] = Ks[p];  // col-major B
+    ldds[p] = Ns[p];  // row-major D
+  }
+
+  // Host data per problem in float (for reference) and FP8 (for device)
+  std::vector<std::vector<float>> fA(problem_count), fB(problem_count), fRef(problem_count);
+
+  // Device pointers per problem
+  std::vector<__nv_fp8_e4m3 *> d_A_vec(problem_count), d_B_vec(problem_count);
+  std::vector<__half *> d_D_vec(problem_count);
+
+  for (int p = 0; p < problem_count; ++p) {
+    int cA = Ms[p] * Ks[p];
+    int cB = Ks[p] * Ns[p];
+    int cD = Ms[p] * Ns[p];
+
+    fA[p].resize(cA);
+    fB[p].resize(cB);
+    fRef[p].resize(cD, 0.0f);
+
+    // Small values for FP8 range
+    for (int i = 0; i < cA; ++i)
+      fA[p][i] = float(((i + p * cA) * 16807 % 4) - 2);
+    for (int i = 0; i < cB; ++i)
+      fB[p][i] = float(((i + p * cB) * 48271 % 4) - 2);
+
+    // Convert to FP8 on host
+    std::vector<__nv_fp8_e4m3> hA(cA), hB(cB);
+    for (int i = 0; i < cA; ++i) hA[i] = __nv_fp8_e4m3(fA[p][i]);
+    for (int i = 0; i < cB; ++i) hB[i] = __nv_fp8_e4m3(fB[p][i]);
+
+    // Snap float reference to FP8 quantized values
+    for (int i = 0; i < cA; ++i) fA[p][i] = float(hA[i]);
+    for (int i = 0; i < cB; ++i) fB[p][i] = float(hB[i]);
+
+    CUDA_CHECK(cudaMalloc(&d_A_vec[p], cA * sizeof(__nv_fp8_e4m3)));
+    CUDA_CHECK(cudaMalloc(&d_B_vec[p], cB * sizeof(__nv_fp8_e4m3)));
+    CUDA_CHECK(cudaMalloc(&d_D_vec[p], cD * sizeof(__half)));
+
+    CUDA_CHECK(cudaMemcpy(d_A_vec[p], hA.data(), cA * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B_vec[p], hB.data(), cB * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_D_vec[p], 0, cD * sizeof(__half)));
+  }
+
+  // Build device pointer arrays and dimension arrays
+  __nv_fp8_e4m3 const **d_A_ptrs;
+  __nv_fp8_e4m3 const **d_B_ptrs;
+  __half **d_D_ptrs;
+  int *d_Ms, *d_Ns, *d_Ks, *d_ldas, *d_ldbs, *d_ldds;
+
+  CUDA_CHECK(cudaMalloc(&d_A_ptrs, problem_count * sizeof(__nv_fp8_e4m3 const *)));
+  CUDA_CHECK(cudaMalloc(&d_B_ptrs, problem_count * sizeof(__nv_fp8_e4m3 const *)));
+  CUDA_CHECK(cudaMalloc(&d_D_ptrs, problem_count * sizeof(__half *)));
+  CUDA_CHECK(cudaMalloc(&d_Ms, problem_count * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_Ns, problem_count * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_Ks, problem_count * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_ldas, problem_count * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_ldbs, problem_count * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_ldds, problem_count * sizeof(int)));
+
+  // Copy pointer arrays to device
+  std::vector<__nv_fp8_e4m3 const *> h_A_ptrs(problem_count);
+  std::vector<__nv_fp8_e4m3 const *> h_B_ptrs(problem_count);
+  std::vector<__half *> h_D_ptrs(problem_count);
+  for (int p = 0; p < problem_count; ++p) {
+    h_A_ptrs[p] = d_A_vec[p];
+    h_B_ptrs[p] = d_B_vec[p];
+    h_D_ptrs[p] = d_D_vec[p];
+  }
+
+  CUDA_CHECK(cudaMemcpy(d_A_ptrs, h_A_ptrs.data(), problem_count * sizeof(__nv_fp8_e4m3 const *), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_B_ptrs, h_B_ptrs.data(), problem_count * sizeof(__nv_fp8_e4m3 const *), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_D_ptrs, h_D_ptrs.data(), problem_count * sizeof(__half *), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_Ms, Ms.data(), problem_count * sizeof(int), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_Ns, Ns.data(), problem_count * sizeof(int), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_Ks, Ks.data(), problem_count * sizeof(int), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_ldas, ldas.data(), problem_count * sizeof(int), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_ldbs, ldbs.data(), problem_count * sizeof(int), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_ldds, ldds.data(), problem_count * sizeof(int), cudaMemcpyHostToDevice));
+
+  cudaError_t result = HopperGroupedGemm(
+    problem_count, d_Ms, d_Ns, d_Ks, alpha,
+    d_A_ptrs, d_ldas, d_B_ptrs, d_ldbs, beta, d_D_ptrs, d_ldds);
+  if (result != cudaSuccess) {
+    std::cerr << "HopperGroupedGemm failed: " << cudaGetErrorString(result) << std::endl;
+    // Cleanup
+    for (int p = 0; p < problem_count; ++p) {
+      cudaFree(d_A_vec[p]); cudaFree(d_B_vec[p]); cudaFree(d_D_vec[p]);
+    }
+    cudaFree(d_A_ptrs); cudaFree(d_B_ptrs); cudaFree(d_D_ptrs);
+    cudaFree(d_Ms); cudaFree(d_Ns); cudaFree(d_Ks);
+    cudaFree(d_ldas); cudaFree(d_ldbs); cudaFree(d_ldds);
+    return -1;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  // Benchmark (triggered by KH_BENCHMARK=N env var)
+  {
+    int _kh_trials = kh_benchmark_trials();
+    if (_kh_trials > 0 && result == cudaSuccess) {
+      kh_benchmark([&]() { HopperGroupedGemm(
+    problem_count, d_Ms, d_Ns, d_Ks, alpha,
+    d_A_ptrs, d_ldas, d_B_ptrs, d_ldbs, beta, d_D_ptrs, d_ldds); }, _kh_trials);
+    }
+  }
+
+
+  // Compare per problem
+  float global_max_diff = 0.0f;
+  for (int p = 0; p < problem_count; ++p) {
+    int cD = Ms[p] * Ns[p];
+    std::vector<__half> hD(cD);
+    CUDA_CHECK(cudaMemcpy(hD.data(), d_D_vec[p], cD * sizeof(__half), cudaMemcpyDeviceToHost));
+
+    std::vector<float> fD_out(cD);
+    for (int i = 0; i < cD; ++i) fD_out[i] = __half2float(hD[i]);
+
+    // CPU reference
+    reference_fp8_gemm(Ms[p], Ns[p], Ks[p], alpha,
+                       fA[p], ldas[p], fB[p], ldbs[p], beta, fRef[p], ldds[p]);
+
+    for (int i = 0; i < cD; ++i) {
+      float diff = std::fabs(fD_out[i] - fRef[p][i]);
+      global_max_diff = std::fmax(global_max_diff, diff);
+    }
+  }
+
+  // Cleanup
+  for (int p = 0; p < problem_count; ++p) {
+    cudaFree(d_A_vec[p]); cudaFree(d_B_vec[p]); cudaFree(d_D_vec[p]);
+  }
+  cudaFree(d_A_ptrs); cudaFree(d_B_ptrs); cudaFree(d_D_ptrs);
+  cudaFree(d_Ms); cudaFree(d_Ns); cudaFree(d_Ks);
+  cudaFree(d_ldas); cudaFree(d_ldbs); cudaFree(d_ldds);
+
+  // FP8 E4M3 has limited precision — generous tolerance
+  float tolerance = 2.0f;
+  if (global_max_diff > tolerance) {
+    std::cerr << "Results incorrect. Max diff: " << global_max_diff << std::endl;
+    return -1;
+  }
+
+  std::cout << "Passed." << std::endl;
+  return 0;
+}
+```

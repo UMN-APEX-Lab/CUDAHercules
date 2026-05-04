@@ -1,0 +1,57 @@
+# Task: 14_ampere_tf32_tensorop_gemm
+
+General Matrix Multiply (GEMM) with mixed memory layouts: row-major A, column-major B, row-major C.
+
+## Function Signature
+
+Implement the following function in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+
+cudaError_t Tf32Gemm(
+    int M, int N, int K,
+    float alpha,
+    float const *A, int lda,
+    float const *B, int ldb,
+    float beta,
+    float *C, int ldc);
+```
+
+## Operation
+
+C = alpha * A * B + beta * C
+
+Where:
+- A is M x K
+- B is K x N
+- C is M x N
+
+## Data Types
+
+All matrices are `float` (FP32).
+
+## Memory Layout
+
+Mixed layouts:
+- A: **row-major**. Element (i,k) at `A[i * lda + k]`.  lda >= K.
+- B: **column-major**. Element (k,j) at `B[k + j * ldb]`.  ldb >= K.
+- C: **row-major**. Element (i,j) at `C[i * ldc + j]`.  ldc >= N.
+
+## Build & Test
+
+```bash
+make test                    # requires solution.h in task directory
+./test                       # default: runs small/medium/large sizes
+./test 1024 1024 1024        # custom single size: M N K
+./test 1024 1024 1024 1.0 0.0 20  # M N K alpha beta iterations
+```
+
+Correctness is verified against a reference implementation at multiple problem sizes
+(small: 1024x1024x1024, medium: 4096x4096x4096, large: 8192x8192x8192).
+Results are compared with a relaxed tolerance (1% relative error) since the reference
+uses TF32 tensor core operations internally.
+Performance is timed for both reference and your solution at each size.
+
+CUTLASS headers are available on the include path.

@@ -1,0 +1,37 @@
+# Task: tk_fp8_gemm
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+FP8 (E4M3) General Matrix Multiply on H100, matching ThunderKittens performance.
+
+## Function Signature
+
+Implement in solution.h:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_fp8.h>
+
+void Fp8Gemm(__nv_fp8_e4m3 *A, __nv_fp8_e4m3 *B, __nv_fp8_e4m3 *C, int M, int N, int K);
+```
+
+## Operation
+
+C = A * B^T
+
+Where A is M×K (row-major), B is N×K (to be transposed, i.e. column-major), C is M×N (row-major). All FP8 E4M3.
+
+**IMPORTANT**: B is stored in column-major layout [N,K]. The GEMM computes C = A * B^T.
+
+## Build & Test
+
+```bash
+# Generate test data (no external data needed - self-contained)
+make test
+./test
+```
+
+Requires H100 GPU (SM90a). ThunderKittens headers on include path.

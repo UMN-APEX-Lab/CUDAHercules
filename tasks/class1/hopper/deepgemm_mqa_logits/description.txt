@@ -1,0 +1,43 @@
+FP8 Multi-Query Attention Scoring (from DeepGEMM / DeepSeek)
+
+## Target Hardware
+NVIDIA Hopper GPU (SM90).
+
+
+Custom attention scoring kernel for MQA layers. Computes:
+  logits[q, kv] = sum_h( relu(Q[q,h,:] @ K[kv,:]^T) * weights[q,h] ) * kv_scales[kv]
+
+This is NOT standard softmax attention — it uses ReLU activation and
+per-head weight reduction to produce a scalar logit per (query, key) pair.
+
+Inputs:
+  q:        FP8 E4M3 tensor, shape (seq_len, num_heads, head_dim)
+  kv:       FP8 E4M3 tensor, shape (seq_len_kv, head_dim)
+  kv_scales: float32, shape (seq_len_kv) — per-token KV scale factors
+  weights:  float32, shape (seq_len, num_heads) — per-head attention weights
+  cu_seq_len_k_start: int32, shape (seq_len) — start of KV range per query
+  cu_seq_len_k_end:   int32, shape (seq_len) — end of KV range per query
+  num_heads: 64 (fixed)
+  head_dim:  128 (fixed)
+
+Outputs:
+  logits:   float32, shape (seq_len, seq_len_kv)
+            Positions outside [ks[q], ke[q]) are -inf.
+
+Test sizes:
+  (seq_len=1024, seq_len_kv=4096)
+  (seq_len=2048, seq_len_kv=4096)
+  (seq_len=2048, seq_len_kv=8192)
+
+Function signature for your solution (in solution.h):
+  void solution_mqa_logits(
+      const __nv_fp8_e4m3* q,        // [seq_len, num_heads, head_dim]
+      const __nv_fp8_e4m3* kv,       // [seq_len_kv, head_dim]
+      const float* kv_scales,         // [seq_len_kv]
+      const float* weights,           // [seq_len, num_heads]
+      const int* cu_seq_len_k_start,  // [seq_len]
+      const int* cu_seq_len_k_end,    // [seq_len]
+      float* logits,                  // [seq_len, seq_len_kv]
+      int seq_len, int seq_len_kv,
+      int num_heads, int head_dim,
+      cudaStream_t stream);

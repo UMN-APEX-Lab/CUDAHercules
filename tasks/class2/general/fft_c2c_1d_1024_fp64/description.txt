@@ -1,0 +1,35 @@
+# Task: fft_c2c_1d_1024_fp64
+
+## Description
+
+Implement a CUDA kernel for 1D Complex-to-Complex FFT (forward transform).
+
+Parameters:
+  input:  [256 * 1024 * 2] float64 -- complex input (interleaved real/imag)
+  output: [256 * 1024 * 2] float64 -- complex output (interleaved real/imag)
+  N:          1024 -- total elements per batch (product of dimensions)
+  batch_size: 256
+  inverse:    0 for forward FFT
+
+Dimensions: 1024
+Data type: float64
+
+The forward DFT is defined as:
+  X[k] = sum_{n=0}^{N-1} x[n] * exp(-2*pi*i*k*n/N)
+
+Each batch element is an independent 1D FFT.
+
+
+## Function Signature
+
+```c
+void launch_fft_c2c_1d_1024_fp64(
+    const void* input,
+    void* output,
+    int N,
+    int batch_size,
+    int inverse,
+    cudaStream_t stream
+);
+
+```
