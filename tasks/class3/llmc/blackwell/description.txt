@@ -1,6 +1,6 @@
 # Task: llmc (Blackwell Black-Box Project Generation)
 
-Generate a complete self-contained CUDA project for GPT-2 124M training on the
+Generate a complete self-contained CUDA project for GPT-2 774M training on the
 same TinyShakespeare benchmark setup as the reference, targeting Blackwell-era
 GPUs.
 
