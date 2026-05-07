@@ -2,18 +2,18 @@
 
 CUDA-Hercules is an expert-referenced benchmark for evaluating whether LLM-based systems can write high-performance, hardware-aware CUDA code.
 
-This release is the paper task set: 205 tasks across four classes, with task metadata, runners, reference dependencies, validation scripts, and application fixtures included in the repository tree.
+This release is the paper task set: 195 tasks across four classes, with task metadata, runners, reference dependencies, validation scripts, and application input preparation scripts included in the repository tree.
 
 ## Task Set
 
 | Class | Scope | Tasks | Release slice |
 |---|---:|---:|---|
-| Class 1 | Single CUDA kernel | 73 | 20 general, 23 Hopper, 30 Blackwell |
+| Class 1 | Single CUDA kernel | 63 | 20 general, 21 Hopper, 22 Blackwell |
 | Class 2 | Module or kernel family | 119 | 43 general, 64 Hopper, 12 Blackwell |
 | Class 3 | Full application workload | 10 | Blackwell app variants, plus `tcgnn_gcn/general` |
 | Class 4 | Frontier challenge | 3 | FA4 forward, FA4 backward, Groth16 prover |
 
-The machine-readable task list is [tasks/release_task_set.txt](tasks/release_task_set.txt). The runner should discover exactly 205 tasks.
+The machine-readable task list is [tasks/release_task_set.txt](tasks/release_task_set.txt). The runner should discover exactly 195 tasks.
 
 ```bash
 python -c "import sys; sys.path.insert(0, 'src'); from cuda_hercules.runner import discover_tasks; print(len(discover_tasks('.')))"

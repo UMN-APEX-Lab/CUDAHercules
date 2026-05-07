@@ -1,20 +1,20 @@
 # Released Task Set
 
-This directory is curated to match the 205-task paper release.
+This directory is curated to match the 195-task paper release.
 
 ## Counts
 
 | Slice | Count |
 |---|---:|
 | Class 1 general | 20 |
-| Class 1 Hopper | 23 |
-| Class 1 Blackwell | 30 |
+| Class 1 Hopper | 21 |
+| Class 1 Blackwell | 22 |
 | Class 2 general | 43 |
 | Class 2 Hopper | 64 |
 | Class 2 Blackwell | 12 |
 | Class 3 applications | 10 |
 | Class 4 challenges | 3 |
-| Total | 205 |
+| Total | 195 |
 
 ## Selection Rules
 

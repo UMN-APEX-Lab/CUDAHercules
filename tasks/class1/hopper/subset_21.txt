@@ -1,13 +1,12 @@
-# Class 1 Hopper pinned subset (23 tasks)
-# CUTLASS SM90 + TK SM90a + DeepGEMM SM90
-# Usage: --task-list tasks/class1/hopper/subset_23.txt
+# Class 1 Hopper pinned subset (21 tasks)
+# CUTLASS SM90 + TK SM90a + DeepGEMM SM90 tasks used in the paper evaluation.
+# Usage: --task-list tasks/class1/hopper/subset_21.txt
 
 class1/hopper/48_hopper_warp_specialized_gemm
 class1/hopper/49_hopper_gemm_with_collective_builder
 class1/hopper/50_hopper_gemm_with_epilogue_swizzle
 class1/hopper/51_hopper_gett
 class1/hopper/52_hopper_gather_scatter_fusion
-class1/hopper/53_hopper_gemm_permute
 class1/hopper/54_hopper_fp8_warp_specialized_gemm
 class1/hopper/55_hopper_mixed_dtype_gemm
 class1/hopper/56_hopper_ptr_array_batched_gemm
@@ -19,7 +18,6 @@ class1/hopper/67_hopper_fp8_warp_specialized_gemm_with_blockwise_scaling
 class1/hopper/68_hopper_fp8_warp_specialized_grouped_gemm_with_blockwise_scaling
 class1/hopper/69_hopper_mixed_dtype_grouped_gemm
 class1/hopper/88_hopper_fmha
-class1/hopper/deepgemm_hc_prenorm_gemm
 class1/hopper/deepgemm_mqa_logits
 class1/hopper/tk_bf16_gemm
 class1/hopper/tk_fp8_gemm
