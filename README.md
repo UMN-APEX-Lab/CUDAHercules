@@ -4,6 +4,24 @@ CUDA-Hercules is an expert-referenced benchmark for evaluating whether LLM-based
 
 This release is the paper task set: 195 tasks across four classes, with task metadata, runners, reference dependencies, validation scripts, and application input preparation scripts included in the repository tree.
 
+## Paper
+
+CUDA-Hercules is described in [CUDAHercules: Benchmarking Hardware-Aware Expert-level CUDA Optimization for LLMs](https://arxiv.org/abs/2605.08467v1).
+If you use this benchmark, please cite:
+
+```bibtex
+@misc{li2026cudahercules,
+  title={CUDAHercules: Benchmarking Hardware-Aware Expert-level CUDA Optimization for LLMs},
+  author={Shiyang Li and Zijian Zhang and Guangyan Sun and Yuebo Luo and Winson Chen and Yanzhi Wang and Mingyi Hong and Caiwen Ding},
+  year={2026},
+  eprint={2605.08467},
+  archivePrefix={arXiv},
+  primaryClass={cs.LG},
+  note={arXiv:2605.08467v1},
+  url={https://arxiv.org/abs/2605.08467v1}
+}
+```
+
 ## Task Set
 
 | Class | Scope | Tasks | Release slice |
