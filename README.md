@@ -1,8 +1,22 @@
 # CUDA-Hercules
 
+<p align="center">
+  <img src="fig/cudahercules_icon.png" alt="CUDA-Hercules icon" width="180">
+</p>
+
 CUDA-Hercules is an expert-referenced benchmark for evaluating whether LLM-based systems can write high-performance, hardware-aware CUDA code.
 
 This release is the paper task set: 195 tasks across four classes, with task metadata, runners, reference dependencies, validation scripts, and application input preparation scripts included in the repository tree.
+
+## Benchmark Overview
+
+<p align="center">
+  <img src="fig/gap.png" alt="What CUDA-Hercules reveals beyond existing benchmarks" width="900">
+</p>
+
+<p align="center">
+  <img src="fig/test_flow.png" alt="CUDA-Hercules task generation and multi-stage evaluation flow" width="820">
+</p>
 
 ## Paper
 
