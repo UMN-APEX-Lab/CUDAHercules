@@ -104,6 +104,10 @@ def _looks_like_arch_error(error_text: str) -> bool:
     )
 
 
+def _should_measure_perf(config: TaskConfig) -> bool:
+    return bool(getattr(config, "_measure_perf", True)) and config.performance.enabled
+
+
 class Class1MakeBackend(Backend):
     def __init__(self):
         self._workdir = ""      # original task dir (read-only)
@@ -191,6 +195,10 @@ class Class1MakeBackend(Backend):
     def run_correctness(self, config: TaskConfig) -> tuple[bool, dict, str]:
         env = os.environ.copy()
         env.update(config.runner.env)
+        measure_perf = _should_measure_perf(config)
+        env["CUDA_HERCULES_MEASURE_PERF"] = "1" if measure_perf else "0"
+        if not measure_perf:
+            env["KH_BENCHMARK"] = "0"
 
         # Kernel execution timeout: 10 min (overrides yaml timeout_sec, which also
         # controls compile step). Only the execute step gets the bump.
@@ -226,7 +234,7 @@ class Class1MakeBackend(Backend):
         return correct, {}, error
 
     def run_performance(self, config: TaskConfig) -> PerfMetrics:
-        if not self._correct or not config.performance.enabled:
+        if not self._correct or not _should_measure_perf(config):
             return PerfMetrics()
 
         metrics = PerfMetrics()

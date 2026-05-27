@@ -71,10 +71,11 @@ class Class2DefpyBackend(Backend):
             cached_ref_time = benchmarks[config.task_id].get("ref_mean_ms", 0.0)
 
         tol = config.correctness.tolerances
+        measure_perf = bool(getattr(config, "_measure_perf", True))
         self._eval_result = eval_kernel(
             task_dir=self._workdir,
             solution_cu=solution_path,
-            measure_performance=config.performance.enabled,
+            measure_performance=measure_perf and config.performance.enabled,
             atol=tol.get("atol", 1e-2),
             rtol=tol.get("rtol", 1e-2),
             cached_ref_time_ms=cached_ref_time,

@@ -129,6 +129,7 @@ def run_task(
 
     # Attach solution_path to config for backends that need it
     config._solution_path = solution_path
+    config._measure_perf = measure_perf
 
     try:
         # Prepare
