@@ -8,7 +8,7 @@ verification, per-task geomean over sizes). No LLM calls. One JSON per task is w
 to --out, raw run directories are never modified.
 
   python scripts/retime_best_solutions.py --gpus 4,6 --out results/retime_realistic_sizes \\
-      --tasks class1/general/05_batched_gemm class2/general/fft_c2c_1d_4096_fp32
+      --tasks class1/general/05_batched_gemm class2/general/fft_c2c_1d_1024_fp32
   python scripts/retime_best_solutions.py --gpus 4 --task-list tasks.txt --out ... --dry-run
 """
 

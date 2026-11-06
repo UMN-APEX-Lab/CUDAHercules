@@ -6,12 +6,15 @@ and returns normalized TaskResult.
 
 import math
 import os
+import re
 
 import torch
 
 from .backend_base import resolve_backend
 from .result import TaskResult, TaskStatus
+from .static_checker import validate_cuda_solution
 from .task_schema import TaskConfig, load_task_config
+from .utils import get_project_root
 
 UNSUPPORTED_ARCH_PREFIX = "UNSUPPORTED_ARCH:"
 
@@ -102,6 +105,35 @@ def _is_unsupported_arch_error(error_msg: str) -> bool:
     return bool(error_msg) and error_msg.startswith(UNSUPPORTED_ARCH_PREFIX)
 
 
+# Backends whose tasks get the exact-arch gate and the static anti-cheat check.
+_GATED_BACKENDS = ("class1_make", "class2_defpy")
+
+# Build flags that target an architecture-specific ISA (sm_90a, sm_100a,
+# sm_103a, sm_120a, ...). Such code only runs on that exact SM.
+_ARCH_SPECIFIC_RE = re.compile(r"\b(?:sm|compute)_(\d{2,3})a\b")
+
+
+def arch_specific_sms(config: TaskConfig) -> set[int]:
+    """SMs an arch-specific task can run on; empty if the task has no
+    arch-specific target (e.g. `general` tasks built as compute_80 PTX).
+
+    Reads the reference build flags: the task's Makefile (Makefile-driven
+    tasks) and def.py (Class 2), ignoring comment lines.
+    """
+    task_dir = (os.path.join(get_project_root(), config.runner.workdir)
+                if config.runner.workdir else getattr(config, "_yaml_dir", ""))
+    sms: set[int] = set()
+    for name in ("Makefile", "def.py"):
+        path = os.path.join(task_dir, name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, errors="replace") as f:
+            for line in f:
+                if not line.lstrip().startswith("#"):
+                    sms.update(int(m) for m in _ARCH_SPECIFIC_RE.findall(line))
+    return sms
+
+
 def run_task(
     config: TaskConfig,
     solution_path: str,
@@ -124,6 +156,33 @@ def run_task(
         if verbose:
             print(f"[{config.task_id}] SKIP_ARCH: {result.error_msg}")
         return result
+    # Arch-specific targets (sm_90a, sm_100a, ...) don't run on newer GPUs
+    # either; skip instead of recording the inevitable failure as a FAIL.
+    if gpu_sm > 0 and config.runner.backend in _GATED_BACKENDS:
+        exact_sms = arch_specific_sms(config)
+        if exact_sms and gpu_sm not in exact_sms:
+            result.status = TaskStatus.SKIP_ARCH
+            result.error_msg = (f"GPU SM {gpu_sm} cannot run arch-specific target "
+                                + ", ".join(f"sm_{sm}a" for sm in sorted(exact_sms)))
+            if verbose:
+                print(f"[{config.task_id}] SKIP_ARCH: {result.error_msg}")
+            return result
+
+    # Static anti-cheat check, so every entry point (including
+    # `cuda-hercules run` / `run-all`) enforces the task's rules.
+    if config.runner.backend in _GATED_BACKENDS and os.path.isfile(solution_path):
+        with open(solution_path, errors="replace") as f:
+            check = validate_cuda_solution(
+                f.read(),
+                blocked_patterns=config.anti_cheat.blocked_patterns or [],
+                required_patterns=config.anti_cheat.required_patterns or [],
+            )
+        if not check.valid:
+            result.status = TaskStatus.FAIL
+            result.error_msg = "Static check failed: " + "; ".join(check.errors)
+            if verbose:
+                print(f"[{config.task_id}] {result.error_msg[:200]}")
+            return result
 
     backend = resolve_backend(config.runner.backend)
 
