@@ -40,22 +40,60 @@ GLOBAL_BLOCKED = [
     (r"\bc10::", "Uses c10 C++ API"),
     # Try-except bypass (model catches errors, falls back to reference)
     (r"\btry\s*\{", "Uses try-catch block (potential bypass)"),
-    # CUTLASS / cuBLAS / cuDNN — solutions must be hand-written CUDA, not
-    # a thin wrapper around a library. The reference already uses these
-    # (that's what the solution has to BEAT); using them in the solution
-    # means no kernel authoring is happening. A trivial `__global__` stub
-    # declared to satisfy GLOBAL_REQUIRED is not a defence — this check
-    # runs independently of the required-patterns check.
-    (r"#include\s*[<\"]cutlass[/>\"]", "Includes CUTLASS headers"),
-    (r"\bcutlass::(gemm|conv|epilogue|reduction|layout|arch|numeric_types)\b",
-     "Uses CUTLASS template library"),
+    # Prebuilt library kernels — solutions must author their own kernels,
+    # not wrap a library kernel that already implements the operation. The
+    # reference already uses these (that's what the solution has to BEAT).
+    # A trivial `__global__` stub declared to satisfy GLOBAL_REQUIRED is not
+    # a defence — this check runs independently of the required-patterns
+    # check.
+    #
+    # For CUTLASS only the kernel-providing layers are blocked:
+    # device/kernel/collective/threadblock-level GEMM/conv/epilogue/
+    # reduction/transform templates, the reference kernels, the CUTLASS
+    # library, and the util/ headers that ship complete kernels (layernorm,
+    # rmsnorm, ...) or wrap cuBLAS. CuTe (`cute::`, `#include <cute/...>`)
+    # and CUTLASS's low-level building blocks (numeric types, cutlass::arch
+    # barriers / register control, pipelines, layouts, warp-level MMA) stay
+    # allowed — they are a way to write kernels, not kernels.
+    (r"#include\s*[<\"]cutlass/(gemm|conv)/(device|kernel|collective|threadblock)/",
+     "Includes a prebuilt CUTLASS GEMM/conv kernel"),
+    (r"\bcutlass::(gemm|conv)::(device|kernel|collective|threadblock)\b",
+     "Uses a prebuilt CUTLASS GEMM/conv kernel"),
+    (r"#include\s*[<\"]cutlass/epilogue/(collective|threadblock)/",
+     "Includes a prebuilt CUTLASS epilogue"),
+    (r"\bcutlass::epilogue::(collective|threadblock)\b",
+     "Uses a prebuilt CUTLASS epilogue"),
+    (r"#include\s*[<\"]cutlass/(reduction|transform)/(device|kernel|collective)/",
+     "Includes a prebuilt CUTLASS reduction/transform kernel"),
+    (r"\bcutlass::(reduction|transform)::(device|kernel|collective)\b",
+     "Uses a prebuilt CUTLASS reduction/transform kernel"),
+    (r"#include\s*[<\"]cutlass/util/(reference/|cublas_wrappers|device_(layernorm|rmsnorm|groupnorm"
+     r"|nchw_to_nhwc|nhwc_to_nchw|nhwc_padding|nhwc_pooling))",
+     "Includes a prebuilt CUTLASS util kernel"),
+    (r"\bcutlass::(reference|library)::", "Uses CUTLASS reference/library kernels"),
+    (r"#include\s*[<\"]cutlass/library/", "Includes the CUTLASS kernel library"),
     (r"#include\s*[<\"]cublas", "Includes cuBLAS headers"),
-    (r"\bcublas[A-Z][a-zA-Z_]*\(", "Calls cuBLAS API"),
+    (r"\bcublas[A-Z][a-zA-Z0-9_]*\(", "Calls cuBLAS API"),
     (r"#include\s*[<\"]cudnn", "Includes cuDNN headers"),
-    (r"\bcudnn[A-Z][a-zA-Z_]*\(", "Calls cuDNN API"),
+    (r"\bcudnn[A-Z][a-zA-Z0-9_]*\(", "Calls cuDNN API"),
     (r"#include\s*[<\"]cufft", "Includes cuFFT headers"),
-    (r"\bcufft[A-Z][a-zA-Z_]*\(", "Calls cuFFT API"),
+    (r"\bcufft[A-Z][a-zA-Z0-9_]*\(", "Calls cuFFT API"),
 ]
+
+# Prompt-facing statement of the library rules in GLOBAL_BLOCKED.
+# prompt_builder and eval_agent embed this text verbatim so prompts cannot
+# drift from what the checker actually enforces.
+LIBRARY_RULES_PROMPT = (
+    "- Do not call prebuilt library kernels: cuBLAS, cuDNN, cuFFT, or "
+    "CUTLASS's device/kernel/collective/threadblock-level templates (e.g. "
+    "`cutlass::gemm::device::Gemm`, `GemmUniversalAdapter`, "
+    "`CollectiveBuilder`, `cutlass/util/device_layernorm.h`, "
+    "`cutlass::reference::*`)\n"
+    "- CuTe (`#include <cute/...>`, `cute::`) and CUTLASS's low-level "
+    "building blocks (numeric types, `cutlass::arch` barriers and register "
+    "control, pipelines, layouts, warp-level MMA) ARE allowed for writing "
+    "your own kernels"
+)
 
 # Patterns that a valid CUDA kernel must have.
 # Note the attribute-aware spacing: models commonly emit

@@ -26,8 +26,8 @@ void launch_fa3_bwd(
     void* dK,               // [B, H, Sk, D] bf16
     void* dV,               // [B, H, Sk, D] bf16
     const float* lse,       // [B, H, Sq]
-    float* dsoftmax_sum,    // [B, H, Sq]
-    float* dq_accum,        // [B, H, Sq, D] fp32 accumulator
+    float* dsoftmax_sum,    // [B, H, Sq] fp32 scratch workspace (not checked)
+    float* dq_accum,        // [B, H, Sq, D] fp32 scratch workspace (not checked)
     int B,
     int H,
     int Sq,
@@ -48,6 +48,11 @@ SCALAR_ARGS = {
 }
 
 TOLERANCES = {"atol": 5e-2, "rtol": 5e-2}
+
+# dsoftmax_sum / dq_accum are workspaces the FA3 reference needs; it
+# stores them in its own internal tile layout (dq_accum unscaled), so
+# only the gradients are compared.
+CHECKED_OUTPUTS = ["dQ", "dK", "dV"]
 
 HAS_CUDA_REFERENCE = True
 REFERENCE_EXTRA_INCLUDES = [
@@ -86,7 +91,7 @@ def get_outputs(inputs):
     dK = torch.empty(B, H, Sk, D, device='cuda', dtype=K.dtype)
     dV = torch.empty(B, H, Sk, D, device='cuda', dtype=K.dtype)
     dsoftmax_sum = torch.empty(B, H, Sq, device='cuda', dtype=torch.float32)
-    dq_accum = torch.zeros(B, H, Sq, D, device='cuda', dtype=torch.float32)
+    dq_accum = torch.empty(B, H, Sq, D, device='cuda', dtype=torch.float32)
     return [("dQ", dQ), ("dK", dK), ("dV", dV), ("dsoftmax_sum", dsoftmax_sum), ("dq_accum", dq_accum)]
 
 
@@ -114,11 +119,7 @@ def reference_fn(inputs):
     dK = K.grad.to(torch.bfloat16)
     dV = V.grad.to(torch.bfloat16)
 
-    # dsoftmax_sum = rowwise dot(dO, O)
-    dsoftmax_sum = (dO * O).sum(dim=-1).float()
-    dq_accum = torch.zeros_like(Q)
-
-    return [("dQ", dQ), ("dK", dK), ("dV", dV), ("dsoftmax_sum", dsoftmax_sum), ("dq_accum", dq_accum)]
+    return [("dQ", dQ), ("dK", dK), ("dV", dV)]
 
 
 DESCRIPTION = """\
@@ -129,4 +130,8 @@ Given forward outputs (O, lse) and upstream gradient dO, compute:
 
 scale = 1/sqrt(D) = 0.125000
 Causal masking enabled.
+
+Only dQ, dK, dV are checked. dsoftmax_sum ([B, H, Sq] fp32) and dq_accum
+([B, H, Sq, D] fp32) are scratch workspaces you may use however you like
+(or ignore); their contents on entry are unspecified and are not checked.
 """

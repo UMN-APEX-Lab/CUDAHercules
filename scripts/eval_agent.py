@@ -42,9 +42,9 @@ from cuda_hercules.backend_class1 import (
     _is_class1_general_task,
 )
 from cuda_hercules.eval import (
-    _current_arch_gencode_flags,
     _get_device_sm,
     _is_class2_general_task,
+    get_solution_cuda_flags,
     get_solution_include_dirs,
     load_task_def,
 )
@@ -54,7 +54,7 @@ from cuda_hercules.prompt_builder import build_prompt
 from cuda_hercules.result import TaskResult, TaskStatus
 from cuda_hercules.runner import discover_tasks, get_gpu_sm, parse_filters, run_task
 from cuda_hercules.score import compute_scores, format_score
-from cuda_hercules.static_checker import validate_cuda_solution
+from cuda_hercules.static_checker import LIBRARY_RULES_PROMPT, validate_cuda_solution
 from cuda_hercules.task_schema import TaskConfig
 from cuda_hercules.utils import extract_cuda_code, get_project_root
 
@@ -563,11 +563,10 @@ def _profile_compile_class2(config: TaskConfig, state: dict) -> tuple[bool, str]
     except Exception as e:
         return False, f"task def load failed: {e}"
 
-    cuda_flags: list[str] = []
-    if _is_class2_general_task(task_dir_abs):
-        target_sm = _get_device_sm()
-        if target_sm > 0:
-            cuda_flags = _current_arch_gencode_flags(target_sm)
+    # Same arch flags as eval_kernel: live GPU for general tasks, the
+    # reference's "a" target (sm_90a / sm_120a / ...) for arch-specific ones.
+    target_sm = _get_device_sm() if _is_class2_general_task(task_dir_abs) else 0
+    cuda_flags = get_solution_cuda_flags(task_def, target_sm)
 
     include_dirs = get_solution_include_dirs(get_project_root())
 
@@ -1183,40 +1182,31 @@ def eval_task_tool_aug(
         if config.runner.backend == "class1_make":
             task_prompt += (
                 "\n\n## Important: Library Restrictions\n\n"
-                "You MUST implement the kernel from scratch in hand-written "
-                "CUDA. The following are **NOT ALLOWED** and will fail the "
-                "static check:\n"
-                "- `#include <cutlass/...>` or any CUTLASS template\n"
-                "- `#include <cublas*>` / `cublasSgemm` / `cublasGemmEx` and "
-                "any other cuBLAS wrapper\n"
-                "- `#include <cudnn*>` / cuDNN API calls\n\n"
-                "You MAY use:\n"
+                "You MUST write the kernel yourself. These rules are "
+                "enforced by the static check:\n"
+                + LIBRARY_RULES_PROMPT + "\n\n"
+                "You MAY also use:\n"
                 "- Raw CUDA kernels (`__global__`) with shared memory, warp "
                 "shuffles, async copies, etc.\n"
                 "- Tensor-core intrinsics via `mma.h` (wmma / mma.sync) and "
                 "`wgmma` on Hopper+\n"
                 "- Inline PTX (`asm volatile (\"...\")`) for anything the "
                 "intrinsics don't expose.\n\n"
-                "Copying the reference CUTLASS/cuBLAS implementation defeats "
+                "Wrapping the reference CUTLASS/cuBLAS kernel defeats "
                 "the benchmark's purpose — the reference is what you are "
                 "being compared against."
             )
         elif config.runner.backend == "class2_defpy":
             task_prompt += (
                 "\n\n## Important: Library Restrictions\n\n"
-                "You MUST implement the kernel from scratch. The following "
-                "domain-specific reference libraries are **BLOCKED** by the "
-                "static check:\n"
-                "- Flash Attention: `#include <flash_attn*>`, `flash_fwd*`, "
-                "`flash_bwd*` headers\n"
-                "- FFT: `#include <cufft*>`, `cufftPlan*`, `cufftExec*`\n"
-                "- cuDNN: `#include <cudnn*>` and its wrapper calls\n\n"
-                "You MAY use:\n"
-                "- `#include <cutlass/...>` — CUTLASS templates ARE permitted "
-                "here (the headers are on the include path). This is "
-                "different from class1.\n"
-                "- Raw CUDA, tensor-core intrinsics (`mma.h`, `wgmma`), "
-                "inline PTX.\n\n"
+                "You MUST write the kernel yourself. These rules are "
+                "enforced by the static check:\n"
+                "- Do not include the Flash Attention sources "
+                "(`#include <flash_attn*>`, `flash_fwd*`, `flash_bwd*`)\n"
+                + LIBRARY_RULES_PROMPT + "\n\n"
+                "The CUTLASS/CuTe headers are on the include path. You MAY "
+                "also use raw CUDA, tensor-core intrinsics (`mma.h`, "
+                "`wgmma`), and inline PTX.\n\n"
                 "Copying the reference (cuFFT / flash-attn / cuDNN) "
                 "defeats the benchmark — those are what you are being "
                 "compared against. Hand-rolled Cooley-Tukey FFT, "
@@ -1504,13 +1494,13 @@ def eval_task_tool_aug(
                 anticheat_note = ""
                 if config.runner.backend == "class1_make":
                     anticheat_note = (
-                        "NOTE: You cannot directly call CUTLASS or cuBLAS "
-                        "APIs in this benchmark. You must implement the "
-                        "current task with hand-written CUDA code. You MAY "
-                        "use `mma` / `wgmma` intrinsics and inline PTX "
-                        "(asm volatile (\"...\")) to drive tensor cores "
-                        "directly, but must not include CUTLASS or cuBLAS "
-                        "headers or call their high-level wrappers."
+                        "NOTE: You cannot call prebuilt CUTLASS or cuBLAS "
+                        "kernels in this benchmark; you must write the "
+                        "kernel yourself. You MAY use CuTe, CUTLASS "
+                        "low-level building blocks, `mma` / `wgmma` "
+                        "intrinsics and inline PTX (asm volatile (\"...\")) "
+                        "to drive tensor cores directly.\n"
+                        + LIBRARY_RULES_PROMPT
                     )
                 elif config.runner.backend == "class2_defpy" and "/fft_" in config.task_id:
                     anticheat_note = (
@@ -1520,10 +1510,9 @@ def eval_task_tool_aug(
                         "are being benchmarked against. Implement the FFT "
                         "by hand: a radix-2 / radix-4 Cooley-Tukey butterfly "
                         "in shared memory with `__sincosf` or precomputed "
-                        "twiddle tables is the intended path. CUTLASS "
-                        "(`#include <cutlass/...>`) is PERMITTED if you "
-                        "want its reusable utilities, but it is not "
-                        "required — raw CUDA is usually simpler for FFT."
+                        "twiddle tables is the intended path. CuTe and "
+                        "CUTLASS low-level building blocks are allowed but "
+                        "not required — raw CUDA is usually simpler for FFT."
                     )
                 if anticheat_note:
                     feedback_err += "\n\n" + anticheat_note

@@ -41,7 +41,7 @@ def get_inputs():
     x = x0 + residual
     mu = x.mean(dim=-1)
     rs = torch.rsqrt(x.var(dim=-1, unbiased=False) + 1e-5)
-    gamma = torch.ones(COLS, device='cuda', dtype=torch.float32)
+    gamma = torch.randn(COLS, device='cuda', dtype=torch.float32)
     dz = torch.randn(ROWS, COLS, device='cuda', dtype=torch.float32)
     return [("dz", dz), ("x", x), ("mu", mu), ("rs", rs), ("gamma", gamma)]
 

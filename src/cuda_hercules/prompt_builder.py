@@ -6,6 +6,8 @@ Builds LLM prompts from description.txt for all task classes.
 
 import os
 
+from .static_checker import LIBRARY_RULES_PROMPT
+
 
 PYTORCH_EXTENSION_TASKS = {
     "class3/mgg_agnn/general",
@@ -179,7 +181,7 @@ def build_prompt(task_dir: str, task_config=None, description_dir: str = None) -
         "- Write pure CUDA/C++ code",
         "- Include all necessary headers (#include <cuda_runtime.h>, etc.)",
         "- All kernel functions must use `__global__` and launch via `<<<>>>`",
-        "- Do not use cuFFT/cuBLAS/cuDNN/CUTLASS (or any other high-level CUDA library)",
+        LIBRARY_RULES_PROMPT,
         "- Optimize for maximum performance on the target GPU",
     ]
 

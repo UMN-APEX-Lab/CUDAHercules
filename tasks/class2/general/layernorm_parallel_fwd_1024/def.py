@@ -40,8 +40,8 @@ REFERENCE_EXTRA_INCLUDES = ["reference_sources/layer_norm"]
 def get_inputs():
     x0 = torch.randn(ROWS, COLS, device='cuda', dtype=torch.float32)
     residual = torch.randn(ROWS, COLS, device='cuda', dtype=torch.float32)
-    gamma = torch.ones(COLS, device='cuda', dtype=torch.float32)
-    beta = torch.zeros(COLS, device='cuda', dtype=torch.float32)
+    gamma = torch.randn(COLS, device='cuda', dtype=torch.float32)
+    beta = torch.randn(COLS, device='cuda', dtype=torch.float32)
     return [("x0", x0), ("residual", residual), ("gamma", gamma), ("beta", beta)]
 
 

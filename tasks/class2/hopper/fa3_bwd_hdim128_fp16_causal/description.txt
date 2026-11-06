@@ -13,6 +13,10 @@ Given forward outputs (O, lse) and upstream gradient dO, compute:
 scale = 1/sqrt(D) = 0.088388
 Causal masking enabled.
 
+Only dQ, dK, dV are checked. dsoftmax_sum ([B, H, Sq] fp32) and dq_accum
+([B, H, Sq, D] fp32) are scratch workspaces you may use however you like
+(or ignore); their contents on entry are unspecified and are not checked.
+
 
 ## Function Signature
 
@@ -27,8 +31,8 @@ void launch_fa3_bwd(
     void* dK,               // [B, H, Sk, D] fp16
     void* dV,               // [B, H, Sk, D] fp16
     const float* lse,       // [B, H, Sq]
-    float* dsoftmax_sum,    // [B, H, Sq]
-    float* dq_accum,        // [B, H, Sq, D] fp32 accumulator
+    float* dsoftmax_sum,    // [B, H, Sq] fp32 scratch workspace (not checked)
+    float* dq_accum,        // [B, H, Sq, D] fp32 scratch workspace (not checked)
     int B,
     int H,
     int Sq,

@@ -76,6 +76,10 @@ def load_task_def(task_dir: str) -> dict:
         "REFERENCE_EXTRA_INCLUDES": getattr(module, "REFERENCE_EXTRA_INCLUDES", []),
         "REFERENCE_EXTRA_CUDA_FLAGS": getattr(module, "REFERENCE_EXTRA_CUDA_FLAGS", []),
         "REFERENCE_EXTRA_LDFLAGS": getattr(module, "REFERENCE_EXTRA_LDFLAGS", []),
+        # Names of get_outputs() tensors that are compared against the
+        # reference. None = all of them. Anything else in get_outputs() is a
+        # scratch/workspace buffer whose contents are implementation-defined.
+        "CHECKED_OUTPUTS": getattr(module, "CHECKED_OUTPUTS", None),
         "get_inputs": module.get_inputs,
         "get_outputs": module.get_outputs,
         "reference_fn": getattr(module, "reference_fn", None),
@@ -118,15 +122,44 @@ def _current_arch_gencode_flags(target_sm: int) -> list[str]:
     ]
 
 
+def _extract_gencode_flags(extra_cuda_flags: list[str]) -> list[str]:
+    """Return only the `-gencode <spec>` pairs from an nvcc flag list."""
+    gencode_flags = []
+    i = 0
+    while i < len(extra_cuda_flags):
+        if extra_cuda_flags[i] == "-gencode" and i + 1 < len(extra_cuda_flags):
+            gencode_flags.extend(extra_cuda_flags[i:i + 2])
+            i += 2
+            continue
+        i += 1
+    return gencode_flags
+
+
+def get_solution_cuda_flags(task_def: dict, target_sm: int) -> list[str]:
+    """nvcc arch flags for the LLM solution: always the reference's target.
+
+    general tasks retarget both sides to the live GPU. Arch-specific tasks
+    (hopper / blackwell) reuse the reference's `-gencode` pairs, so the
+    solution gets the same "a" target (sm_90a / sm_120a / sm_100a) that
+    wgmma, setmaxnreg, block-scaled FP4 MMA, etc. require. Without this,
+    torch's cpp_extension auto-detects a plain sm_XX target for the
+    solution only, and those instructions fail in ptxas.
+    """
+    if target_sm > 0:
+        return _current_arch_gencode_flags(target_sm)
+    return _extract_gencode_flags(task_def.get("REFERENCE_EXTRA_CUDA_FLAGS", []))
+
+
 def get_solution_include_dirs(root_dir: str) -> list[str]:
     """Include paths permitted for the LLM solution in class2 builds.
 
-    We shipped CUTLASS in reference_sources/ and most class2 anti-cheat
-    configs allow models to `#include <cutlass/...>` (they only forbid
-    domain-specific libraries like flash_attn / cufft). Without
-    adding the CUTLASS root to the solution include path, such includes
-    fail at compile time and the model cannot tell whether the library is
-    allowed.
+    We ship CUTLASS in reference_sources/ so solutions can use CuTe
+    (`#include <cute/...>`) and CUTLASS's low-level primitives (numeric
+    types, arch barriers, pipelines). Prebuilt CUTLASS kernel interfaces
+    (device/kernel/collective-level GEMM/conv) are still rejected by
+    static_checker. Without adding the CUTLASS root to the solution include
+    path, such includes fail at compile time and the model cannot tell
+    whether the library is allowed.
 
     Each candidate path is checked for existence so fresh clones that skip
     the CUTLASS submodule do not break the build — missing paths are
@@ -207,6 +240,7 @@ def check_correctness(
     ref_outputs: list,
     sol_outputs: list,
     tolerances: dict,
+    checked_outputs: Optional[list[str]] = None,
 ) -> tuple[bool, dict]:
     """
     Check if solution outputs match reference outputs within tolerance.
@@ -215,6 +249,8 @@ def check_correctness(
         ref_outputs: List of (name, tensor) from reference.
         sol_outputs: List of (name, tensor) from solution.
         tolerances: Dict with 'atol' and 'rtol'.
+        checked_outputs: If given, only outputs with these names are
+            compared; the rest are scratch buffers and are skipped.
 
     Returns:
         (all_correct, per_output_results)
@@ -225,6 +261,8 @@ def check_correctness(
     per_output = {}
     for (ref_name, ref_tensor), (sol_name, sol_tensor) in zip(ref_outputs, sol_outputs):
         name = ref_name
+        if checked_outputs is not None and name not in checked_outputs:
+            continue
 
         if ref_tensor.shape != sol_tensor.shape:
             per_output[name] = {
@@ -313,13 +351,13 @@ def eval_kernel(
 
     build_dir = tempfile.mkdtemp(prefix="cuda_hercules_sol_")
     try:
-        solution_cuda_flags = _current_arch_gencode_flags(target_sm) if target_sm > 0 else None
+        solution_cuda_flags = get_solution_cuda_flags(task_def, target_sm)
         solution_include_dirs = get_solution_include_dirs(root_dir)
         sol_fn = compile_cuda_module(
             cuda_source=solution_cu,
             function_signature=sig,
             extra_include_dirs=solution_include_dirs or None,
-            extra_cuda_cflags=solution_cuda_flags,
+            extra_cuda_cflags=solution_cuda_flags or None,
             interpose_cached_allocators=is_class2_task,
             build_dir=build_dir,
             verbose=verbose,
@@ -434,7 +472,8 @@ def eval_kernel(
 
             # Compare solution vs CUDA reference
             correct, per_output = check_correctness(
-                ref_outputs, sol_outputs, tolerances
+                ref_outputs, sol_outputs, tolerances,
+                checked_outputs=task_def["CHECKED_OUTPUTS"],
             )
             result.per_output_correctness = per_output
 
