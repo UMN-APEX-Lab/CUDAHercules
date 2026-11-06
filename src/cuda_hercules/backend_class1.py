@@ -9,6 +9,7 @@ Supports cached reference benchmarks for speedup calculation.
 """
 
 import json
+import math
 import os
 import re
 import shutil
@@ -272,8 +273,12 @@ class Class1MakeBackend(Backend):
         metrics.per_size = per_size
 
         if per_size:
-            # Final speedup = average across all sizes
-            metrics.speedup = sum(e["speedup"] for e in per_size) / len(per_size)
+            # Final speedup = geometric mean across sizes (cross-task aggregation
+            # stays arithmetic with failures = 0, see score.py)
+            if all(e["speedup"] > 0 for e in per_size):
+                metrics.speedup = math.exp(sum(math.log(e["speedup"]) for e in per_size) / len(per_size))
+            else:
+                metrics.speedup = 0.0
             # Use last (largest) size for latency fields
             metrics.latency_min_ms = per_size[-1]["kernel_min_ms"]
             metrics.ref_latency_min_ms = per_size[-1]["ref_min_ms"]

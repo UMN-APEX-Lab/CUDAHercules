@@ -1037,7 +1037,7 @@ from cuda_hercules.utils import get_project_root
 root = get_project_root()
 tasks = {{t.task_id: t for t in discover_tasks(root)}}
 config = tasks[{task_id!r}]
-tr = run_task(config, {sol_path!r}, measure_perf=True, verbose=False)
+tr = run_task(config, {sol_path!r}, measure_perf={measure_perf!r}, verbose=False)
 
 payload = {{
     "compiled": tr.compiled,
@@ -1058,6 +1058,7 @@ def _run_task_isolated(
     config: TaskConfig,
     sol_path: str,
     timeout_sec: int = 900,
+    measure_perf: bool = True,
 ) -> TaskResult:
     """Run `run_task` in a fresh subprocess.
 
@@ -1073,6 +1074,7 @@ def _run_task_isolated(
         root=project_root,
         task_id=config.task_id,
         sol_path=sol_path,
+        measure_perf=measure_perf,
     )
 
     try:
@@ -1130,6 +1132,52 @@ def _run_task_isolated(
     )
 
 
+def build_task_prompt(config: TaskConfig) -> str:
+    """Task prompt shared by the tool-augmented controller and external agent
+    harnesses (e.g. scripts/eval_kda.py): description + GPU + library rules."""
+    root = get_project_root()
+    task_dir = os.path.join(root, config.runner.workdir) if config.runner.workdir else ""
+    yaml_dir = getattr(config, "_yaml_dir", task_dir)
+    task_prompt = build_prompt(task_dir, config, description_dir=yaml_dir) + _current_gpu_text()
+    # Up-front anti-cheat warnings so the model doesn't spend rounds
+    # discovering the rules via BLOCKED responses. Tailored per-backend.
+    if config.runner.backend == "class1_make":
+        task_prompt += (
+            "\n\n## Important: Library Restrictions\n\n"
+            "You MUST write the kernel yourself. These rules are "
+            "enforced by the static check:\n"
+            + LIBRARY_RULES_PROMPT + "\n\n"
+            "You MAY also use:\n"
+            "- Raw CUDA kernels (`__global__`) with shared memory, warp "
+            "shuffles, async copies, etc.\n"
+            "- Tensor-core intrinsics via `mma.h` (wmma / mma.sync) and "
+            "`wgmma` on Hopper+\n"
+            "- Inline PTX (`asm volatile (\"...\")`) for anything the "
+            "intrinsics don't expose.\n\n"
+            "Wrapping the reference CUTLASS/cuBLAS kernel defeats "
+            "the benchmark's purpose — the reference is what you are "
+            "being compared against."
+        )
+    elif config.runner.backend == "class2_defpy":
+        task_prompt += (
+            "\n\n## Important: Library Restrictions\n\n"
+            "You MUST write the kernel yourself. These rules are "
+            "enforced by the static check:\n"
+            "- Do not include the Flash Attention sources "
+            "(`#include <flash_attn*>`, `flash_fwd*`, `flash_bwd*`)\n"
+            + LIBRARY_RULES_PROMPT + "\n\n"
+            "The CUTLASS/CuTe headers are on the include path. You MAY "
+            "also use raw CUDA, tensor-core intrinsics (`mma.h`, "
+            "`wgmma`), and inline PTX.\n\n"
+            "Copying the reference (cuFFT / flash-attn / cuDNN) "
+            "defeats the benchmark — those are what you are being "
+            "compared against. Hand-rolled Cooley-Tukey FFT, "
+            "flash-attention in shared memory, Welford layernorm, etc. "
+            "are the intended paths."
+        )
+    return task_prompt
+
+
 def eval_task_tool_aug(
     config: TaskConfig,
     max_iterations: int,
@@ -1175,44 +1223,7 @@ def eval_task_tool_aug(
     }
 
     try:
-        yaml_dir = getattr(config, "_yaml_dir", task_dir)
-        task_prompt = build_prompt(task_dir, config, description_dir=yaml_dir) + _current_gpu_text()
-        # Up-front anti-cheat warnings so the model doesn't spend rounds
-        # discovering the rules via BLOCKED responses. Tailored per-backend.
-        if config.runner.backend == "class1_make":
-            task_prompt += (
-                "\n\n## Important: Library Restrictions\n\n"
-                "You MUST write the kernel yourself. These rules are "
-                "enforced by the static check:\n"
-                + LIBRARY_RULES_PROMPT + "\n\n"
-                "You MAY also use:\n"
-                "- Raw CUDA kernels (`__global__`) with shared memory, warp "
-                "shuffles, async copies, etc.\n"
-                "- Tensor-core intrinsics via `mma.h` (wmma / mma.sync) and "
-                "`wgmma` on Hopper+\n"
-                "- Inline PTX (`asm volatile (\"...\")`) for anything the "
-                "intrinsics don't expose.\n\n"
-                "Wrapping the reference CUTLASS/cuBLAS kernel defeats "
-                "the benchmark's purpose — the reference is what you are "
-                "being compared against."
-            )
-        elif config.runner.backend == "class2_defpy":
-            task_prompt += (
-                "\n\n## Important: Library Restrictions\n\n"
-                "You MUST write the kernel yourself. These rules are "
-                "enforced by the static check:\n"
-                "- Do not include the Flash Attention sources "
-                "(`#include <flash_attn*>`, `flash_fwd*`, `flash_bwd*`)\n"
-                + LIBRARY_RULES_PROMPT + "\n\n"
-                "The CUTLASS/CuTe headers are on the include path. You MAY "
-                "also use raw CUDA, tensor-core intrinsics (`mma.h`, "
-                "`wgmma`), and inline PTX.\n\n"
-                "Copying the reference (cuFFT / flash-attn / cuDNN) "
-                "defeats the benchmark — those are what you are being "
-                "compared against. Hand-rolled Cooley-Tukey FFT, "
-                "flash-attention in shared memory, Welford layernorm, etc. "
-                "are the intended paths."
-            )
+        task_prompt = build_task_prompt(config)
     except Exception as e:
         result["final_status"] = TaskStatus.ERROR.value
         result["error"] = f"Prompt build failed: {e}"
