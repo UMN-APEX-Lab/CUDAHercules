@@ -49,7 +49,7 @@ REFERENCE_EXTRA_INCLUDES = [
     "reference_sources/cutlass/include",
 ]
 REFERENCE_EXTRA_CUDA_FLAGS = [
-    "-gencode", "arch=compute_100a,code=sm_100a",
+    "-gencode", "arch=compute_120a,code=sm_120a",
     "-include", "cassert",
     "-std=c++17",
     "--expt-relaxed-constexpr",
