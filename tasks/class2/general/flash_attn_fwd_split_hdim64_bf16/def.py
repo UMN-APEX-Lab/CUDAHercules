@@ -5,14 +5,16 @@ Source: flash-attention/csrc/flash_attn/src/flash_fwd_split_hdim64_bf16_sm80.cu
 Operation: O = softmax(Q @ K^T * scale) @ V, using split-KV parallelism.
 Split-KV splits the K/V sequence across multiple thread block groups,
 each computes partial softmax results, then combines.
+Shape: Qwen3-32B GQA decode (8 q heads packed into Sq per KV head):
+B=16, H=8, Sq=8, Sk=6144.
 """
 import torch
 import math
 
-BATCH_SIZE = 8
-NUM_HEADS = 32
-SEQ_LEN_Q = 8192
-SEQ_LEN_K = 8192
+BATCH_SIZE = 16
+NUM_HEADS = 8
+SEQ_LEN_Q = 8
+SEQ_LEN_K = 6144
 HEAD_DIM = 64
 NUM_SPLITS = 4
 
@@ -46,7 +48,13 @@ SCALAR_ARGS = {
     "num_splits": NUM_SPLITS,
 }
 
-TOLERANCES = {"atol": 5e-2, "rtol": 5e-2}
+# Decode outputs are small (|O| ~ 1/sqrt(Sk) for random inputs) and lse ~ log(Sk),
+# so 5e-2 would accept dropping a whole KV split or ignoring the causal mask.
+# A correct implementation differs from the reference by <= 1 output ulp; for
+# bf16 that is up to ~37% of (1e-3, 5e-3) at |O| ~ 0.07, so bf16 uses rtol 1e-2
+# (<= 30%), which still fails a dropped split (~45x), mask errors (~4x) and a
+# 1% scale error (~1.7x).
+TOLERANCES = {"atol": 1e-3, "rtol": 1e-2}
 
 HAS_CUDA_REFERENCE = True
 REFERENCE_EXTRA_INCLUDES = [
@@ -93,27 +101,41 @@ def reference_fn(inputs):
 
 
 DESCRIPTION = """\
-Implement a CUDA kernel for the forward pass of Flash Attention using split-KV parallelism.
+Implement the attention forward pass for one decode step over a long KV cache.
 
-Split-KV approach: split the K/V sequence into num_splits chunks, compute partial
-softmax results independently per chunk, then combine using log-sum-exp correction.
+Workload: one batched decode step of a grouped-query-attention LLM
+(Qwen3-32B: 64 query heads, 8 KV heads) on one GPU, for 16 sequences with a
+6144-token KV cache each. The 8 query heads that share a KV head are packed
+into the query-row dimension, so each (b, h) is one KV head with Sq = 8 query rows.
+This task uses head dimension D = 64.
 
-  S = Q @ K^T * scale
-  O = softmax(S) @ V
-  lse[i] = log(sum(exp(S[i][:])))
+For every batch index b and head h (query rows i, key/value rows j):
+  S[i][j]    = scale * dot(Q[b,h,i,:], K[b,h,j,:])
+  O[b,h,i,:] = sum_j softmax_j(S[i][:]) * V[b,h,j,:]
+  lse[b,h,i] = log(sum_j exp(S[i][j]))      (natural logarithm)
 
-Inputs (all bf16, contiguous, [B, H, S, D] layout):
+Inputs (bf16, contiguous, [B, H, S, D] layout):
   Q: [%d, %d, %d, %d]
   K: [%d, %d, %d, %d]
   V: [%d, %d, %d, %d]
-  num_splits: %d
+  scale = 1/sqrt(D) = %f
+  num_splits = %d: passed by the caller; O and lse must equal attention over the
+    full key sequence however the work is partitioned.
 
 Outputs:
-  O:   [B, H, Sq, D] bf16 — attention output
-  lse: [B, H, Sq] fp32 — log-sum-exp per query row
+  O:   [%d, %d, %d, %d] bf16
+  lse: [%d, %d, %d] fp32
 
-scale = 1/sqrt(D) = %f
+Precision: dot products, softmax statistics and the P*V sums must be accumulated
+in FP32 (or higher); O is rounded to bf16 once, at the end.
+
+Correctness: on 3 random input sets (Q, K, V ~ N(0, 1)), O and lse are each
+compared element-wise with a reference: |out - ref| <= atol + rtol * |ref|,
+atol = %g, rtol = %g.
 """ % (BATCH_SIZE, NUM_HEADS, SEQ_LEN_Q, HEAD_DIM,
        BATCH_SIZE, NUM_HEADS, SEQ_LEN_K, HEAD_DIM,
        BATCH_SIZE, NUM_HEADS, SEQ_LEN_K, HEAD_DIM,
-       NUM_SPLITS, SCALE)
+       SCALE, NUM_SPLITS,
+       BATCH_SIZE, NUM_HEADS, SEQ_LEN_Q, HEAD_DIM,
+       BATCH_SIZE, NUM_HEADS, SEQ_LEN_Q,
+       TOLERANCES["atol"], TOLERANCES["rtol"])

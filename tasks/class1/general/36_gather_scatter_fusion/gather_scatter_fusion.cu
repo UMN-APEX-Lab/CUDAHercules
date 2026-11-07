@@ -59,17 +59,16 @@
 // Also, we don't check the index value is legal and index array point is valid
 // for the sake of the performance.
 
+
 #include <cstdlib>
 #include <cstdio>
-#include <ctime>
 #include <cmath>
-#include <cassert>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
 #include <algorithm>
 #include <iostream>
-#include <fstream>
 #include <random>
 #include <numeric>
 #include <sstream>
@@ -78,20 +77,13 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_universal.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
-#include "cutlass/util/host_tensor.h"
-#include "cutlass/util/command_line.h"
-#include "cutlass/util/reference/device/gemm.h"
-#include "cutlass/util/reference/host/tensor_compare.h"
-#include "cutlass/util/reference/host/tensor_copy.h"
-#include "cutlass/util/reference/host/tensor_fill.h"
-#include "cutlass/util/tensor_view_io.h"
 #include "helper.h"
 
 #ifdef KH_TEST_SOLUTION
 #include "solution.h"
 #endif
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////
 
 #define CUDA_CHECK(status)                                              \
   {                                                                     \
@@ -104,300 +96,538 @@
   }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-
-// The code section below describes datatype for input, output matrices and computation between
-// elements in input matrices.
-using ElementAccumulator = float;                   // <- data type of accumulator
-using ElementComputeEpilogue = ElementAccumulator;  // <- data type of epilogue operations
-using ElementInputA = cutlass::half_t;              // <- data type of elements in input matrix A
-using ElementInputB = cutlass::half_t;              // <- data type of elements in input matrix B
-using ElementOutput = float;                        // <- data type of elements in output matrix D
-
-// The code section below describes matrix layout of input and output matrices.
-// Column Major for Matrix A, B and C.
-using LayoutInputA = cutlass::layout::ColumnMajor;
-using LayoutInputB = cutlass::layout::ColumnMajor;
-using LayoutOutput = cutlass::layout::ColumnMajor;
-
-// This code section describes whether you want to use tensor cores or regular SIMT cores on GPU SM
-using MMAOp = cutlass::arch::OpClassTensorOp;
-
-// This code section describes CUDA SM architecture number
-using SmArch = cutlass::arch::Sm80;
-
-// This code section describes the tile size a thread block will compute
-using ShapeMMAThreadBlock =
-    cutlass::gemm::GemmShape<128, 128, 32>;
-// This code section describes tile size a warp will compute
-using ShapeMMAWarp = cutlass::gemm::GemmShape<64, 64, 32>;
-// This code section describes the size of MMA op
-using ShapeMMAOp = cutlass::gemm::GemmShape<16, 8, 16>;
-
-// This code section describes how threadblocks are scheduled on GPU
-using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
-
-// Define the epilogue operation as LinearCombination.
-using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
-    ElementOutput,
-    128 / cutlass::sizeof_bits<ElementOutput>::value,
-    ElementAccumulator,
-    ElementComputeEpilogue>;
-
-// Number of pipelines you want to use
-constexpr int NumStages = 5;
-
-using Gemm = cutlass::gemm::device::GemmUniversal<ElementInputA,
-                                                  LayoutInputA,
-                                                  ElementInputB,
-                                                  LayoutInputB,
-                                                  ElementOutput,
-                                                  LayoutOutput,
-                                                  ElementAccumulator,
-                                                  MMAOp,
-                                                  SmArch,
-                                                  ShapeMMAThreadBlock,
-                                                  ShapeMMAWarp,
-                                                  ShapeMMAOp,
-                                                  EpilogueOp,
-                                                  SwizzleThreadBlock,
-                                                  NumStages,
-                                                  8,     /*alignmentA*/
-                                                  8,     /*alignmentB*/
-                                                  cutlass::arch::OpMultiplyAdd,
-                                                  cutlass::ComplexTransform::kNone,
-                                                  cutlass::ComplexTransform::kNone,
-                                                  false, /*GatherA*/
-                                                  true,  /*GatherB*/
-                                                  true   /*ScatterD*/
-                                                 >;
-
+// Reference: CUTLASS fused gather-GEMM-scatter (GemmUniversal with GatherA / ScatterD), FP16
+// tensor cores with FP32 accumulation and FP32 output. All matrices are row-major: gathering
+// rows of A and scattering rows of D keeps the full vector alignment along K / N. Per-size
+// configuration chosen by an offline sweep on the benchmark GPU (RTX PRO 6000 Blackwell, sm_120).
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Reference gather-scatter GEMM computed on host (float precision).
-/// Row-major layout for all matrices.
-/// D[scatter_D[i], j] = alpha * sum_k A[gather_A[i], k] * B[k, j] + beta * C[gather_C[i], j]
-void CutlassGatherScatterGemmHost(
-    int M, int N, int K, float alpha,
-    std::vector<float> const &fA, int lda, std::vector<int> const &gather_A,
-    std::vector<float> const &fB, int ldb,
-    float beta,
-    std::vector<float> const &fC, int ldc, std::vector<int> const &gather_C,
-    std::vector<float> &fD, int ldd, std::vector<int> const &scatter_D) {
+using ElementAccumulator = float;
+using ElementComputeEpilogue = ElementAccumulator;
+using ElementInputA = cutlass::half_t;
+using ElementInputB = cutlass::half_t;
+using ElementOutput = float;
+using LayoutInputA = cutlass::layout::RowMajor;
+using LayoutInputB = cutlass::layout::RowMajor;
+using LayoutOutput = cutlass::layout::RowMajor;
 
-  for (int i = 0; i < M; ++i) {
-    int a_row = gather_A[i];
-    int c_row = gather_C[i];
-    int d_row = scatter_D[i];
-    for (int j = 0; j < N; ++j) {
-      float acc = 0;
-      for (int k = 0; k < K; ++k)
-        acc += fA[a_row * lda + k] * fB[k * ldb + j];
-      fD[d_row * ldd + j] = alpha * acc + beta * fC[c_row * ldc + j];
-    }
-  }
+using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
+    ElementOutput, 128 / cutlass::sizeof_bits<ElementOutput>::value,
+    ElementAccumulator, ElementComputeEpilogue>;
+
+template <int TM, int TN, int TK, int WM, int WN, int WK, int Stages, int Swizzle = 1>
+using GatherScatterGemmT = cutlass::gemm::device::GemmUniversal<
+    ElementInputA, LayoutInputA, ElementInputB, LayoutInputB, ElementOutput, LayoutOutput,
+    ElementAccumulator, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<TM, TN, TK>, cutlass::gemm::GemmShape<WM, WN, WK>,
+    cutlass::gemm::GemmShape<16, 8, 16>, EpilogueOp,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<Swizzle>, Stages,
+    8, 8,                                  // alignment A, B
+    cutlass::arch::OpMultiplyAdd,
+    cutlass::ComplexTransform::kNone, cutlass::ComplexTransform::kNone,
+    true,  /*GatherA*/
+    false, /*GatherB*/
+    true   /*ScatterD*/>;
+
+// Per-size configurations (offline sweep):
+//   0: 128x128x32 threadblock, 64x64x32 warp, 5 stages               (qwen3_30b_a3b)
+//   1: 128x128x32 threadblock, 64x64x32 warp, 3 stages, serial split-K (other shapes; FP32 output,
+//      so the split-K partial sums stay in FP32)
+using GatherScatterGemm0 = GatherScatterGemmT<128, 128, 32, 64, 64, 32, 5>;
+using GatherScatterGemm1 = GatherScatterGemmT<128, 128, 32, 64, 64, 32, 3>;
+
+struct RefPlan { int config; int split_k; };
+
+static RefPlan RefPlanFor(int M, int N, int K) {
+  if (M == 1024 && N == 1536 && K == 2048)   return {0, 1};   // qwen3_30b_a3b
+  if (M == 1536 && N == 2816 && K == 2048)   return {1, 2};   // deepseek_v2_lite
+  if (M == 4096 && N == 14336 && K == 4096)  return {1, 1};   // mixtral_8x7b_tp2
+  if (M == 512 && N == 4096 && K == 7168)    return {1, 4};   // deepseek_v3_ep
+  int sms = 0;
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+  long long tiles = (long long)((M + 127) / 128) * ((N + 127) / 128);
+  int split = int(std::min<long long>(4, std::max<long long>(1, (sms + tiles - 1) / tiles)));
+  return {1, std::max(1, std::min(split, K / 1024))};
 }
 
-/// Wrapper that copies data from device, runs host reference, and writes result back.
-cudaError_t CutlassGatherScatterGemmRef(
+
+/// Persistent workspace (allocated once, outside the timed region).
+static void *g_ref_workspace = nullptr;
+static size_t g_ref_workspace_bytes = 0;
+
+template <typename Gemm>
+static cudaError_t RunCutlass(int M, int N, int K, float alpha, __half const *dA, int lda,
+                              int const *d_gather_A, __half const *dB, int ldb, float beta,
+                              float const *dC, int ldc, float *dD, int ldd,
+                              int const *d_scatter_D, int split_k) {
+  typename Gemm::Arguments arguments(
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      cutlass::gemm::GemmCoord(M, N, K),
+      split_k,                             // serial split-K slices
+      {alpha, beta},
+      reinterpret_cast<cutlass::half_t const *>(dA),
+      reinterpret_cast<cutlass::half_t const *>(dB), dC, dD,
+      0, 0, 0, 0,                          // batch strides (unused)
+      int64_t(lda), int64_t(ldb), int64_t(ldc), int64_t(ldd),
+      d_gather_A,                          // gather rows of A
+      nullptr,                             // no gather on B
+      d_scatter_D);                        // scatter rows of D (and read rows of C)
+  size_t ws = Gemm::get_workspace_size(arguments);
+  if (ws > g_ref_workspace_bytes) {
+    if (g_ref_workspace) cudaFree(g_ref_workspace);
+    if (cudaMalloc(&g_ref_workspace, ws) != cudaSuccess) return cudaErrorMemoryAllocation;
+    g_ref_workspace_bytes = ws;
+  }
+  Gemm gemm_op;
+  if (gemm_op.can_implement(arguments) != cutlass::Status::kSuccess) return cudaErrorInvalidValue;
+  if (gemm_op.initialize(arguments, g_ref_workspace) != cutlass::Status::kSuccess) return cudaErrorUnknown;
+  if (gemm_op() != cutlass::Status::kSuccess) return cudaErrorUnknown;
+  return cudaGetLastError();
+}
+
+/// CUTLASS fused gather-GEMM-scatter (reference that is timed).
+/// D[scatter_D[i], j] = alpha * sum_k A[gather_A[i], k] * B[k, j] + beta * C[scatter_D[i], j]
+/// CUTLASS reads C through the scatter indices, so it matches the task semantics when
+/// gather_C == scatter_D (which is how the harness builds the indices).
+cudaError_t CutlassGatherScatterGemm(
     int M, int N, int K, float alpha,
     __half const *dA, int lda, int const *d_gather_A,
     __half const *dB, int ldb,
     float beta,
-    float const *dC, int ldc, int const *d_gather_C,
-    float *dD, int ldd, int const *d_scatter_D,
-    int A_rows) {
-
-  // Copy indices
-  std::vector<int> gather_A(M), gather_C(M), scatter_D(M);
-  cudaMemcpy(gather_A.data(), d_gather_A, M * sizeof(int), cudaMemcpyDeviceToHost);
-  cudaMemcpy(gather_C.data(), d_gather_C, M * sizeof(int), cudaMemcpyDeviceToHost);
-  cudaMemcpy(scatter_D.data(), d_scatter_D, M * sizeof(int), cudaMemcpyDeviceToHost);
-
-  int D_rows = 0;
-  for (int i = 0; i < M; ++i) D_rows = std::max(D_rows, scatter_D[i] + 1);
-  int C_rows = 0;
-  for (int i = 0; i < M; ++i) C_rows = std::max(C_rows, gather_C[i] + 1);
-
-  int count_A = A_rows * K, count_B = K * N;
-  int count_C = C_rows * N, count_D = D_rows * N;
-
-  // Copy half data
-  std::vector<__half> hA(count_A), hB(count_B);
-  cudaMemcpy(hA.data(), dA, count_A * sizeof(__half), cudaMemcpyDeviceToHost);
-  cudaMemcpy(hB.data(), dB, count_B * sizeof(__half), cudaMemcpyDeviceToHost);
-
-  // Convert half to float
-  std::vector<float> fA(count_A), fB(count_B);
-  for (int i = 0; i < count_A; ++i) fA[i] = __half2float(hA[i]);
-  for (int i = 0; i < count_B; ++i) fB[i] = __half2float(hB[i]);
-
-  // Copy C (float)
-  std::vector<float> fC(count_C, 0);
-  cudaMemcpy(fC.data(), dC, count_C * sizeof(float), cudaMemcpyDeviceToHost);
-
-  // Compute
-  std::vector<float> fD(count_D, 0);
-  CutlassGatherScatterGemmHost(M, N, K, alpha, fA, lda, gather_A, fB, ldb,
-    beta, fC, ldc, gather_C, fD, ldd, scatter_D);
-
-  // Copy result back
-  cudaMemcpy(dD, fD.data(), count_D * sizeof(float), cudaMemcpyHostToDevice);
-
-  return cudaSuccess;
+    float const *dC, int ldc,
+    float *dD, int ldd, int const *d_scatter_D) {
+  RefPlan p = RefPlanFor(M, N, K);
+  if (p.config == 0)
+    return RunCutlass<GatherScatterGemm0>(M, N, K, alpha, dA, lda, d_gather_A, dB, ldb, beta, dC,
+                                          ldc, dD, ldd, d_scatter_D, 1);
+  return RunCutlass<GatherScatterGemm1>(M, N, K, alpha, dA, lda, d_gather_A, dB, ldb, beta, dC,
+                                        ldc, dD, ldd, d_scatter_D, p.split_k);
 }
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Verification kit: random full-mantissa inputs, golden GEMM on the device (FP64, or FP32 for
+// 16-bit inputs whose products are exact in FP32), NaN-safe comparison of every output element
+// (max error and relative Frobenius error vs the golden).
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+
+#define KH_CHECK(call)                                                                         \
+  do {                                                                                         \
+    cudaError_t kh_err_ = (call);                                                              \
+    if (kh_err_ != cudaSuccess) {                                                              \
+      std::cerr << "CUDA error " << cudaGetErrorString(kh_err_) << " at " << __FILE__ << ":"   \
+                << __LINE__ << std::endl;                                                      \
+      std::exit(2);                                                                            \
+    }                                                                                          \
+  } while (0)
+
+__host__ __device__ inline unsigned long long kh_hash64(unsigned long long i, unsigned int seed) {
+  unsigned long long x = i * 0x9E3779B97F4A7C15ull + (seed + 1ull) * 0xD1B54A32D192ED03ull;
+  x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 27; x *= 0x94D049BB133111EBull; x ^= x >> 33;
+  return x;
+}
+
+/// Uniform in [-1, 1): a random 25-bit signed integer times 2^-24. Every value with |v| >= 0.5
+/// carries a full 24-bit significand, so rounding inputs to TF32/BF16/FP16 changes the result.
+__host__ __device__ inline float kh_uniform(unsigned long long i, unsigned int seed) {
+  return float(int(unsigned(kh_hash64(i, seed) >> 32)) >> 7) * (1.0f / 16777216.0f);
+}
+
+__device__ inline double kh_to_double(float x) { return double(x); }
+__device__ inline double kh_to_double(__half x) { return double(__half2float(x)); }
+__device__ inline double kh_to_double(__nv_bfloat16 x) { return double(__bfloat162float(x)); }
+template <typename T> __device__ inline T kh_from_float(float x);
+template <> __device__ inline float kh_from_float<float>(float x) { return x; }
+template <> __device__ inline __half kh_from_float<__half>(float x) { return __float2half_rn(x); }
+template <> __device__ inline __nv_bfloat16 kh_from_float<__nv_bfloat16>(float x) {
+  return __float2bfloat16_rn(x);
+}
+
+/// Random values: uniform in [-scale, scale) rounded to T (a full T significand).
+template <typename T>
+__global__ void kh_fill_kernel(T *p, size_t n, unsigned int seed, float scale) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    p[i] = kh_from_float<T>(kh_uniform(i, seed) * scale);
+}
+
+template <typename T>
+__global__ void kh_fill_value_kernel(T *p, size_t n, float v) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    p[i] = kh_from_float<T>(v);
+}
+
+template <typename T>
+static void kh_fill(T *p, size_t n, unsigned int seed, float scale = 1.0f) {
+  kh_fill_kernel<T><<<4096, 256>>>(p, n, seed, scale);
+  KH_CHECK(cudaGetLastError());
+}
+
+/// Finite poison for outputs that the operation may also read with beta = 0 (0 * poison = 0):
+/// any element the solution leaves unwritten keeps this value and fails the comparison
+/// (65504 = largest finite FP16 value; 3e38 for FP32 outputs).
+static const float kPoison16 = 65504.0f;
+static const float kPoison32 = 3.0e38f;
+
+template <typename T>
+static void kh_fill_value(T *p, size_t n, float v) {
+  kh_fill_value_kernel<T><<<4096, 256>>>(p, n, v);
+  KH_CHECK(cudaGetLastError());
+}
+
+/// Golden GEMM: G(i,j) = alpha * sum_k A(i,k) B(k,j) + beta * C(i,j), G row-major M x N (FP64),
+/// accumulated in Acc (double, or float for 16-bit inputs whose products are exact in FP32).
+/// Element (i,k) of A is A[i*sam + k*sak]; B(k,j) = B[k*sbk + j*sbn]; C(i,j) = C[i*scm + j*scn].
+template <typename Acc, typename TA, typename TB, typename TC>
+__global__ void __launch_bounds__(256) kh_golden_gemm_kernel(
+    int M, int N, int K, double alpha,
+    TA const *A, long long sam, long long sak,
+    TB const *B, long long sbk, long long sbn,
+    double beta, TC const *C, long long scm, long long scn,
+    double *G) {
+  __shared__ Acc As[16][65];
+  __shared__ Acc Bs[16][65];
+  int const tx = threadIdx.x % 16, ty = threadIdx.x / 16;
+  int const m0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+  Acc acc[4][4];
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) acc[r][c] = Acc(0);
+  bool const a_m_fast = (sam == 1);
+  bool const b_n_fast = (sbn == 1);
+  for (int k0 = 0; k0 < K; k0 += 16) {
+    for (int e = threadIdx.x; e < 16 * 64; e += 256) {
+      int kk = a_m_fast ? e / 64 : e % 16;
+      int mm = a_m_fast ? e % 64 : e / 16;
+      int gi = m0 + mm, gk = k0 + kk;
+      As[kk][mm] = (gi < M && gk < K) ? Acc(kh_to_double(A[gi * sam + gk * sak])) : Acc(0);
+      int kb = b_n_fast ? e / 64 : e % 16;
+      int nn = b_n_fast ? e % 64 : e / 16;
+      int gj = n0 + nn, gkb = k0 + kb;
+      Bs[kb][nn] = (gj < N && gkb < K) ? Acc(kh_to_double(B[gkb * sbk + gj * sbn])) : Acc(0);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < 16; ++kk) {
+      Acc a[4], b[4];
+#pragma unroll
+      for (int r = 0; r < 4; ++r) a[r] = As[kk][ty + 16 * r];
+#pragma unroll
+      for (int c = 0; c < 4; ++c) b[c] = Bs[kk][tx + 16 * c];
+#pragma unroll
+      for (int r = 0; r < 4; ++r)
+#pragma unroll
+        for (int c = 0; c < 4; ++c) acc[r][c] = fma(a[r], b[c], acc[r][c]);
+    }
+    __syncthreads();
+  }
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) {
+      int i = m0 + ty + 16 * r, j = n0 + tx + 16 * c;
+      if (i < M && j < N) {
+        double v = alpha * double(acc[r][c]);
+        if (beta != 0.0) v += beta * kh_to_double(C[i * scm + j * scn]);
+        G[size_t(i) * N + j] = v;
+      }
+    }
+}
+
+template <typename Acc, typename TA, typename TB, typename TC>
+static void kh_golden_gemm(int M, int N, int K, double alpha,
+                           TA const *A, long long sam, long long sak,
+                           TB const *B, long long sbk, long long sbn,
+                           double beta, TC const *C, long long scm, long long scn, double *G) {
+  dim3 grid((N + 63) / 64, (M + 63) / 64);
+  kh_golden_gemm_kernel<Acc, TA, TB, TC><<<grid, 256>>>(M, N, K, alpha, A, sam, sak, B, sbk, sbn,
+                                                       beta, C, scm, scn, G);
+  KH_CHECK(cudaGetLastError());
+}
+
+struct KhStats {
+  double sum_g2, sum_d2;
+  unsigned long long max_d_bits, nonfinite, nbad;
+};
+
+__device__ inline void kh_block_add(double v, double *dst) {
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+  if ((threadIdx.x & 31) == 0) atomicAdd(dst, v);
+}
+
+__global__ void kh_sumsq_kernel(double const *G, size_t n, KhStats *st) {
+  double s = 0.0;
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    s += G[i] * G[i];
+  kh_block_add(s, &st->sum_g2);
+}
+
+/// Compares X(i,j) = X[i*sxm + j*sxn] with G (row-major M x N). Counts non-finite outputs and
+/// elements with !(|x - g| <= tol_abs) (NaN-safe), accumulates sum (x-g)^2 and max |x-g|.
+template <typename TX>
+__global__ void kh_compare_kernel(TX const *X, long long sxm, long long sxn, double const *G,
+                                  int M, int N, double tol_abs, double tol_rel, KhStats *st) {
+  size_t const n = size_t(M) * N;
+  double s = 0.0, mx = 0.0;
+  unsigned long long nf = 0, nb = 0;
+  for (size_t idx = blockIdx.x * size_t(blockDim.x) + threadIdx.x; idx < n;
+       idx += size_t(gridDim.x) * blockDim.x) {
+    long long i = (long long)(idx / N), j = (long long)(idx % N);
+    double x = kh_to_double(X[i * sxm + j * sxn]);
+    double d = fabs(x - G[idx]);
+    if (!isfinite(x)) { ++nf; continue; }
+    if (!(d <= tol_abs + tol_rel * fabs(G[idx]))) ++nb;
+    s += d * d;
+    mx = fmax(mx, d);
+  }
+  kh_block_add(s, &st->sum_d2);
+  for (int o = 16; o > 0; o >>= 1) {
+    mx = fmax(mx, __shfl_down_sync(0xffffffffu, mx, o));
+    nf += __shfl_down_sync(0xffffffffu, nf, o);
+    nb += __shfl_down_sync(0xffffffffu, nb, o);
+  }
+  if ((threadIdx.x & 31) == 0) {
+    atomicMax(&st->max_d_bits, (unsigned long long)__double_as_longlong(mx));
+    atomicAdd(&st->nonfinite, nf);
+    atomicAdd(&st->nbad, nb);
+  }
+}
+
+struct KhResult {
+  double rms, max_err_rel, fro_rel;
+  unsigned long long nonfinite, nbad;
+  bool pass;
+};
+
+/// Full check of an M x N output against the golden: every element must be finite and within
+/// tol_max * RMS(golden) (+ tol_rel * |golden|) of the golden, and the relative Frobenius error
+/// must be <= tol_fro.
+template <typename TX>
+static KhResult kh_check(TX const *X, long long sxm, long long sxn, double const *G,
+                         int M, int N, double tol_max, double tol_fro, double tol_rel = 0.0) {
+  KhStats *st;
+  KH_CHECK(cudaMalloc(&st, sizeof(KhStats)));
+  KH_CHECK(cudaMemset(st, 0, sizeof(KhStats)));
+  size_t n = size_t(M) * N;
+  kh_sumsq_kernel<<<2048, 256>>>(G, n, st);
+  KH_CHECK(cudaGetLastError());
+  KhStats h;
+  KH_CHECK(cudaMemcpy(&h, st, sizeof(h), cudaMemcpyDeviceToHost));
+  double rms = std::sqrt(h.sum_g2 / double(n));
+  kh_compare_kernel<TX><<<2048, 256>>>(X, sxm, sxn, G, M, N, tol_max * rms, tol_rel, st);
+  KH_CHECK(cudaGetLastError());
+  KH_CHECK(cudaMemcpy(&h, st, sizeof(h), cudaMemcpyDeviceToHost));
+  KH_CHECK(cudaFree(st));
+  double max_d;
+  std::memcpy(&max_d, &h.max_d_bits, sizeof(max_d));
+  KhResult r;
+  r.rms = rms;
+  r.max_err_rel = rms > 0 ? max_d / rms : INFINITY;
+  r.fro_rel = h.sum_g2 > 0 ? std::sqrt(h.sum_d2 / h.sum_g2) : INFINITY;
+  r.nonfinite = h.nonfinite;
+  r.nbad = h.nbad;
+  r.pass = (rms > 0) && h.nonfinite == 0 && h.nbad == 0 && r.fro_rel <= tol_fro;
+  return r;
+}
+
+static void kh_print(char const *who, KhResult const &r, double tol_max, double tol_fro) {
+  std::printf("  %s: max|err|/rms = %.3e (tol %.1e), rel_fro_err = %.3e (tol %.1e), "
+              "non-finite = %llu, elements over tol = %llu -> %s\n",
+              who, r.max_err_rel, tol_max, r.fro_rel, tol_fro, r.nonfinite, r.nbad,
+              r.pass ? "ok" : "FAIL");
+}
+/// MoE token dispatch for one expert (vLLM fused-MoE style). A_rows tokens each pick top_k
+/// experts; the expert under test receives M distinct tokens (in token order). Row i of the
+/// GEMM gathers token gather_A[i] and is scattered to its (token, k) slot
+/// scatter_D[i] = token * top_k + r in a [A_rows * top_k, N] output buffer; C is read at the
+/// same slot (gather_C == scatter_D). Returns the number of rows of C/D.
+static int BuildMoeIndices(int M, int A_rows, int top_k, std::vector<int> &gather_A,
+                           std::vector<int> &gather_C, std::vector<int> &scatter_D) {
+  std::mt19937 rng(2024u + unsigned(M) * 31u + unsigned(A_rows));
+  std::vector<int> tokens(A_rows);
+  std::iota(tokens.begin(), tokens.end(), 0);
+  for (int i = 0; i < M; ++i) {            // partial Fisher-Yates: M distinct tokens
+    int j = i + int(rng() % unsigned(A_rows - i));
+    std::swap(tokens[i], tokens[j]);
+  }
+  std::sort(tokens.begin(), tokens.begin() + M);
+  gather_A.resize(M); gather_C.resize(M); scatter_D.resize(M);
+  for (int i = 0; i < M; ++i) {
+    int slot = tokens[i] * top_k + int(rng() % unsigned(top_k));
+    gather_A[i] = tokens[i];
+    scatter_D[i] = slot;
+    gather_C[i] = slot;
+  }
+  return A_rows * top_k;
+}
+
+/// Device buffers for one problem.
+struct Problem {
+  int M, N, K, A_rows, D_rows, lda, ldb, ldc, ldd;
+  __half *dA = nullptr, *dB = nullptr;
+  float *dC = nullptr;
+  int *dGA = nullptr, *dGC = nullptr, *dSD = nullptr;
+  size_t count_A, count_B, count_C, count_D;
+  std::vector<int> gather_A, gather_C, scatter_D;
+
+  Problem(int M_, int N_, int K_, int A_rows_, int top_k) : M(M_), N(N_), K(K_), A_rows(A_rows_) {
+    D_rows = BuildMoeIndices(M, A_rows, top_k, gather_A, gather_C, scatter_D);
+    lda = K; ldb = N; ldc = N; ldd = N;
+    count_A = size_t(A_rows) * K; count_B = size_t(K) * N;
+    count_C = size_t(D_rows) * N; count_D = size_t(D_rows) * N;
+    CUDA_CHECK(cudaMalloc(&dA, count_A * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&dB, count_B * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&dC, count_C * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dGA, M * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dGC, M * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dSD, M * sizeof(int)));
+    // Random inputs with a full FP16 (A, B) / FP32 (C) significand.
+    kh_fill(dA, count_A, 1u);
+    kh_fill(dB, count_B, 2u);
+    kh_fill(dC, count_C, 3u);
+    CUDA_CHECK(cudaMemcpy(dGA, gather_A.data(), M * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dGC, gather_C.data(), M * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dSD, scatter_D.data(), M * sizeof(int), cudaMemcpyHostToDevice));
+  }
+  ~Problem() {
+    cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dGA); cudaFree(dGC); cudaFree(dSD);
+  }
+  float *AllocD() const {
+    float *d;
+    CUDA_CHECK(cudaMalloc(&d, count_D * sizeof(float)));
+    // Same finite sentinel (0x7F7F7F7F ~ 3.4e38) in every D buffer: rows that must be written
+    // and are not, and rows that must NOT be written but are, both fail the comparison.
+    CUDA_CHECK(cudaMemset(d, 0x7F, count_D * sizeof(float)));
+    return d;
+  }
+};
+
+/// Gathers rows: dst[i, :] = src[idx[i], :] (row-major, ld = cols).
+template <typename T>
+__global__ void GatherRows_kernel(T const *src, int const *idx, int rows, int cols, T *dst) {
+  for (size_t e = blockIdx.x * size_t(blockDim.x) + threadIdx.x; e < size_t(rows) * cols;
+       e += size_t(gridDim.x) * blockDim.x) {
+    size_t i = e / cols, j = e % cols;
+    dst[e] = src[size_t(idx[i]) * cols + j];
+  }
+}
+
+/// Counts elements of D rows that are NOT scatter targets whose bits differ from the sentinel.
+__global__ void UntouchedRows_kernel(float const *D, unsigned char const *is_target, int D_rows,
+                                     int N, unsigned long long *bad) {
+  unsigned long long nb = 0;
+  for (size_t e = blockIdx.x * size_t(blockDim.x) + threadIdx.x; e < size_t(D_rows) * N;
+       e += size_t(gridDim.x) * blockDim.x) {
+    if (!is_target[e / N] && __float_as_uint(D[e]) != 0x7F7F7F7Fu) ++nb;
+  }
+  for (int o = 16; o > 0; o >>= 1) nb += __shfl_down_sync(0xffffffffu, nb, o);
+  if ((threadIdx.x & 31) == 0 && nb) atomicAdd(bad, nb);
+}
+
+/// Golden output rows (FP64): G[i, :] = alpha * A[gather_A[i], :] * B + beta * C[gather_C[i], :].
+struct Golden {
+  double *G = nullptr;
+  float *Ds = nullptr;              // dense M x N staging buffer for gathered output rows
+  unsigned char *is_target = nullptr;
+  unsigned long long *bad = nullptr;
+  Golden(Problem const &p, float alpha, float beta) {
+    __half *Ag;
+    float *Cg;
+    CUDA_CHECK(cudaMalloc(&Ag, size_t(p.M) * p.K * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&Cg, size_t(p.M) * p.N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&G, size_t(p.M) * p.N * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&Ds, size_t(p.M) * p.N * sizeof(float)));
+    GatherRows_kernel<<<4096, 256>>>(p.dA, p.dGA, p.M, p.K, Ag);
+    GatherRows_kernel<<<4096, 256>>>(p.dC, p.dGC, p.M, p.N, Cg);
+    kh_golden_gemm<double>(p.M, p.N, p.K, alpha, Ag, p.K, 1, p.dB, p.ldb, 1, beta, Cg, p.N, 1, G);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaFree(Ag);
+    cudaFree(Cg);
+    std::vector<unsigned char> mask(p.D_rows, 0);
+    for (int r : p.scatter_D) mask[r] = 1;
+    CUDA_CHECK(cudaMalloc(&is_target, p.D_rows));
+    CUDA_CHECK(cudaMemcpy(is_target, mask.data(), p.D_rows, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&bad, sizeof(unsigned long long)));
+  }
+  ~Golden() { cudaFree(G); cudaFree(Ds); cudaFree(is_target); cudaFree(bad); }
+
+  /// Checks every element of D: the M scattered rows against the golden, and every other row
+  /// for the untouched sentinel.
+  bool Check(Problem const &p, float const *D, char const *who, double tol_max, double tol_fro) {
+    GatherRows_kernel<<<4096, 256>>>(D, p.dSD, p.M, p.N, Ds);
+    KhResult r = kh_check(Ds, p.N, 1, G, p.M, p.N, tol_max, tol_fro);
+    CUDA_CHECK(cudaMemset(bad, 0, sizeof(unsigned long long)));
+    UntouchedRows_kernel<<<4096, 256>>>(D, is_target, p.D_rows, p.N, bad);
+    unsigned long long nbad = 0;
+    CUDA_CHECK(cudaMemcpy(&nbad, bad, sizeof(nbad), cudaMemcpyDeviceToHost));
+    kh_print(who, r, tol_max, tol_fro);
+    std::printf("  %s: elements written outside the scatter_D rows = %llu\n", who, nbad);
+    if (!r.pass || nbad) {
+      std::cerr << who << " incorrect vs FP64 golden: max|err|/rms = " << r.max_err_rel
+                << ", rel_fro_err = " << r.fro_rel << ", non-finite = " << r.nonfinite
+                << ", elements over tolerance = " << r.nbad
+                << ", elements written outside scatter_D rows = " << nbad << std::endl;
+      return false;
+    }
+    return true;
+  }
+};
+
+// FP32-accumulated FP16 products, FP32 output: tolerances relative to the RMS of the exact
+// (FP64) result, scaled with sqrt(K) like FP32 accumulation error (tensor-core FP32
+// accumulation of the reference stays >= 3.7x below both). Lower-precision paths (FP16
+// accumulation or output rounding, FP8/INT8 operands) exceed the Frobenius bound by >= 10x.
+static double TolMax(int K) { return 2e-6 * std::sqrt(double(K)); }
+static double TolFro(int K) { return 3e-7 * std::sqrt(double(K)); }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Test correctness
-cudaError_t TestCorrectness(int M, int N, int K, int A_rows, float alpha, float beta) {
-  int lda = K, ldb = N, ldc = N, ldd = N;
+cudaError_t TestCorrectness(int M, int N, int K, int A_rows, int top_k, float alpha, float beta) {
+  Problem p(M, N, K, A_rows, top_k);
+  Golden g(p, alpha, beta);
+  double const tol_max = TolMax(K), tol_fro = TolFro(K);
 
-  // Create gather/scatter indices
-  std::vector<int> gather_A(M), gather_C(M), scatter_D(M);
-  for (int i = 0; i < M; ++i) {
-    gather_A[i] = (i * 2) % A_rows;
-    gather_C[i] = i;
-    scatter_D[i] = i;
-  }
-
-  int count_A = A_rows * K, count_B = K * N, count_C = M * N, count_D = M * N;
-
-  std::vector<float> fA(count_A), fB(count_B), fC(count_C, 0), fD_naive(count_D, 0);
-  for (int i = 0; i < count_A; ++i) fA[i] = float((i * 16807 % 16) - 8) * 0.01f;
-  for (int i = 0; i < count_B; ++i) fB[i] = float((i * 48271 % 16) - 8) * 0.01f;
-
-  // Convert through half to match what the GPU kernel sees
-  std::vector<float> fA_h(count_A), fB_h(count_B);
-  for (int i = 0; i < count_A; ++i) fA_h[i] = __half2float(__float2half(fA[i]));
-  for (int i = 0; i < count_B; ++i) fB_h[i] = __half2float(__float2half(fB[i]));
-
-  // Naive reference on host (using half-converted data)
-  CutlassGatherScatterGemmHost(M, N, K, alpha, fA_h, lda, gather_A, fB_h, ldb,
-    beta, fC, ldc, gather_C, fD_naive, ldd, scatter_D);
-
-  // Allocate device memory
-  std::vector<__half> hA(count_A), hB(count_B);
-  for (int i = 0; i < count_A; ++i) hA[i] = __float2half(fA[i]);
-  for (int i = 0; i < count_B; ++i) hB[i] = __float2half(fB[i]);
-
-  __half *dA, *dB; float *dC, *dD_ref; int *dGA, *dGC, *dSD;
-  CUDA_CHECK(cudaMalloc(&dA, count_A * sizeof(__half)));
-  CUDA_CHECK(cudaMalloc(&dB, count_B * sizeof(__half)));
-  CUDA_CHECK(cudaMalloc(&dC, count_C * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&dD_ref, count_D * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&dGA, M * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&dGC, M * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&dSD, M * sizeof(int)));
-
-  CUDA_CHECK(cudaMemcpy(dA, hA.data(), count_A * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dB, hB.data(), count_B * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemset(dC, 0, count_C * sizeof(float)));
-  CUDA_CHECK(cudaMemset(dD_ref, 0, count_D * sizeof(float)));
-  CUDA_CHECK(cudaMemcpy(dGA, gather_A.data(), M * sizeof(int), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dGC, gather_C.data(), M * sizeof(int), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dSD, scatter_D.data(), M * sizeof(int), cudaMemcpyHostToDevice));
-
-  // Run reference (host-based computation stored on device)
-  cudaError_t result = CutlassGatherScatterGemmRef(M, N, K, alpha,
-    dA, lda, dGA, dB, ldb, beta, dC, ldc, dGC, dD_ref, ldd, dSD, A_rows);
+  float *dD_ref = p.AllocD();
+  cudaError_t result = CutlassGatherScatterGemm(M, N, K, alpha, p.dA, p.lda, p.dGA, p.dB, p.ldb,
+    beta, p.dC, p.ldc, dD_ref, p.ldd, p.dSD);
+  if (result == cudaSuccess) result = cudaDeviceSynchronize();
   if (result != cudaSuccess) {
-    std::cerr << "Reference gather-scatter GEMM failed." << std::endl;
-    cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dD_ref);
-    cudaFree(dGA); cudaFree(dGC); cudaFree(dSD);
+    std::cerr << "CUTLASS gather-scatter GEMM failed: " << cudaGetErrorString(result) << std::endl;
+    cudaFree(dD_ref);
     return result;
   }
-
-  // Verify reference vs naive (should be identical since both compute in float on host)
-  std::vector<float> h_D_ref(count_D);
-  CUDA_CHECK(cudaMemcpy(h_D_ref.data(), dD_ref, count_D * sizeof(float), cudaMemcpyDeviceToHost));
-
-  float max_diff = 0;
-  for (int i = 0; i < count_D; ++i)
-    max_diff = fmaxf(max_diff, fabsf(h_D_ref[i] - fD_naive[i]));
-  if (max_diff > 1e-3f) {
-    std::cerr << "Reference incorrect vs naive. Max diff: " << max_diff << std::endl;
-    cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dD_ref);
-    cudaFree(dGA); cudaFree(dGC); cudaFree(dSD);
-    return cudaErrorUnknown;
-  }
+  bool ok = g.Check(p, dD_ref, "reference", tol_max, tol_fro);
+  cudaFree(dD_ref);
+  if (!ok) return cudaErrorUnknown;
 
 #ifdef KH_TEST_SOLUTION
-  // Allocate and run solution
-  float *dD_solution;
-  CUDA_CHECK(cudaMalloc(&dD_solution, count_D * sizeof(float)));
-  CUDA_CHECK(cudaMemset(dD_solution, 0, count_D * sizeof(float)));
-
-  result = GatherScatterGemm(M, N, K, alpha, dA, lda, dGA, dB, ldb,
-    beta, dC, ldc, dGC, dD_solution, ldd, dSD);
+  float *dD_solution = p.AllocD();
+  result = GatherScatterGemm(M, N, K, alpha, p.dA, p.lda, p.dGA, p.dB, p.ldb,
+    beta, p.dC, p.ldc, p.dGC, dD_solution, p.ldd, p.dSD);
+  cudaError_t sync = cudaDeviceSynchronize();
+  if (result == cudaSuccess) result = sync;
   if (result != cudaSuccess) {
     std::cerr << "Solution kernel failed: " << cudaGetErrorString(result) << std::endl;
-    cudaFree(dD_solution); cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dD_ref);
-    cudaFree(dGA); cudaFree(dGC); cudaFree(dSD);
+    cudaFree(dD_solution);
     return result;
   }
-  cudaDeviceSynchronize();
-
-  // Verify solution vs reference
-  std::vector<float> h_D_solution(count_D);
-  CUDA_CHECK(cudaMemcpy(h_D_solution.data(), dD_solution, count_D * sizeof(float), cudaMemcpyDeviceToHost));
-
-  float sol_max_diff = 0;
-  for (int i = 0; i < count_D; ++i)
-    sol_max_diff = fmaxf(sol_max_diff, fabsf(h_D_solution[i] - h_D_ref[i]));
-  if (sol_max_diff > 1.0f) {
-    std::cerr << "Solution incorrect. Max diff vs reference: " << sol_max_diff << std::endl;
-    cudaFree(dD_solution); cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dD_ref);
-    cudaFree(dGA); cudaFree(dGC); cudaFree(dSD);
-    return cudaErrorUnknown;
-  }
-
+  ok = g.Check(p, dD_solution, "solution ", tol_max, tol_fro);
   cudaFree(dD_solution);
+  if (!ok) return cudaErrorUnknown;
 #endif
 
-  cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dD_ref);
-  cudaFree(dGA); cudaFree(dGC); cudaFree(dSD);
   return cudaSuccess;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Profile reference (and solution if KH_TEST_SOLUTION) with CUDA events.
-void Profile(int M, int N, int K, int A_rows, float alpha, float beta, int iterations) {
-  int lda = K, ldb = N, ldc = N, ldd = N;
-
-  std::vector<int> gather_A(M), gather_C(M), scatter_D(M);
-  for (int i = 0; i < M; ++i) {
-    gather_A[i] = (i * 2) % A_rows;
-    gather_C[i] = i;
-    scatter_D[i] = i;
-  }
-
-  int count_A = A_rows * K, count_B = K * N, count_C = M * N, count_D = M * N;
-
-  std::vector<float> fA(count_A), fB(count_B);
-  for (int i = 0; i < count_A; ++i) fA[i] = float((i * 16807 % 16) - 8) * 0.01f;
-  for (int i = 0; i < count_B; ++i) fB[i] = float((i * 48271 % 16) - 8) * 0.01f;
-
-  std::vector<__half> hA(count_A), hB(count_B);
-  for (int i = 0; i < count_A; ++i) hA[i] = __float2half(fA[i]);
-  for (int i = 0; i < count_B; ++i) hB[i] = __float2half(fB[i]);
-
-  __half *dA, *dB; float *dC, *dD; int *dGA, *dGC, *dSD;
-  CUDA_CHECK(cudaMalloc(&dA, count_A * sizeof(__half)));
-  CUDA_CHECK(cudaMalloc(&dB, count_B * sizeof(__half)));
-  CUDA_CHECK(cudaMalloc(&dC, count_C * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&dD, count_D * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&dGA, M * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&dGC, M * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&dSD, M * sizeof(int)));
-
-  CUDA_CHECK(cudaMemcpy(dA, hA.data(), count_A * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dB, hB.data(), count_B * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemset(dC, 0, count_C * sizeof(float)));
-  CUDA_CHECK(cudaMemset(dD, 0, count_D * sizeof(float)));
-  CUDA_CHECK(cudaMemcpy(dGA, gather_A.data(), M * sizeof(int), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dGC, gather_C.data(), M * sizeof(int), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dSD, scatter_D.data(), M * sizeof(int), cudaMemcpyHostToDevice));
+void Profile(int M, int N, int K, int A_rows, int top_k, float alpha, float beta, int iterations) {
+  Problem p(M, N, K, A_rows, top_k);
+  float *dD = p.AllocD();
 
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
@@ -405,17 +635,16 @@ void Profile(int M, int N, int K, int A_rows, float alpha, float beta, int itera
 
   // Warmup reference
   for (int i = 0; i < 3; i++)
-    CutlassGatherScatterGemmRef(M, N, K, alpha, dA, lda, dGA, dB, ldb,
-      beta, dC, ldc, dGC, dD, ldd, dSD, A_rows);
+    CutlassGatherScatterGemm(M, N, K, alpha, p.dA, p.lda, p.dGA, p.dB, p.ldb,
+      beta, p.dC, p.ldc, dD, p.ldd, p.dSD);
   cudaDeviceSynchronize();
 
   // Profile reference
   float ref_total_ms = 0, ref_min_ms = 1e30f;
   for (int iter = 0; iter < iterations; ++iter) {
-    cudaMemset(dD, 0, count_D * sizeof(float));
     cudaEventRecord(start);
-    CutlassGatherScatterGemmRef(M, N, K, alpha, dA, lda, dGA, dB, ldb,
-      beta, dC, ldc, dGC, dD, ldd, dSD, A_rows);
+    CutlassGatherScatterGemm(M, N, K, alpha, p.dA, p.lda, p.dGA, p.dB, p.ldb,
+      beta, p.dC, p.ldc, dD, p.ldd, p.dSD);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     float ms;
@@ -428,19 +657,17 @@ void Profile(int M, int N, int K, int A_rows, float alpha, float beta, int itera
 
 #ifdef KH_TEST_SOLUTION
   // Warmup solution
-  cudaMemset(dD, 0, count_D * sizeof(float));
   for (int i = 0; i < 3; i++)
-    GatherScatterGemm(M, N, K, alpha, dA, lda, dGA, dB, ldb,
-      beta, dC, ldc, dGC, dD, ldd, dSD);
+    GatherScatterGemm(M, N, K, alpha, p.dA, p.lda, p.dGA, p.dB, p.ldb,
+      beta, p.dC, p.ldc, p.dGC, dD, p.ldd, p.dSD);
   cudaDeviceSynchronize();
 
   // Profile solution
   float sol_total_ms = 0, sol_min_ms = 1e30f;
   for (int iter = 0; iter < iterations; ++iter) {
-    cudaMemset(dD, 0, count_D * sizeof(float));
     cudaEventRecord(start);
-    GatherScatterGemm(M, N, K, alpha, dA, lda, dGA, dB, ldb,
-      beta, dC, ldc, dGC, dD, ldd, dSD);
+    GatherScatterGemm(M, N, K, alpha, p.dA, p.lda, p.dGA, p.dB, p.ldb,
+      beta, p.dC, p.ldc, p.dGC, dD, p.ldd, p.dSD);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     float ms;
@@ -455,8 +682,7 @@ void Profile(int M, int N, int K, int A_rows, float alpha, float beta, int itera
 
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
-  cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dD);
-  cudaFree(dGA); cudaFree(dGC); cudaFree(dSD);
+  cudaFree(dD);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -479,7 +705,7 @@ int main(int argc, const char *arg[]) {
 
   struct TestConfig {
     const char* label;
-    int m, n, k, a_rows;
+    int m, n, k, a_rows, top_k;
   };
 
   bool explicit_size = (argc >= 4);
@@ -489,7 +715,7 @@ int main(int argc, const char *arg[]) {
   int iterations = 20;
 
   if (explicit_size) {
-    int M = 248, N = 256, K = 256, A_rows = 512;
+    int M = 1024, N = 1536, K = 2048, A_rows = 16384, top_k = 8;
     std::stringstream ss1(arg[1]); ss1 >> M;
     std::stringstream ss2(arg[2]); ss2 >> N;
     std::stringstream ss3(arg[3]); ss3 >> K;
@@ -497,20 +723,34 @@ int main(int argc, const char *arg[]) {
     if (argc > 5) { std::stringstream ss(arg[5]); ss >> alpha; }
     if (argc > 6) { std::stringstream ss(arg[6]); ss >> beta; }
     if (argc > 7) { std::stringstream ss(arg[7]); ss >> iterations; }
-    configs.push_back({"custom", M, N, K, A_rows});
+    if (argc > 8) { std::stringstream ss(arg[8]); ss >> top_k; }
+    if (M > A_rows || top_k < 1) {
+      std::cerr << "Need M <= A_rows and top_k >= 1." << std::endl;
+      return -1;
+    }
+    configs.push_back({"custom", M, N, K, A_rows, top_k});
   } else {
+    // MoE expert gate+up projection with token dispatch for one expert during a 16K-token
+    // prefill chunk on one GPU: A_rows = 16384 tokens, M = tokens routed to this expert
+    // (~A_rows * top_k / num_experts), K = hidden size, N = per-GPU gate+up width.
     configs = {
-      {"small",   1024, 1024, 1024, 2048},
-      {"medium",  4096, 4096, 4096, 8192},
-      {"large",   8192, 8192, 8192, 16384},
+      // Qwen3-30B-A3B: 128 experts, top-8, expert FFN 768 -> gate+up 1536
+      {"qwen3_30b_a3b",      1024,  1536, 2048, 16384, 8},
+      // DeepSeek-V2-Lite: 64 routed experts, top-6, expert FFN 1408 -> gate+up 2816
+      {"deepseek_v2_lite",   1536,  2816, 2048, 16384, 6},
+      // Mixtral-8x7B with tensor parallel 2: 8 experts, top-2, FFN 14336 / 2 -> gate+up 14336
+      {"mixtral_8x7b_tp2",   4096, 14336, 4096, 16384, 2},
+      // DeepSeek-V3 with expert parallelism (whole experts per GPU): 256 experts, top-8,
+      // expert FFN 2048 -> gate+up 4096
+      {"deepseek_v3_ep",      512,  4096, 7168, 16384, 8},
     };
   }
 
   for (const auto& cfg : configs) {
-    fprintf(stdout, "\n=== %s: M=%d, N=%d, K=%d, A_rows=%d ===\n",
-            cfg.label, cfg.m, cfg.n, cfg.k, cfg.a_rows);
+    fprintf(stdout, "\n=== %s: M=%d, N=%d, K=%d, A_rows=%d, top_k=%d ===\n",
+            cfg.label, cfg.m, cfg.n, cfg.k, cfg.a_rows, cfg.top_k);
 
-    cudaError_t result = TestCorrectness(cfg.m, cfg.n, cfg.k, cfg.a_rows, alpha, beta);
+    cudaError_t result = TestCorrectness(cfg.m, cfg.n, cfg.k, cfg.a_rows, cfg.top_k, alpha, beta);
     if (result != cudaSuccess) {
       std::cout << "Incorrect" << std::endl;
       return -1;
@@ -518,7 +758,7 @@ int main(int argc, const char *arg[]) {
     std::cout << "Passed" << std::endl;
 
     if (iterations > 0) {
-      Profile(cfg.m, cfg.n, cfg.k, cfg.a_rows, alpha, beta, iterations);
+      Profile(cfg.m, cfg.n, cfg.k, cfg.a_rows, cfg.top_k, alpha, beta, iterations);
     }
   }
 

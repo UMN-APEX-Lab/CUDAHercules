@@ -1,12 +1,12 @@
 """
-Task: 1D Complex-to-Complex FFT -- 16384, float32, batch=64
+Task: 1D Complex-to-Complex FFT -- 16384, float32, batch=8192
 
 Source: cuFFT (NVIDIA CUDA Library Samples)
 """
 import torch
 
 N = 16384
-BATCH_SIZE = 64
+BATCH_SIZE = 8192
 
 FUNCTION_SIGNATURE = """\
 void launch_fft_c2c_1d_16384_fp32(
@@ -25,7 +25,7 @@ SCALAR_ARGS = {
     "inverse": 0,
 }
 
-TOLERANCES = {"atol": 1e-3, "rtol": 1e-3}
+TOLERANCES = {"atol": 0.001, "rtol": 0.001}
 
 HAS_CUDA_REFERENCE = True
 REFERENCE_EXTRA_INCLUDES = []
@@ -34,7 +34,7 @@ REFERENCE_EXTRA_LDFLAGS = ["-lcufft"]
 
 
 def get_inputs():
-    x = torch.randn(64, 16384, 2, device="cuda", dtype=torch.float32).contiguous()
+    x = torch.randn(8192, 16384, 2, device="cuda", dtype=torch.float32).contiguous()
     return [("input", x.view(-1))]
 
 
@@ -47,7 +47,7 @@ def get_outputs(inputs):
 def reference_fn(inputs):
     """PyTorch reference for correctness validation."""
     x_flat = inputs[0][1]
-    x = x_flat.view(64, 16384, 2)
+    x = x_flat.view(8192, 16384, 2)
     x_complex = torch.view_as_complex(x)
     y_complex = torch.fft.fft(x_complex)
     y = torch.view_as_real(y_complex)
@@ -55,20 +55,27 @@ def reference_fn(inputs):
 
 
 DESCRIPTION = """\
-Implement a CUDA kernel for 1D Complex-to-Complex FFT (forward transform).
+Implement a batched forward 1D complex-to-complex FFT.
+
+Workload: 8192 independent length-16384 complex signals per call (1 GiB of
+complex64 input), e.g. batched spectral analysis of signal streams.
+
+Unnormalized forward transform of every batch element b:
+  X[b][k] = sum_{n=0}^{N-1} x[b][n] * exp(-2*pi*i*k*n/N),  k = 0 .. N-1
 
 Parameters:
-  input:  [64 * 16384 * 2] float32 -- complex input (interleaved real/imag)
-  output: [64 * 16384 * 2] float32 -- complex output (interleaved real/imag)
-  N:          16384 -- total elements per batch (product of dimensions)
-  batch_size: 64
-  inverse:    0 for forward FFT
+  input:  [8192 * 16384 * 2] float32 -- complex input, interleaved (re, im), transform b at
+          complex offset b*N
+  output: [8192 * 16384 * 2] float32 -- complex output, same layout
+  N:          16384 -- elements per transform (product of the dimensions)
+  batch_size: 8192
+  inverse:    always 0 (forward transform)
 
-Dimensions: 16384
-Data type: float32
+Precision: FP32 (or higher) arithmetic for twiddle factors and butterflies;
+FP16 / BF16 / TF32 or other reduced-precision arithmetic is not allowed.
 
-The forward DFT is defined as:
-  X[k] = sum_{n=0}^{N-1} x[n] * exp(-2*pi*i*k*n/N)
-
-Each batch element is an independent 1D FFT.
+Correctness: on 3 random inputs (real and imaginary parts ~ N(0, 1)),
+every output value must satisfy |out - ref| <= atol + rtol * |ref| against a
+reference FFT, with atol = 0.001, rtol = 0.001 (output components have
+RMS ~ sqrt(N)).
 """

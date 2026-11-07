@@ -30,10 +30,14 @@
  **************************************************************************************************/
 
 // Standard Library includes
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <sstream>
 #include <vector>
-#include <cmath>
 
 // Helper methods to check for errors
 #include "helper.h"
@@ -46,245 +50,406 @@
 #endif
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Define a CUTLASS GEMM template and launch a GEMM kernel.
-cudaError_t CutlassSgemmNN(
-  int M, int N, int K,
-  float alpha,
-  float const *A, int lda,
-  float const *B, int ldb,
-  float beta,
-  float *C, int ldc) {
-
-  using ColumnMajor = cutlass::layout::ColumnMajor;
-
-  using CutlassGemm = cutlass::gemm::device::Gemm<float,        // Data-type of A matrix
-                                                  ColumnMajor,  // Layout of A matrix
-                                                  float,        // Data-type of B matrix
-                                                  ColumnMajor,  // Layout of B matrix
-                                                  float,        // Data-type of C matrix
-                                                  ColumnMajor>; // Layout of C matrix
-
-  CutlassGemm gemm_operator;
-
-  CutlassGemm::Arguments args({M , N, K},  // Gemm Problem dimensions
-                              {A, lda},    // Tensor-ref for source matrix A
-                              {B, ldb},    // Tensor-ref for source matrix B
-                              {C, ldc},    // Tensor-ref for source matrix C
-                              {C, ldc},    // Tensor-ref for destination matrix D
-                              {alpha, beta}); // Scalars used in the Epilogue
-
-  cutlass::Status status = gemm_operator(args);
-
-  if (status != cutlass::Status::kSuccess) {
-    return cudaErrorUnknown;
-  }
-
-  return cudaSuccess;
-}
-
+// Reference: CUTLASS FP32 SIMT SGEMM (column-major A, B, C) with a per-size configuration chosen
+// by an offline sweep on the benchmark GPU (RTX PRO 6000 Blackwell, sm_120).
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Kernel to initialize a matrix with small integers.
-__global__ void InitializeMatrix_kernel(
-  float *matrix, int rows, int columns, int seed = 0) {
+using ColumnMajor = cutlass::layout::ColumnMajor;
 
-  int i = threadIdx.x + blockIdx.x * blockDim.x;
-  int j = threadIdx.y + blockIdx.y * blockDim.y;
+// Config 0: CUTLASS default SGEMM (128x128x8 threadblock, 32x64x8 warp, 2-stage pipeline).
+using CutlassGemmDefault = cutlass::gemm::device::Gemm<float, ColumnMajor, float, ColumnMajor,
+                                                       float, ColumnMajor>;
 
-  if (i < rows && j < columns) {
-    int offset = i + j * rows;
-    int const k = 16807;
-    int const m = 16;
-    float value = float(((offset + seed) * k % m) - m / 2);
-    matrix[offset] = value;
+// Config 1: 128x128x16 threadblock, 64x64x16 warp, 3-stage cp.async pipeline, serial split-K.
+using CutlassGemmSplitK = cutlass::gemm::device::Gemm<
+    float, ColumnMajor, float, ColumnMajor, float, ColumnMajor, float,
+    cutlass::arch::OpClassSimt, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 128, 16>, cutlass::gemm::GemmShape<64, 64, 16>,
+    cutlass::gemm::GemmShape<1, 1, 1>,
+    cutlass::epilogue::thread::LinearCombination<float, 1, float, float>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 3, 1, 1,
+    true /*SplitKSerial*/>;
+
+// Config 2: 128x256x8 threadblock, 64x64x8 warp, 3-stage cp.async pipeline.
+using CutlassGemmWide = cutlass::gemm::device::Gemm<
+    float, ColumnMajor, float, ColumnMajor, float, ColumnMajor, float,
+    cutlass::arch::OpClassSimt, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 256, 8>, cutlass::gemm::GemmShape<64, 64, 8>,
+    cutlass::gemm::GemmShape<1, 1, 1>,
+    cutlass::epilogue::thread::LinearCombination<float, 1, float, float>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 3>;
+
+struct RefPlan { int config; int split_k; };
+
+/// Per-size plan (offline sweep, see task notes); other sizes use a fill-the-GPU heuristic.
+static RefPlan RefPlanFor(int M, int N, int K) {
+  if (M == 128 && N == 10240 && K == 5120)   return {1, 4};   // decode_qkv
+  if (M == 128 && N == 151936 && K == 5120)  return {1, 3};   // decode_lm_head
+  if (M == 16384 && N == 51200 && K == 5120) return {2, 1};   // prefill_mlp_up
+  if (M <= 512) {
+    int sms = 0;
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    long long tiles = (long long)((M + 127) / 128) * ((N + 127) / 128);
+    int split = int(std::min<long long>(8, std::max<long long>(1, (2LL * sms + tiles - 1) / tiles)));
+    split = std::max(1, std::min(split, K / 256));
+    return {1, split};
   }
+  return {0, 1};
 }
 
-/// Simple function to initialize a matrix to arbitrary small integers.
-cudaError_t InitializeMatrix(float *matrix, int rows, int columns, int seed = 0) {
+/// Persistent workspace for the split-K semaphores (allocated once, outside the timed region).
+static void *g_ref_workspace = nullptr;
+static size_t g_ref_workspace_bytes = 0;
 
-  dim3 block(16, 16);
-  dim3 grid(
-    (rows + block.x - 1) / block.x,
-    (columns + block.y - 1) / block.y
-  );
-
-  InitializeMatrix_kernel<<< grid, block >>>(matrix, rows, columns, seed);
-
+template <typename Gemm>
+static cudaError_t RunCutlass(int M, int N, int K, float alpha, float const *A, int lda,
+                              float const *B, int ldb, float beta, float *C, int ldc, int split_k) {
+  typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, ldc}, {C, ldc},
+                                {alpha, beta}, split_k);
+  size_t ws = Gemm::get_workspace_size(args);
+  if (ws > g_ref_workspace_bytes) {
+    if (g_ref_workspace) cudaFree(g_ref_workspace);
+    if (cudaMalloc(&g_ref_workspace, ws) != cudaSuccess) return cudaErrorMemoryAllocation;
+    g_ref_workspace_bytes = ws;
+  }
+  Gemm gemm_op;
+  if (gemm_op.can_implement(args) != cutlass::Status::kSuccess) return cudaErrorInvalidValue;
+  if (gemm_op.initialize(args, g_ref_workspace) != cutlass::Status::kSuccess) return cudaErrorUnknown;
+  if (gemm_op() != cutlass::Status::kSuccess) return cudaErrorUnknown;
   return cudaGetLastError();
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Allocates device memory for a matrix then fills with arbitrary small integers.
-cudaError_t AllocateMatrix(float **matrix, int rows, int columns, int seed = 0) {
-  cudaError_t result;
-
-  size_t sizeof_matrix = sizeof(float) * rows * columns;
-
-  result = cudaMalloc(reinterpret_cast<void **>(matrix), sizeof_matrix);
-  if (result != cudaSuccess) {
-    std::cerr << "Failed to allocate matrix: " << cudaGetErrorString(result) << std::endl;
-    return result;
-  }
-
-  result = cudaMemset(*matrix, 0, sizeof_matrix);
-  if (result != cudaSuccess) {
-    std::cerr << "Failed to clear matrix device memory: " << cudaGetErrorString(result) << std::endl;
-    return result;
-  }
-
-  result = InitializeMatrix(*matrix, rows, columns, seed);
-  if (result != cudaSuccess) {
-    std::cerr << "Failed to initialize matrix: " << cudaGetErrorString(result) << std::endl;
-    return result;
-  }
-
-  return result;
+/// Reference SGEMM: C = alpha * A * B + beta * C, all column-major.
+cudaError_t CutlassSgemmNN(int M, int N, int K, float alpha, float const *A, int lda,
+                           float const *B, int ldb, float beta, float *C, int ldc) {
+  RefPlan p = RefPlanFor(M, N, K);
+  if (p.config == 1)
+    return RunCutlass<CutlassGemmSplitK>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, p.split_k);
+  if (p.config == 2)
+    return RunCutlass<CutlassGemmWide>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, 1);
+  return RunCutlass<CutlassGemmDefault>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, 1);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
+// Verification kit: random full-mantissa inputs, golden GEMM on the device (FP64, or FP32 for
+// 16-bit inputs whose products are exact in FP32), NaN-safe comparison of every output element
+// (max error and relative Frobenius error vs the golden).
+///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Naive reference GEMM computation.
-__global__ void ReferenceGemm_kernel(
-  int M, int N, int K,
-  float alpha,
-  float const *A, int lda,
-  float const *B, int ldb,
-  float beta,
-  float *C, int ldc) {
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
-  int i = threadIdx.x + blockIdx.x * blockDim.x;
-  int j = threadIdx.y + blockIdx.y * blockDim.y;
+#define KH_CHECK(call)                                                                         \
+  do {                                                                                         \
+    cudaError_t kh_err_ = (call);                                                              \
+    if (kh_err_ != cudaSuccess) {                                                              \
+      std::cerr << "CUDA error " << cudaGetErrorString(kh_err_) << " at " << __FILE__ << ":"   \
+                << __LINE__ << std::endl;                                                      \
+      std::exit(2);                                                                            \
+    }                                                                                          \
+  } while (0)
 
-  if (i < M && j < N) {
-    float accumulator = 0;
-    for (int k = 0; k < K; ++k) {
-      accumulator += A[i + k * lda] * B[k + j * ldb];
+__host__ __device__ inline unsigned long long kh_hash64(unsigned long long i, unsigned int seed) {
+  unsigned long long x = i * 0x9E3779B97F4A7C15ull + (seed + 1ull) * 0xD1B54A32D192ED03ull;
+  x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 27; x *= 0x94D049BB133111EBull; x ^= x >> 33;
+  return x;
+}
+
+/// Uniform in [-1, 1): a random 25-bit signed integer times 2^-24. Every value with |v| >= 0.5
+/// carries a full 24-bit significand, so rounding inputs to TF32/BF16/FP16 changes the result.
+__host__ __device__ inline float kh_uniform(unsigned long long i, unsigned int seed) {
+  return float(int(unsigned(kh_hash64(i, seed) >> 32)) >> 7) * (1.0f / 16777216.0f);
+}
+
+__device__ inline double kh_to_double(float x) { return double(x); }
+__device__ inline double kh_to_double(__half x) { return double(__half2float(x)); }
+__device__ inline double kh_to_double(__nv_bfloat16 x) { return double(__bfloat162float(x)); }
+template <typename T> __device__ inline T kh_from_float(float x);
+template <> __device__ inline float kh_from_float<float>(float x) { return x; }
+template <> __device__ inline __half kh_from_float<__half>(float x) { return __float2half_rn(x); }
+template <> __device__ inline __nv_bfloat16 kh_from_float<__nv_bfloat16>(float x) {
+  return __float2bfloat16_rn(x);
+}
+
+/// Random values: uniform in [-scale, scale) rounded to T (a full T significand).
+template <typename T>
+__global__ void kh_fill_kernel(T *p, size_t n, unsigned int seed, float scale) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    p[i] = kh_from_float<T>(kh_uniform(i, seed) * scale);
+}
+
+template <typename T>
+__global__ void kh_fill_value_kernel(T *p, size_t n, float v) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    p[i] = kh_from_float<T>(v);
+}
+
+template <typename T>
+static void kh_fill(T *p, size_t n, unsigned int seed, float scale = 1.0f) {
+  kh_fill_kernel<T><<<4096, 256>>>(p, n, seed, scale);
+  KH_CHECK(cudaGetLastError());
+}
+
+/// Finite poison for outputs that the operation may also read with beta = 0 (0 * poison = 0):
+/// any element the solution leaves unwritten keeps this value and fails the comparison
+/// (65504 = largest finite FP16 value; 3e38 for FP32 outputs).
+static const float kPoison16 = 65504.0f;
+static const float kPoison32 = 3.0e38f;
+
+template <typename T>
+static void kh_fill_value(T *p, size_t n, float v) {
+  kh_fill_value_kernel<T><<<4096, 256>>>(p, n, v);
+  KH_CHECK(cudaGetLastError());
+}
+
+/// Golden GEMM: G(i,j) = alpha * sum_k A(i,k) B(k,j) + beta * C(i,j), G row-major M x N (FP64),
+/// accumulated in Acc (double, or float for 16-bit inputs whose products are exact in FP32).
+/// Element (i,k) of A is A[i*sam + k*sak]; B(k,j) = B[k*sbk + j*sbn]; C(i,j) = C[i*scm + j*scn].
+template <typename Acc, typename TA, typename TB, typename TC>
+__global__ void __launch_bounds__(256) kh_golden_gemm_kernel(
+    int M, int N, int K, double alpha,
+    TA const *A, long long sam, long long sak,
+    TB const *B, long long sbk, long long sbn,
+    double beta, TC const *C, long long scm, long long scn,
+    double *G) {
+  __shared__ Acc As[16][65];
+  __shared__ Acc Bs[16][65];
+  int const tx = threadIdx.x % 16, ty = threadIdx.x / 16;
+  int const m0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+  Acc acc[4][4];
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) acc[r][c] = Acc(0);
+  bool const a_m_fast = (sam == 1);
+  bool const b_n_fast = (sbn == 1);
+  for (int k0 = 0; k0 < K; k0 += 16) {
+    for (int e = threadIdx.x; e < 16 * 64; e += 256) {
+      int kk = a_m_fast ? e / 64 : e % 16;
+      int mm = a_m_fast ? e % 64 : e / 16;
+      int gi = m0 + mm, gk = k0 + kk;
+      As[kk][mm] = (gi < M && gk < K) ? Acc(kh_to_double(A[gi * sam + gk * sak])) : Acc(0);
+      int kb = b_n_fast ? e / 64 : e % 16;
+      int nn = b_n_fast ? e % 64 : e / 16;
+      int gj = n0 + nn, gkb = k0 + kb;
+      Bs[kb][nn] = (gj < N && gkb < K) ? Acc(kh_to_double(B[gkb * sbk + gj * sbn])) : Acc(0);
     }
-    C[i + j * ldc] = alpha * accumulator + beta * C[i + j * ldc];
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < 16; ++kk) {
+      Acc a[4], b[4];
+#pragma unroll
+      for (int r = 0; r < 4; ++r) a[r] = As[kk][ty + 16 * r];
+#pragma unroll
+      for (int c = 0; c < 4; ++c) b[c] = Bs[kk][tx + 16 * c];
+#pragma unroll
+      for (int r = 0; r < 4; ++r)
+#pragma unroll
+        for (int c = 0; c < 4; ++c) acc[r][c] = fma(a[r], b[c], acc[r][c]);
+    }
+    __syncthreads();
+  }
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) {
+      int i = m0 + ty + 16 * r, j = n0 + tx + 16 * c;
+      if (i < M && j < N) {
+        double v = alpha * double(acc[r][c]);
+        if (beta != 0.0) v += beta * kh_to_double(C[i * scm + j * scn]);
+        G[size_t(i) * N + j] = v;
+      }
+    }
+}
+
+template <typename Acc, typename TA, typename TB, typename TC>
+static void kh_golden_gemm(int M, int N, int K, double alpha,
+                           TA const *A, long long sam, long long sak,
+                           TB const *B, long long sbk, long long sbn,
+                           double beta, TC const *C, long long scm, long long scn, double *G) {
+  dim3 grid((N + 63) / 64, (M + 63) / 64);
+  kh_golden_gemm_kernel<Acc, TA, TB, TC><<<grid, 256>>>(M, N, K, alpha, A, sam, sak, B, sbk, sbn,
+                                                       beta, C, scm, scn, G);
+  KH_CHECK(cudaGetLastError());
+}
+
+struct KhStats {
+  double sum_g2, sum_d2;
+  unsigned long long max_d_bits, nonfinite, nbad;
+};
+
+__device__ inline void kh_block_add(double v, double *dst) {
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+  if ((threadIdx.x & 31) == 0) atomicAdd(dst, v);
+}
+
+__global__ void kh_sumsq_kernel(double const *G, size_t n, KhStats *st) {
+  double s = 0.0;
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    s += G[i] * G[i];
+  kh_block_add(s, &st->sum_g2);
+}
+
+/// Compares X(i,j) = X[i*sxm + j*sxn] with G (row-major M x N). Counts non-finite outputs and
+/// elements with !(|x - g| <= tol_abs) (NaN-safe), accumulates sum (x-g)^2 and max |x-g|.
+template <typename TX>
+__global__ void kh_compare_kernel(TX const *X, long long sxm, long long sxn, double const *G,
+                                  int M, int N, double tol_abs, double tol_rel, KhStats *st) {
+  size_t const n = size_t(M) * N;
+  double s = 0.0, mx = 0.0;
+  unsigned long long nf = 0, nb = 0;
+  for (size_t idx = blockIdx.x * size_t(blockDim.x) + threadIdx.x; idx < n;
+       idx += size_t(gridDim.x) * blockDim.x) {
+    long long i = (long long)(idx / N), j = (long long)(idx % N);
+    double x = kh_to_double(X[i * sxm + j * sxn]);
+    double d = fabs(x - G[idx]);
+    if (!isfinite(x)) { ++nf; continue; }
+    if (!(d <= tol_abs + tol_rel * fabs(G[idx]))) ++nb;
+    s += d * d;
+    mx = fmax(mx, d);
+  }
+  kh_block_add(s, &st->sum_d2);
+  for (int o = 16; o > 0; o >>= 1) {
+    mx = fmax(mx, __shfl_down_sync(0xffffffffu, mx, o));
+    nf += __shfl_down_sync(0xffffffffu, nf, o);
+    nb += __shfl_down_sync(0xffffffffu, nb, o);
+  }
+  if ((threadIdx.x & 31) == 0) {
+    atomicMax(&st->max_d_bits, (unsigned long long)__double_as_longlong(mx));
+    atomicAdd(&st->nonfinite, nf);
+    atomicAdd(&st->nbad, nb);
   }
 }
 
-/// Reference GEMM computation.
-cudaError_t ReferenceGemm(
-  int M, int N, int K,
-  float alpha,
-  float const *A, int lda,
-  float const *B, int ldb,
-  float beta,
-  float *C, int ldc) {
+struct KhResult {
+  double rms, max_err_rel, fro_rel;
+  unsigned long long nonfinite, nbad;
+  bool pass;
+};
 
-  dim3 block(16, 16);
-  dim3 grid(
-    (M + block.x - 1) / block.x,
-    (N + block.y - 1) / block.y
-  );
+/// Full check of an M x N output against the golden: every element must be finite and within
+/// tol_max * RMS(golden) (+ tol_rel * |golden|) of the golden, and the relative Frobenius error
+/// must be <= tol_fro.
+template <typename TX>
+static KhResult kh_check(TX const *X, long long sxm, long long sxn, double const *G,
+                         int M, int N, double tol_max, double tol_fro, double tol_rel = 0.0) {
+  KhStats *st;
+  KH_CHECK(cudaMalloc(&st, sizeof(KhStats)));
+  KH_CHECK(cudaMemset(st, 0, sizeof(KhStats)));
+  size_t n = size_t(M) * N;
+  kh_sumsq_kernel<<<2048, 256>>>(G, n, st);
+  KH_CHECK(cudaGetLastError());
+  KhStats h;
+  KH_CHECK(cudaMemcpy(&h, st, sizeof(h), cudaMemcpyDeviceToHost));
+  double rms = std::sqrt(h.sum_g2 / double(n));
+  kh_compare_kernel<TX><<<2048, 256>>>(X, sxm, sxn, G, M, N, tol_max * rms, tol_rel, st);
+  KH_CHECK(cudaGetLastError());
+  KH_CHECK(cudaMemcpy(&h, st, sizeof(h), cudaMemcpyDeviceToHost));
+  KH_CHECK(cudaFree(st));
+  double max_d;
+  std::memcpy(&max_d, &h.max_d_bits, sizeof(max_d));
+  KhResult r;
+  r.rms = rms;
+  r.max_err_rel = rms > 0 ? max_d / rms : INFINITY;
+  r.fro_rel = h.sum_g2 > 0 ? std::sqrt(h.sum_d2 / h.sum_g2) : INFINITY;
+  r.nonfinite = h.nonfinite;
+  r.nbad = h.nbad;
+  r.pass = (rms > 0) && h.nonfinite == 0 && h.nbad == 0 && r.fro_rel <= tol_fro;
+  return r;
+}
 
-  ReferenceGemm_kernel<<< grid, block >>>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-
-  return cudaGetLastError();
+static void kh_print(char const *who, KhResult const &r, double tol_max, double tol_fro) {
+  std::printf("  %s: max|err|/rms = %.3e (tol %.1e), rel_fro_err = %.3e (tol %.1e), "
+              "non-finite = %llu, elements over tol = %llu -> %s\n",
+              who, r.max_err_rel, tol_max, r.fro_rel, tol_fro, r.nonfinite, r.nbad,
+              r.pass ? "ok" : "FAIL");
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Test correctness: CUTLASS reference vs naive, and (if KH_TEST_SOLUTION) solution vs CUTLASS.
-cudaError_t TestCorrectness(int M, int N, int K, float alpha, float beta) {
-  cudaError_t result;
+// FP32 tolerances, relative to the RMS of the exact (FP64) result and scaled with sqrt(K) like
+// FP32 accumulation error. At the benchmark sizes the FP32 reference stays >= 4x below both
+// bounds, while rounding the inputs to TF32 (or BF16/FP16) raises the Frobenius error to
+// >= 4e-4, 20x above the bound: lower-precision arithmetic fails.
+static double TolMax(int K) { return 1.5e-6 * std::sqrt(double(K)); }
+static double TolFro(int K) { return 1.2e-7 * std::sqrt(double(K)); }
 
-  int lda = M;
-  int ldb = K;
-  int ldc = M;
-  size_t sizeof_C = sizeof(float) * ldc * N;
+/// Column-major M x N buffer filled with the initial C: random data when beta != 0, otherwise a
+/// finite poison value (C is not needed when beta == 0, and unwritten elements must fail).
+static void InitC(float *C, size_t count, float beta) {
+  if (beta != 0.0f) kh_fill(C, count, 3u);
+  else kh_fill_value(C, count, kPoison32);
+}
 
-  float *A, *B, *C_cutlass, *C_reference;
+/// Test correctness of the reference and (if KH_TEST_SOLUTION) the solution against an FP64
+/// golden result computed on the device. Every output element is checked.
+cudaError_t TestCorrectness(int M, int N, int K, float alpha, float beta,
+                            bool skip_reference_verification) {
+  int lda = M, ldb = K, ldc = M;
+  size_t count_A = size_t(lda) * K, count_B = size_t(ldb) * N, count_C = size_t(ldc) * N;
+  double const kTolMax = TolMax(K), kTolFro = TolFro(K);
 
-  result = AllocateMatrix(&A, M, K, 0);
-  if (result != cudaSuccess) return result;
+  float *A, *B, *C_ref;
+  double *G;
+  KH_CHECK(cudaMalloc(&A, count_A * sizeof(float)));
+  KH_CHECK(cudaMalloc(&B, count_B * sizeof(float)));
+  KH_CHECK(cudaMalloc(&C_ref, count_C * sizeof(float)));
+  KH_CHECK(cudaMalloc(&G, size_t(M) * N * sizeof(double)));
+  kh_fill(A, count_A, 1u);
+  kh_fill(B, count_B, 2u);
+  InitC(C_ref, count_C, beta);
 
-  result = AllocateMatrix(&B, K, N, 17);
-  if (result != cudaSuccess) { cudaFree(A); return result; }
+  // Golden (FP64 accumulation) from the initial C, before anything overwrites it.
+  kh_golden_gemm<double>(M, N, K, alpha, A, 1, lda, B, 1, ldb, beta, C_ref, 1, ldc, G);
 
-  result = AllocateMatrix(&C_cutlass, M, N, 101);
-  if (result != cudaSuccess) { cudaFree(A); cudaFree(B); return result; }
+  cudaError_t result = cudaSuccess;
+#ifdef KH_TEST_SOLUTION
+  float *C_sol;
+  KH_CHECK(cudaMalloc(&C_sol, count_C * sizeof(float)));
+  KH_CHECK(cudaMemcpy(C_sol, C_ref, count_C * sizeof(float), cudaMemcpyDeviceToDevice));
+#endif
 
-  result = AllocateMatrix(&C_reference, M, N, 101);
-  if (result != cudaSuccess) { cudaFree(A); cudaFree(B); cudaFree(C_cutlass); return result; }
-
-  // Both C matrices start with same values
-  cudaMemcpy(C_reference, C_cutlass, sizeof_C, cudaMemcpyDeviceToDevice);
-
-  // Run CUTLASS reference
-  result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc);
+  // Reference
+  result = CutlassSgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_ref, ldc);
+  if (result == cudaSuccess) result = cudaDeviceSynchronize();
   if (result != cudaSuccess) {
-    std::cerr << "CUTLASS GEMM failed: " << cudaGetErrorString(result) << std::endl;
-    cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(B); cudaFree(A);
-    return result;
-  }
-
-  // Run naive reference
-  result = ReferenceGemm(M, N, K, alpha, A, lda, B, ldb, beta, C_reference, ldc);
-  if (result != cudaSuccess) {
-    std::cerr << "Reference GEMM failed: " << cudaGetErrorString(result) << std::endl;
-    cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(B); cudaFree(A);
-    return result;
-  }
-
-  // Verify CUTLASS vs naive
-  std::vector<float> host_cutlass(ldc * N);
-  std::vector<float> host_reference(ldc * N);
-
-  cudaMemcpy(host_cutlass.data(), C_cutlass, sizeof_C, cudaMemcpyDeviceToHost);
-  cudaMemcpy(host_reference.data(), C_reference, sizeof_C, cudaMemcpyDeviceToHost);
-
-  if (host_cutlass != host_reference) {
-    std::cerr << "CUTLASS reference incorrect vs naive." << std::endl;
-    cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(B); cudaFree(A);
-    return cudaErrorUnknown;
+    std::cerr << "CUTLASS reference GEMM failed: " << cudaGetErrorString(result) << std::endl;
+  } else if (!skip_reference_verification) {
+    KhResult r = kh_check(C_ref, 1, ldc, G, M, N, kTolMax, kTolFro);
+    kh_print("reference", r, kTolMax, kTolFro);
+    if (!r.pass) {
+      std::cerr << "CUTLASS reference incorrect vs FP64 golden." << std::endl;
+      result = cudaErrorUnknown;
+    }
+  } else {
+    std::cout << "Baseline reference verification skipped." << std::endl;
   }
 
 #ifdef KH_TEST_SOLUTION
-  // Allocate solution output (same initial C)
-  float *C_solution;
-  result = AllocateMatrix(&C_solution, M, N, 101);
-  if (result != cudaSuccess) {
-    cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(B); cudaFree(A);
-    return result;
+  if (result == cudaSuccess) {
+    result = SgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_sol, ldc);
+    cudaError_t sync = cudaDeviceSynchronize();
+    if (result == cudaSuccess) result = sync;
+    if (result != cudaSuccess) {
+      std::cerr << "Solution kernel failed: " << cudaGetErrorString(result) << std::endl;
+    } else {
+      KhResult r = kh_check(C_sol, 1, ldc, G, M, N, kTolMax, kTolFro);
+      kh_print("solution ", r, kTolMax, kTolFro);
+      if (!r.pass) {
+        std::cerr << "Solution incorrect vs FP64 golden: max|err|/rms = " << r.max_err_rel
+                  << ", rel_fro_err = " << r.fro_rel << ", non-finite = " << r.nonfinite
+                  << ", elements over tolerance = " << r.nbad << std::endl;
+        result = cudaErrorUnknown;
+      }
+    }
   }
-
-  // Run solution
-  result = SgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C_solution, ldc);
-  if (result != cudaSuccess) {
-    std::cerr << "Solution kernel failed: " << cudaGetErrorString(result) << std::endl;
-    cudaFree(C_solution); cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(B); cudaFree(A);
-    return result;
-  }
-  cudaDeviceSynchronize();
-
-  // Verify solution vs CUTLASS reference
-  std::vector<float> host_solution(ldc * N);
-  cudaMemcpy(host_solution.data(), C_solution, sizeof_C, cudaMemcpyDeviceToHost);
-
-  float max_diff = 0;
-  for (int i = 0; i < ldc * N; ++i) {
-    max_diff = fmaxf(max_diff, fabsf(host_solution[i] - host_cutlass[i]));
-  }
-  if (max_diff > 1e-3f) {
-    std::cerr << "Solution incorrect. Max diff vs reference: " << max_diff << std::endl;
-    cudaFree(C_solution); cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(B); cudaFree(A);
-    return cudaErrorUnknown;
-  }
-
-  cudaFree(C_solution);
+  cudaFree(C_sol);
 #endif
 
-  cudaFree(C_reference);
-  cudaFree(C_cutlass);
+  cudaFree(G);
+  cudaFree(C_ref);
   cudaFree(B);
   cudaFree(A);
-
-  return cudaSuccess;
+  return result;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -292,11 +457,15 @@ cudaError_t TestCorrectness(int M, int N, int K, float alpha, float beta) {
 /// Profile reference (and solution if KH_TEST_SOLUTION) with CUDA events.
 void Profile(int M, int N, int K, float alpha, float beta, int iterations) {
   int lda = M, ldb = K, ldc = M;
+  size_t count_A = size_t(lda) * K, count_B = size_t(ldb) * N, count_C = size_t(ldc) * N;
 
   float *A, *B, *C;
-  AllocateMatrix(&A, M, K, 0);
-  AllocateMatrix(&B, K, N, 17);
-  AllocateMatrix(&C, M, N, 101);
+  KH_CHECK(cudaMalloc(&A, count_A * sizeof(float)));
+  KH_CHECK(cudaMalloc(&B, count_B * sizeof(float)));
+  KH_CHECK(cudaMalloc(&C, count_C * sizeof(float)));
+  kh_fill(A, count_A, 1u);
+  kh_fill(B, count_B, 2u);
+  kh_fill(C, count_C, 3u);
 
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
@@ -325,7 +494,7 @@ void Profile(int M, int N, int K, float alpha, float beta, int iterations) {
 
 #ifdef KH_TEST_SOLUTION
   // Warmup solution
-  InitializeMatrix(C, M, N, 101);
+  kh_fill(C, count_C, 3u);
   for (int i = 0; i < 3; i++) {
     SgemmNN(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
   }
@@ -364,34 +533,50 @@ int main(int argc, const char *arg[]) {
     int m, n, k;
   };
 
-  // Check for explicit size on command line
-  bool explicit_size = (argc >= 4);
-
   std::vector<TestConfig> configs;
   float alpha = 1.0f, beta = 0.0f;
   int iterations = 20;
+  bool skip_reference_verification = false;
+  std::vector<const char*> positional;
+
+  for (int i = 1; i < argc; ++i) {
+    if (!strcmp(arg[i], "--skip-verification") || !strcmp(arg[i], "--no_verif")) {
+      skip_reference_verification = true;
+    } else {
+      positional.push_back(arg[i]);
+    }
+  }
+
+  // Check for explicit size on command line
+  bool explicit_size = (positional.size() >= 3);
 
   if (explicit_size) {
     int M = 128, N = 128, K = 128;
-    std::stringstream(arg[1]) >> M;
-    std::stringstream(arg[2]) >> N;
-    std::stringstream(arg[3]) >> K;
-    if (argc > 4) std::stringstream(arg[4]) >> alpha;
-    if (argc > 5) std::stringstream(arg[5]) >> beta;
-    if (argc > 6) std::stringstream(arg[6]) >> iterations;
+    std::stringstream(positional[0]) >> M;
+    std::stringstream(positional[1]) >> N;
+    std::stringstream(positional[2]) >> K;
+    if (positional.size() > 3) std::stringstream(positional[3]) >> alpha;
+    if (positional.size() > 4) std::stringstream(positional[4]) >> beta;
+    if (positional.size() > 5) std::stringstream(positional[5]) >> iterations;
     configs.push_back({"custom", M, N, K});
   } else {
+    // Qwen3-32B linear layers on one GPU (hidden 5120, 64 q / 8 kv heads x 128 -> fused QKV
+    // 10240, FFN 25600, vocab 151936); M = tokens: 16K-token prefill chunk, 128-sequence decode.
     configs = {
-      {"small",   1024, 1024, 1024},
-      {"medium",  4096, 4096, 4096},
-      {"large",   8192, 8192, 8192},
+      {"decode_qkv",        128,  10240,  5120},   // fused QKV proj, 128 decode tokens
+      {"prefill_qkv",     16384,  10240,  5120},   // fused QKV proj, 16K-token prefill chunk
+      {"prefill_o_proj",  16384,   5120,  8192},   // attention output proj (64 heads x 128)
+      {"prefill_mlp_up",  16384,  51200,  5120},   // fused gate+up proj (2 x 25600)
+      {"prefill_mlp_down",16384,   5120, 25600},   // down proj
+      {"decode_lm_head",    128, 151936,  5120},   // LM head, 128 decode tokens
     };
   }
 
   for (const auto& cfg : configs) {
     fprintf(stdout, "\n=== %s: M=%d, N=%d, K=%d ===\n", cfg.label, cfg.m, cfg.n, cfg.k);
 
-    cudaError_t result = TestCorrectness(cfg.m, cfg.n, cfg.k, alpha, beta);
+    cudaError_t result = TestCorrectness(
+      cfg.m, cfg.n, cfg.k, alpha, beta, skip_reference_verification);
     if (result != cudaSuccess) {
       std::cout << "Incorrect" << std::endl;
       return -1;

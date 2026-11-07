@@ -5,11 +5,25 @@
 Implement a CUDA kernel for fused residual addition + LayerNorm forward pass.
 
   x[i,j] = x0[i,j] + residual[i,j]
-  mu[i] = mean(x[i, :])
-  rs[i] = rsqrt(var(x[i, :]) + eps)
+  mu[i]  = (1/cols) * sum_j x[i, j]
+  var[i] = (1/cols) * sum_j (x[i, j] - mu[i])^2      (biased variance)
+  rs[i]  = 1 / sqrt(var[i] + eps)
   z[i,j] = (x[i,j] - mu[i]) * rs[i] * gamma[j] + beta[j]
 
-Dimensions: rows=16384, cols=1024, eps=1e-05
+Dimensions: rows=16384, cols=1024, eps=1e-05. All tensors are contiguous row-major fp32.
+x0[i, :] and residual[i, :] are s_i * N(0, 1) with a per-row scale s_i = 10^U(-2, 1)
+(so var[i] ranges over ~2e-4 .. 2e2 and eps matters for the small rows); gamma and beta
+are i.i.d. N(0, 1).
+Outputs: z [rows, cols], x [rows, cols], mu [rows], rs [rows].
+
+Precision: all arithmetic must be FP32 (or higher). FP16/BF16/FP8 arithmetic or
+storing intermediates in a lower precision is not allowed.
+
+Correctness: z, x, mu and rs are compared element-wise with a reference
+implementation over 3 random input sets:
+  |out - ref| <= atol + rtol * |ref|,  atol = 1e-05, rtol = 1e-05
+NaN/Inf fail, and every output element must be written (output buffers are
+pre-filled with NaN).
 
 
 ## Function Signature

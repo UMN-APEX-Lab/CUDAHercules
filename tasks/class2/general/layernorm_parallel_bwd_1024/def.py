@@ -29,7 +29,7 @@ void launch_layernorm_parallel_bwd(
 
 SCALAR_ARGS = {"rows": ROWS, "cols": COLS}
 
-TOLERANCES = {"atol": 1e-3, "rtol": 1e-3}
+TOLERANCES = {"atol": 0.003, "rtol": 0.0001}  # mirrored in task.yaml correctness.tolerances
 
 HAS_CUDA_REFERENCE = True
 REFERENCE_EXTRA_INCLUDES = ["reference_sources/layer_norm"]
@@ -47,10 +47,11 @@ def get_inputs():
 
 
 def get_outputs(inputs):
-    dx0 = torch.empty(ROWS, COLS, device='cuda', dtype=torch.float32)
-    dresidual = torch.empty(ROWS, COLS, device='cuda', dtype=torch.float32)
-    dgamma = torch.empty(COLS, device='cuda', dtype=torch.float32)
-    dbeta = torch.empty(COLS, device='cuda', dtype=torch.float32)
+    # NaN-poisoned so that elements the kernel does not write fail the comparison.
+    dx0 = torch.full((ROWS, COLS), float('nan'), device='cuda', dtype=torch.float32)
+    dresidual = torch.full((ROWS, COLS), float('nan'), device='cuda', dtype=torch.float32)
+    dgamma = torch.full((COLS,), float('nan'), device='cuda', dtype=torch.float32)
+    dbeta = torch.full((COLS,), float('nan'), device='cuda', dtype=torch.float32)
     return [("dx0", dx0), ("dresidual", dresidual), ("dgamma", dgamma), ("dbeta", dbeta)]
 
 
@@ -82,14 +83,29 @@ def reference_fn(inputs):
 DESCRIPTION = """\
 Implement a CUDA kernel for the backward pass of fused residual + LayerNorm.
 
-Given upstream gradient dz, saved x (= x0 + residual), mean mu, reciprocal std rs, gamma:
-
-  x_hat = (x - mu) * rs
-  dgamma = sum_rows(dz * x_hat)
-  dbeta = sum_rows(dz)
-  dx = rs * (dz*gamma - (ds*x_hat + db) / cols)
+Given upstream gradient dz [rows, cols], saved x = x0 + residual [rows, cols], saved mean
+mu [rows], saved reciprocal std rs [rows] (rs = 1/sqrt(var + 1e-5), biased variance) and
+weight gamma [cols]:
+  x_hat[i,j]    = (x[i,j] - mu[i]) * rs[i]
+  dz_gamma[i,j] = dz[i,j] * gamma[j]
+  ds[i] = sum_j(dz_gamma[i,j] * x_hat[i,j])
+  db[i] = sum_j(dz_gamma[i,j])
+  dx[i,j] = rs[i] * (dz_gamma[i,j] - (ds[i] * x_hat[i,j] + db[i]) / cols)
   dx0 = dx
-  dresidual = dx  (gradient flows through both branches)
+  dresidual = dx      (the gradient flows to both branches; write both outputs)
+  dgamma[j] = sum_i(dz[i,j] * x_hat[i,j])
+  dbeta[j]  = sum_i(dz[i,j])
 
-Dimensions: rows=%d, cols=%d
+Dimensions: rows=%d, cols=%d. All tensors are contiguous row-major fp32.
+x0, residual, gamma and dz are i.i.d. standard normal; mu and rs are the statistics of x.
+Outputs: dx0 [rows, cols], dresidual [rows, cols], dgamma [cols], dbeta [cols].
+
+Precision: all arithmetic must be FP32 (or higher). FP16/BF16/FP8 arithmetic or
+storing intermediates in a lower precision is not allowed.
+
+Correctness: dx0, dresidual, dgamma and dbeta are compared element-wise with a reference
+implementation over 3 random input sets:
+  |out - ref| <= atol + rtol * |ref|,  atol = 0.003, rtol = 0.0001
+NaN/Inf fail, and every output element must be written (output buffers are
+pre-filled with NaN).
 """ % (ROWS, COLS)

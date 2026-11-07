@@ -31,6 +31,10 @@ Where:
 
 All matrices are `double` (FP64).
 
+The computation must be carried out in FP64: lower-precision paths (FP32, TF32, FP16, BF16,
+FP8, INT8 arithmetic or tensor cores, or rounding the inputs to a lower precision) are not
+allowed, even if they happen to pass the tolerance.
+
 ## Memory Layout
 
 All matrices are **column-major**:
@@ -43,12 +47,18 @@ All matrices are **column-major**:
 ```bash
 make test                    # requires solution.h in task directory
 ./test                       # default: runs small/medium/large sizes
-./test 1024 1024             # custom single size: M N
-./test 1024 1024 1.0 20     # M N alpha iterations
+./test 4096 4096             # custom single size: M N
+./test 4096 4096 1.1 20     # M N alpha iterations
 ```
 
-Correctness is verified against a reference implementation at multiple problem sizes
+Default run: alpha = 1.1, lda = ldb = ldc = M, at three problem sizes
 (small: M=N=1024, medium: M=N=4096, large: M=4096 N=8192).
+The lower triangle of A and all of B hold pseudo-random FP64 values in [-1, 1)
+(full 52-bit mantissa); the upper triangle of A is zero. C is output-only: every element
+must be written (its initial contents are undefined).
+
+Correctness is verified against a reference implementation at every size: each element
+must satisfy |C - C_ref| <= 1e-10 * max|C_ref| (NaN/Inf fail).
 Performance is timed for both reference and your solution at each size.
 
 CUTLASS headers are available on the include path.

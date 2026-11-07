@@ -2,26 +2,37 @@
 
 ## Description
 
-Implement a CUDA kernel for the forward pass of Flash Attention using split-KV parallelism.
+Implement the attention forward pass for one decode step over a long KV cache.
 
-Split-KV approach: split the K/V sequence into num_splits chunks, compute partial
-softmax results independently per chunk, then combine using log-sum-exp correction.
+Workload: one batched decode step of a grouped-query-attention LLM
+(Qwen3-32B: 64 query heads, 8 KV heads) on one GPU, for 16 sequences with a
+6144-token KV cache each. The 8 query heads that share a KV head are packed
+into the query-row dimension, so each (b, h) is one KV head with Sq = 8 query rows.
+This task uses head dimension D = 64.
 
-  S = Q @ K^T * scale
-  O = softmax(S) @ V
-  lse[i] = log(sum(exp(S[i][:])))
+For every batch index b and head h (query rows i, key/value rows j):
+  S[i][j]    = scale * dot(Q[b,h,i,:], K[b,h,j,:])
+  O[b,h,i,:] = sum_j softmax_j(S[i][:]) * V[b,h,j,:]
+  lse[b,h,i] = log(sum_j exp(S[i][j]))      (natural logarithm)
 
-Inputs (all bf16, contiguous, [B, H, S, D] layout):
-  Q: [4, 8, 256, 64]
-  K: [4, 8, 256, 64]
-  V: [4, 8, 256, 64]
-  num_splits: 4
+Inputs (bf16, contiguous, [B, H, S, D] layout):
+  Q: [16, 8, 8, 64]
+  K: [16, 8, 6144, 64]
+  V: [16, 8, 6144, 64]
+  scale = 1/sqrt(D) = 0.125000
+  num_splits = 4: passed by the caller; O and lse must equal attention over the
+    full key sequence however the work is partitioned.
 
 Outputs:
-  O:   [B, H, Sq, D] bf16 — attention output
-  lse: [B, H, Sq] fp32 — log-sum-exp per query row
+  O:   [16, 8, 8, 64] bf16
+  lse: [16, 8, 8] fp32
 
-scale = 1/sqrt(D) = 0.125000
+Precision: dot products, softmax statistics and the P*V sums must be accumulated
+in FP32 (or higher); O is rounded to bf16 once, at the end.
+
+Correctness: on 3 random input sets (Q, K, V ~ N(0, 1)), O and lse are each
+compared element-wise with a reference: |out - ref| <= atol + rtol * |ref|,
+atol = 0.001, rtol = 0.01.
 
 
 ## Function Signature

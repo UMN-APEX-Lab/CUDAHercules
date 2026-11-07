@@ -1,6 +1,7 @@
 # Task: 28_ampere_3xtf32_fast_accurate_tensorop_fprop
 
-Conv2D Forward Propagation using 3xTF32 for FP32 accuracy with TensorCore performance. NHWC layout, float32 input/output.
+Conv2D forward propagation with FP32 input/filter/output at FP32 accuracy, NHWC layout
+(FP32-accurate results with tensor-core performance, e.g. via 3xTF32).
 
 ## Function Signature
 
@@ -22,13 +23,21 @@ output[n][p][q][k] = sum_{r,s,c} input[n][h][w][c] * filter[k][r][s][c]
 
 Where:
 - h = p * stride_h + r - pad_h
-- w = q * stride_w + s - pad_w
+- w = q * stride_w + s - pad_w   (zero padding: out-of-bounds positions contribute 0)
 - P = (H + 2*pad_h - R) / stride_h + 1
 - Q = (W + 2*pad_w - S) / stride_w + 1
 
-## Data Types
+Every output element must be written (the output buffer is not zero-initialized).
+
+## Data Types and Precision
 
 All tensors are `float` (FP32).
+
+The result must be computed to FP32 accuracy: FP32 arithmetic, or a split-precision scheme that
+reproduces FP32-accurate products such as 3xTF32 (big/small TF32 parts, three tensor-core
+products), with FP32 accumulation. Lower-precision arithmetic is not allowed even if it passes the
+tolerance: no single-pass TF32 (operands rounded or truncated to TF32), no 2xTF32, and no FP16,
+BF16, FP8 or INT8 operands.
 
 ## Memory Layout
 
@@ -37,15 +46,37 @@ All tensors are **NHWC** (channels-last):
 - filter: Element (k,r,s,c) at `filter[((k*R + r)*S + s)*C + c]`
 - output: Element (n,p,q,k) at `output[((n*P + p)*Q + q)*K + k]`
 
+## Problem Sizes
+
+All 3x3 filters with pad = 1:
+- resnet50_conv2_b256:      N=256, H=W=56,  C=K=64,   stride 1 (ResNet-50 stage-2 3x3 conv, training batch 256)
+- resnet50_conv3_down_b256: N=256, H=W=56,  C=K=128,  stride 2 (ResNet-50 stage-3 downsampling 3x3 conv, output 28x28)
+- resnet50_conv4_b256:      N=256, H=W=14,  C=K=256,  stride 1 (ResNet-50 stage-4 3x3 conv)
+- sdxl_unet_128:            N=4,   H=W=128, C=K=320,  stride 1 (SDXL UNet at 1024x1024: 128x128 latents,
+                                                             batch 4 = 2 images x classifier-free guidance)
+- sdxl_unet_64:             N=4,   H=W=64,  C=K=640,  stride 1 (SDXL UNet, 64x64 level)
+- sdxl_unet_32:             N=4,   H=W=32,  C=K=1280, stride 1 (SDXL UNet, 32x32 level)
+
+## Correctness
+
+Inputs are random values using the full 24-bit FP32 mantissa (uniform in [-1, 1)). Every output
+element is compared with an FP64 result computed from the same FP32 inputs and must satisfy
+
+  |output - expected| <= 2e-6 * sum_{c,r,s} |input * filter|
+
+NaN/Inf fail; the output buffer is filled with NaN before each call. Every timed call is verified
+as well.
+
 ## Build & Test
 
 ```bash
 make test                    # requires solution.h in task directory
-./test                       # default: runs small/medium/large sizes
+./test                       # default: runs all benchmark sizes
+./test 1 56 56 64 64 3 3     # custom single size: N H W C K R S (pad R/2, stride 1)
+./test 1 56 56 64 64 3 3 20  # custom with iteration count
 ```
 
-Correctness is verified against a CUTLASS reference implementation at multiple problem sizes
-(small: N=1 H=W=56 C=K=64, medium: N=1 H=W=112 C=K=128, large: N=4 H=W=56 C=K=256).
-Performance is timed for both reference and your solution at each size.
+Performance is timed for both the reference and your solution at each size; the task score is the
+geometric mean of the per-size speedups.
 
 CUTLASS headers are available on the include path.

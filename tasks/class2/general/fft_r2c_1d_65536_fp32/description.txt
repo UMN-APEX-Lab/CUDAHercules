@@ -2,22 +2,28 @@
 
 ## Description
 
-Implement a CUDA kernel for 1D Real-to-Complex FFT (forward transform).
+Implement a batched forward 1D real-to-complex FFT.
+
+Workload: 4096 independent real length-65536 signals per call (1 GiB of float32
+input), e.g. spectra of batched audio or sensor streams.
+
+Unnormalized forward transform of every batch element b:
+  X[b][k] = sum_{n=0}^{N-1} x[b][n] * exp(-2*pi*i*k*n/N),  k = 0 .. N/2 (the non-redundant half)
 
 Parameters:
-  input:  [16 * 65536] float32 -- real input (flat)
-  output: [16 * 32769 * 2] float32 -- complex output (interleaved real/imag)
-  N:          65536 -- total elements per batch (product of dimensions)
-  batch_size: 16
-  inverse:    0 for forward FFT
+  input:  [4096 * 65536] float32 -- real input, signal b at offset b*N
+  output: [4096 * 32769 * 2] float32 -- complex output X[b][0..N/2], interleaved (re, im)
+  N:          65536 -- elements per transform (product of the dimensions)
+  batch_size: 4096
+  inverse:    always 0 (forward transform)
 
-Dimensions: 65536
-Data type: float32
+Precision: FP32 (or higher) arithmetic for twiddle factors and butterflies;
+FP16 / BF16 / TF32 or other reduced-precision arithmetic is not allowed.
 
-The forward DFT is defined as:
-  X[k] = sum_{n=0}^{N-1} x[n] * exp(-2*pi*i*k*n/N)
-
-Each batch element is an independent 1D FFT.
+Correctness: on 3 random inputs (every input value ~ N(0, 1)),
+every output value must satisfy |out - ref| <= atol + rtol * |ref| against a
+reference FFT, with atol = 0.002, rtol = 0.001 (output components have
+RMS ~ sqrt(N)).
 
 
 ## Function Signature

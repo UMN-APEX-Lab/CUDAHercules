@@ -44,7 +44,7 @@ SCALAR_ARGS = {
     "scale": SCALE,
 }
 
-TOLERANCES = {"atol": 5e-2, "rtol": 5e-2}
+TOLERANCES = {"atol": 0.025, "rtol": 0.05}  # mirrored in task.yaml correctness.tolerances
 
 HAS_CUDA_REFERENCE = True
 REFERENCE_EXTRA_INCLUDES = [
@@ -62,12 +62,20 @@ def get_inputs():
     V = torch.randn(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM,
                      device='cuda', dtype=torch.bfloat16)
 
-    attn_w = torch.matmul(Q.float(), K.float().transpose(-2, -1)) * SCALE
+    # Forward O and lse in FP32, a few heads at a time: the full [B, H, S, S] score
+    # tensor would need B*H*S*S*4 bytes (64-128 GB for the hdim32/64 shapes).
+    O = torch.empty_like(Q)
+    lse = torch.empty(BATCH_SIZE, NUM_HEADS, SEQ_LEN, device=Q.device, dtype=torch.float32)
     causal_mask = torch.triu(torch.ones(SEQ_LEN, SEQ_LEN, device=Q.device, dtype=torch.bool), diagonal=1)
-    attn_w.masked_fill_(causal_mask, float('-inf'))
-    lse = torch.logsumexp(attn_w, dim=-1).float()
-    P = torch.softmax(attn_w, dim=-1)
-    O = torch.matmul(P, V.float()).to(torch.bfloat16)
+    for b in range(BATCH_SIZE):
+        for h0 in range(0, NUM_HEADS, 4):
+            h1 = min(h0 + 4, NUM_HEADS)
+            attn_w = torch.matmul(Q[b, h0:h1].float(), K[b, h0:h1].float().transpose(-2, -1)) * SCALE
+            attn_w.masked_fill_(causal_mask, float('-inf'))
+            lse[b, h0:h1] = torch.logsumexp(attn_w, dim=-1)
+            P = torch.softmax(attn_w, dim=-1)
+            O[b, h0:h1] = torch.matmul(P, V[b, h0:h1].float()).to(torch.bfloat16)
+            del attn_w, P
     dO = torch.randn_like(O)
 
     return [("dO", dO), ("Q", Q), ("K", K), ("V", V), ("O", O), ("lse", lse)]
@@ -77,9 +85,10 @@ def get_outputs(inputs):
     Q = inputs[1][1]
     K = inputs[2][1]
     B, H, S, D = Q.shape
-    dQ = torch.empty_like(Q)
-    dK = torch.empty_like(K)
-    dV = torch.empty_like(K)
+    # NaN-poisoned so that elements the kernel does not write fail the comparison.
+    dQ = torch.full_like(Q, float('nan'))
+    dK = torch.full_like(K, float('nan'))
+    dV = torch.full_like(K, float('nan'))
     return [("dQ", dQ), ("dK", dK), ("dV", dV)]
 
 
@@ -115,31 +124,41 @@ def reference_fn(inputs):
 
 
 DESCRIPTION = """\
-Implement CUDA kernels for the Flash Attention backward pass with causal masking.
+Implement CUDA kernels for the backward pass of exact softmax attention with causal masking.
+The full S x S attention matrix must not be materialized in global memory.
 
-Given upstream gradient dO and saved forward tensors (Q, K, V, O, lse), compute:
-  dQ, dK, dV — gradients w.r.t. Q, K, V
+Forward pass being differentiated (per batch b and head h; Sq = Sk = S):
+  S = Q @ K^T * scale
+  Causal mask: S[i][j] = -inf (P[i][j] = 0) for j > i   (query row i attends keys 0..i)
+  P = exp(S - lse[:, None])        (= softmax(S) along the key axis)
+  O = P @ V
 
-Algorithm (tiled, avoids materializing full attention matrix):
-  1. Preprocessing: dsoftmax_sum[b,h,i] = sum_d(dO[b,h,i,d] * O[b,h,i,d])
-  2. For each K/V tile:
-     For each Q tile:
-       S = Q_tile @ K_tile^T * scale
-       P = exp(S - lse)
-       dV += P^T @ dO_tile
-       dP = dO_tile @ V_tile^T
-       dS = P * (dP - dsoftmax_sum)
-       dQ += dS @ K_tile * scale
-       dK += dS^T @ Q_tile * scale
+Given the upstream gradient dO, compute (per batch b and head h):
+  Dsum[i] = sum_d dO[i, d] * O[i, d]
+  dV = P^T @ dO
+  dP = dO @ V^T
+  dS = P * (dP - Dsum[:, None])
+  dQ = dS @ K * scale
+  dK = dS^T @ Q * scale
 
-Inputs (all bf16, contiguous [B, H, S, D]):
-  dO: [%d, %d, %d, %d], Q/K/V/O: same shape
-  lse: [%d, %d, %d] fp32
+Inputs (contiguous row-major [B, H, S, D] layout, D fastest):
+  Q, K, V, dO: [%d, %d, %d, %d] bf16, i.i.d. standard normal rounded to bf16
+  O:   same shape, bf16 — forward output (computed in FP32 from Q, K, V, rounded to bf16)
+  lse: [%d, %d, %d] fp32 — natural-log log-sum-exp of each row of S (from the forward pass)
 
-Outputs (bf16): dQ, dK, dV same shape as Q, K, V
+Outputs (bf16): dQ, dK, dV with the same shapes as Q, K, V.
 
 scale = 1/sqrt(D) = %f
-Causal: position i can only attend to positions j <= i.
+
+Precision: matrix products must use bf16 (or higher-precision) operands with FP32
+accumulation; Dsum and the softmax recomputation must be done in FP32. Quantizing any
+operand to FP8, INT8 or any lower precision is not allowed.
+
+Correctness: dQ, dK and dV are compared element-wise with a reference
+implementation over 3 random input sets:
+  |out - ref| <= atol + rtol * |ref|,  atol = 0.025, rtol = 0.05
+NaN/Inf fail, and every output element must be written (output buffers are
+pre-filled with NaN).
 """ % (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM,
        BATCH_SIZE, NUM_HEADS, SEQ_LEN,
        SCALE)

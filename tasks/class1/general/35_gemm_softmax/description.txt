@@ -33,17 +33,23 @@ For each batch b = 0 .. batch_count-1:
   1. GEMM:     D[m,n] = alpha * sum_k(A[m,k] * B[k,n]) + beta * C[m,n]
   2. Softmax:  Softmax[m,n] = exp(D[m,n] - max_n(D[m,:])) / sum_n(exp(D[m,n'] - max_n(D[m,:])))
 
-Row-wise softmax: each row m is independently normalized across columns n=0..N-1.
+Row-wise softmax: each row m is independently normalized across columns n=0..N-1. Both D and
+Softmax are outputs.
 
-## Data Types
+## Data Types and Precision
 
-All matrices are `__half` (FP16). Use FP32 accumulation for numerical stability.
+All matrices are `__half` (FP16); alpha and beta are `float`. The GEMM must accumulate in FP32
+and the softmax must be computed in FP32 arithmetic (from the FP32 or the FP16-rounded logits).
+Lower-precision arithmetic (FP16 accumulation, BF16, FP8, INT8 or narrower formats) is not
+allowed, even if it passes the tolerance.
 
 ## Memory Layouts
 
 - A: **row-major**, shape [M, K].  Element (m,k) at `A[m * lda + k]`.  lda >= K.
 - B: **column-major**, shape [K, N].  Element (k,n) at `B[k + n * ldb]`.  ldb >= K.
 - C, D, Softmax: **row-major**, shape [M, N].  Element (m,n) at `X[m * ldx + n]`.  ldx >= N.
+
+The test uses packed matrices (lda = ldb = K, ldc = ldd = lds = N).
 
 ## Batching
 
@@ -52,17 +58,39 @@ All matrices are `__half` (FP16). Use FP32 accumulation for numerical stability.
   B_b = B + b * batch_stride_B
   (same for C, D, Softmax with their respective batch strides)
 
+## Problem Sizes
+
+alpha = 1/sqrt(K) at every size; shapes as run on a single 96 GB GPU:
+
+| name              | M     | N      | K    | batch | beta | workload                                                        |
+|-------------------|-------|--------|------|-------|------|-----------------------------------------------------------------|
+| attn_prefill_d64  | 512   | 512    | 64   | 1024  | 1    | BERT-large training attention scores, 64 seqs x 16 heads        |
+| attn_prefill_d128 | 4096  | 4096   | 128  | 64    | 1    | Qwen3-32B attention scores, 64 heads, 4K-token prompt           |
+| attn_prefill_d256 | 8192  | 8192   | 256  | 16    | 1    | Gemma-2-9B attention scores, 16 heads x 256, 8K-token prompt    |
+| attn_decode_gqa   | 8     | 6144   | 128  | 128   | 1    | Qwen3-32B decode scores, 16 seqs x 8 KV heads, 6K context       |
+| lm_head_softmax   | 128   | 262208 | 5376 | 1     | 0    | Gemma-3-27B LM head + softmax over the 262K vocabulary          |
+| moe_router        | 16384 | 128    | 2048 | 1     | 0    | Qwen3-30B-A3B MoE router over 128 experts, 16K-token chunk      |
+
+(beta = 1: C is an additive attention bias/mask.)
+
+## Correctness
+
+Inputs A, B, C are random FP16 values uniform in [-2, 2). Both outputs are compared on every element
+with an FP32 reference (FP32-accumulated GEMM; softmax of the FP32 logits):
+- D:       |D - ref| <= 1e-3 + 2e-3 * |ref|
+- Softmax: |S - ref| <= 1e-6 + 1.5e-2 * |ref|, and every Softmax row must sum to 1 within 1e-3
+Every element must be written and finite. The outputs are checked again after the timed runs.
+
 ## Build & Test
 
 ```bash
 make test                             # requires solution.h in task directory
-./test                                # default: runs small/medium/large sizes
-./test --m=1024 --n=512 --k=256 --batch_count=8   # custom single size
+./test                                # default: runs all problem sizes listed above
+./test --m=1024 --n=512 --k=256 --batch_count=8 [--beta=1]   # custom single size (N, K multiples of 8)
 ./test --iterations=50                # more profiling iterations (default: 20)
 ```
 
-Correctness is verified against a reference implementation at multiple problem sizes
-(small: 128x128x64, medium: 512x512x256, large: 2048x2048x1024).
-Performance is timed for both reference and your solution at each size.
+Performance is timed for both the reference and your solution at each size; the task speedup is
+the geometric mean of the per-size speedups.
 
 CUTLASS headers are available on the include path.

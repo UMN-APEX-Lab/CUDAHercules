@@ -42,7 +42,17 @@ source:
   commit: ''
   license: BSD-3-Clause
 anti_cheat:
+  # Precision floor: FP16 inputs with FP32 accumulation. FP16/BF16 accumulation (FP16-accumulate
+  # MMA, half arithmetic intrinsics) and FP8/FP6/FP4/INT8 operands are
+  # below spec and are not allowed even if they pass tolerance; header includes alone are fine.
   blocked_patterns:
+  - '\.f16\.f16\.f16\.f16\b'
+  - '\b__h(fma|add|sub|mul)2?(_rn|_sat|_relu)?\b'
+  - '\b__nv_fp8\w*|\b__nv_fp6\w*|\b__nv_fp4\w*'
+  - '\bcutlass::(float_e4m3_t|float_e5m2_t|float_e2m1_t|float_e3m2_t|float_e2m3_t)\b'
+  - '\.e[2-5]m[1-3](x2)?\b'
+  - '\.[su](4|8)\.[su](4|8)\b'
+  - '\b__dp4a\b'
   required_patterns:
   - __global__\s+void
   - <<<.*>>>

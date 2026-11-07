@@ -1,6 +1,6 @@
 # Task: 41_fused_multi_head_attention
 
-Fused Multi-Head Attention on half-precision (FP16) data.
+Fused Multi-Head Attention forward pass on half-precision (FP16) data.
 
 ## Operation
 
@@ -29,9 +29,12 @@ cudaError_t fmha_solution(
     bool causal);
 ```
 
-## Data Types
+## Data Types and Precision
 
-All input/output matrices are `__half` (FP16). Use FP32 accumulation for numerical stability.
+Q, K, V and O are `__half` (FP16). The products Q.K^T and P.V must be accumulated in FP32 and the
+softmax must be computed in FP32 (P may be rounded to FP16 as an operand of P.V). Lower-precision
+arithmetic (FP16 accumulation, BF16, FP8, INT8 or narrower formats) is not allowed, even if it
+passes the tolerance.
 
 ## Memory Layout (BMHK format)
 
@@ -43,7 +46,7 @@ Element access with strides:
 - V[b, m, h, k] at `V[b * v_strideB + m * v_strideM + h * v_strideH + k]`
 - O[b, m, h, k] at `O[b * (seq_q * o_strideM) + m * o_strideM + h * head_dim_v + k]`
 
-Typical stride values:
+Stride values used by the test:
 - `q_strideH = head_dim`, `q_strideM = num_heads * head_dim`, `q_strideB = seq_q * q_strideM`
 - Same pattern for K and V.
 - `o_strideM = num_heads * head_dim_v`
@@ -56,23 +59,43 @@ Equivalently, set S[i,j] = -infinity for j > i before softmax.
 ## Dimensions
 
 - `batch_size`: number of independent sequences
-- `seq_q`: query sequence length
-- `seq_kv`: key/value sequence length (usually equals seq_q)
-- `num_heads`: number of attention heads
-- `head_dim`: dimension of Q and K per head
-- `head_dim_v`: dimension of V and O per head (usually equals head_dim)
+- `seq_q`, `seq_kv`: query / key-value sequence length (equal in all tests)
+- `num_heads`: number of attention heads (K and V have one head per query head)
+- `head_dim`, `head_dim_v`: per-head dimension of Q/K and of V/O (equal in all tests: 64 or 128)
+
+## Problem Sizes
+
+Every call of the test uses one of these sizes (seq_q = seq_kv, head_dim_v = head_dim), taken from
+models that run on a single 96 GB GPU:
+
+| name                   | batch | seq    | heads | head_dim | causal | model                                     |
+|------------------------|-------|--------|-------|----------|--------|-------------------------------------------|
+| bert_large_train       | 64    | 512    | 16    | 64       | no     | BERT-large encoder, training batch        |
+| vit_l14                | 64    | 257    | 16    | 64       | no     | ViT-L/14 at 224 px (256 patches + CLS)    |
+| qwen3_32b_prefill_16k  | 1     | 16384  | 64    | 128      | yes    | Qwen3-32B prefill of a 16K-token prompt   |
+| gemma3_27b_prefill_32k | 1     | 32768  | 32    | 128      | yes    | Gemma-3-27B prefill of a 32K-token prompt |
+
+(For the grouped-query-attention models the K/V heads are given expanded to one per query head.)
+
+## Correctness
+
+Inputs are random FP16 values (Q and K uniform in [-3, 3), giving attention logits with a standard
+deviation of about 3; V uniform in [-1, 1)). Every element of O is compared with an FP32 reference
+(Q.K^T, softmax and P.V all in FP32):
+- per element: |O - ref| <= 1e-3 + 5e-3 * |ref|
+- whole output: rms(O - ref) <= 7e-4 * rms(ref)
+Every element of O must be written and finite. The output is checked again after the timed runs.
 
 ## Build & Test
 
 ```bash
 make test                             # requires solution.h in task directory
-./test                                # default: runs small/medium/large sizes
-./test --batch_size=4 --seq_length=256 --head_number=8 --head_size=64  # custom
+./test                                # runs all sizes listed above
+./test --batch_size=4 --seq_length=256 --head_number=8 --head_size=64 [--causal=true]  # custom (head_size 64 or 128)
 ./test --iterations=50                # more profiling iterations (default: 20)
 ```
 
-Correctness is verified against a reference implementation at multiple problem sizes
-(small: batch=4 seq=128, medium: batch=16 seq=512, large: batch=4 seq=2048).
-Performance is timed for both reference and your solution at each size.
+Performance is timed for both the reference and your solution at each size; the task speedup is
+the geometric mean of the per-size speedups.
 
 CUTLASS headers are available on the include path.

@@ -34,6 +34,7 @@
 #include <sstream>
 #include <vector>
 #include <cmath>
+#include <cstring>
 
 // Helper methods to check for errors
 #include "helper.h"
@@ -119,6 +120,16 @@ cudaError_t CutlassSsyrkNN(
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Kernel to initialize a matrix with small integers.
+/// Pseudo-random double in [-1, 1) from (offset, seed) with 52 random mantissa bits.
+/// Full-mantissa FP64 data: FP32 (or lower-precision) arithmetic cannot reproduce the result.
+__host__ __device__ inline double kh_rand_double(unsigned long long offset, unsigned long long seed) {
+  unsigned long long x = offset * 0x9E3779B97F4A7C15ull + (seed + 1ull) * 0xBF58476D1CE4E5B9ull;
+  x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull;
+  x ^= x >> 27; x *= 0x94D049BB133111EBull;
+  x ^= x >> 31;
+  return double(x >> 11) * 0x1.0p-52 - 1.0;
+}
+
 __global__ void InitializeMatrix_kernel(
   double *matrix,
   int ldm,
@@ -130,17 +141,12 @@ __global__ void InitializeMatrix_kernel(
   int j = threadIdx.y + blockIdx.y * blockDim.y;
 
   if (i < rows && j < columns) {
-    int offset = i + j * ldm;
-
-    int const k = 16807;
-    int const m = 16;
-    double value = double(((offset + seed) * k % m) - m / 2);
-
-    matrix[offset] = value;
+    size_t offset = size_t(i) + size_t(j) * ldm;
+    matrix[offset] = kh_rand_double(offset, (unsigned long long)seed);
   }
 }
 
-/// Simple function to initialize a matrix to arbitrary small integers.
+/// Simple function to initialize a matrix with full-mantissa pseudo-random values in [-1, 1).
 cudaError_t InitializeMatrix(double *matrix, int ldm, int rows, int columns, int seed = 0) {
 
   dim3 block(16, 16);
@@ -156,7 +162,7 @@ cudaError_t InitializeMatrix(double *matrix, int ldm, int rows, int columns, int
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Allocates device memory for a matrix then fills with arbitrary small integers.
+/// Allocates device memory for a matrix then fills it with pseudo-random values in [-1, 1).
 cudaError_t AllocateMatrix(double **matrix, int ldm, int rows, int columns, int seed = 0) {
   cudaError_t result;
 
@@ -240,6 +246,40 @@ cudaError_t ReferenceSyrk(
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
+/// FP64 accuracy requirement: every lower-triangle element must satisfy
+///   |x - ref| <= kFp64RelTol * max|ref|   (NaN/Inf always fail).
+/// Two correct FP64 implementations (any summation order) agree to ~1e-14 of max|ref| at
+/// these sizes; FP32 arithmetic or FP32-rounded inputs give ~1e-7, so they fail.
+static const double kFp64RelTol = 1e-10;
+
+/// Returns the max lower-triangle error relative to max|ref| (inf if any element is NaN/Inf
+/// or the strict upper triangle of `x` differs from `upper_expected`).
+static double SyrkRelError(std::vector<double> const &x, std::vector<double> const &ref,
+                           std::vector<double> const &upper_expected, int N, int ldc,
+                           bool *upper_ok) {
+  double ref_scale = 0;
+  for (int jj = 0; jj < N; ++jj)
+    for (int ii = jj; ii < N; ++ii)
+      ref_scale = std::fmax(ref_scale, std::fabs(ref[ii + jj * ldc]));
+  if (ref_scale == 0) ref_scale = 1;
+  double max_rel = 0;
+  bool bad = false;
+  *upper_ok = true;
+  for (int jj = 0; jj < N; ++jj) {
+    for (int ii = 0; ii < jj; ++ii) {   // strict upper triangle must be left unchanged
+      double a = x[ii + jj * ldc], b = upper_expected[ii + jj * ldc];
+      if (std::memcmp(&a, &b, sizeof(double)) != 0) *upper_ok = false;
+    }
+    for (int ii = jj; ii < N; ++ii) {
+      double rel = std::fabs(x[ii + jj * ldc] - ref[ii + jj * ldc]) / ref_scale;
+      if (!(rel <= kFp64RelTol)) bad = true;   // also catches NaN/Inf
+      if (!std::isfinite(rel)) rel = INFINITY;
+      if (rel > max_rel) max_rel = rel;
+    }
+  }
+  return bad ? std::fmax(max_rel, 2 * kFp64RelTol) : max_rel;
+}
+
 /// Test correctness: CUTLASS reference vs naive, and (if KH_TEST_SOLUTION) solution vs CUTLASS.
 cudaError_t TestCorrectness(int N, int K, double alpha, double beta) {
   cudaError_t result;
@@ -281,20 +321,32 @@ cudaError_t TestCorrectness(int N, int K, double alpha, double beta) {
 
   cudaDeviceSynchronize();
 
-  // Verify CUTLASS vs naive (lower triangle only)
-  std::vector<double> host_cutlass(ldc * N);
-  std::vector<double> host_reference(ldc * N);
+  // Verify CUTLASS vs naive (lower triangle within FP64 tolerance, upper triangle untouched)
+  std::vector<double> host_cutlass(size_t(ldc) * N);
+  std::vector<double> host_reference(size_t(ldc) * N);
+  std::vector<double> host_c_init(size_t(ldc) * N);
 
   cudaMemcpy(host_cutlass.data(), C_cutlass, sizeof_C, cudaMemcpyDeviceToHost);
   cudaMemcpy(host_reference.data(), C_reference, sizeof_C, cudaMemcpyDeviceToHost);
+  {
+    double *C_init;
+    result = AllocateMatrix(&C_init, ldc, N, N, 101);
+    if (result != cudaSuccess) { cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(A); return result; }
+    cudaMemcpy(host_c_init.data(), C_init, sizeof_C, cudaMemcpyDeviceToHost);
+    cudaFree(C_init);
+  }
 
-  for (int jj = 0; jj < N; ++jj)
-    for (int ii = jj; ii < N; ++ii)
-      if (host_cutlass[ii + jj * ldc] != host_reference[ii + jj * ldc]) {
-        std::cerr << "CUTLASS reference incorrect vs naive at (" << ii << "," << jj << ")" << std::endl;
-        cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(A);
-        return cudaErrorUnknown;
-      }
+  {
+    bool upper_ok = true;
+    double rel = SyrkRelError(host_cutlass, host_reference, host_c_init, N, ldc, &upper_ok);
+    if (!(rel <= kFp64RelTol) || !upper_ok) {
+      std::cerr << "CUTLASS reference incorrect vs naive (rel err " << rel
+                << (upper_ok ? "" : ", upper triangle modified") << ")" << std::endl;
+      cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(A);
+      return cudaErrorUnknown;
+    }
+    std::cout << "Reference vs naive FP64 rel err: " << rel << std::endl;
+  }
 
 #ifdef KH_TEST_SOLUTION
   // Allocate solution output (same initial C)
@@ -314,18 +366,17 @@ cudaError_t TestCorrectness(int N, int K, double alpha, double beta) {
   }
   cudaDeviceSynchronize();
 
-  // Verify solution vs CUTLASS reference (lower triangle only)
-  std::vector<double> host_solution(ldc * N);
+  // Verify solution vs CUTLASS reference: lower triangle within FP64 tolerance (NaN/Inf fail),
+  // strict upper triangle must be unchanged.
+  std::vector<double> host_solution(size_t(ldc) * N);
   cudaMemcpy(host_solution.data(), C_solution, sizeof_C, cudaMemcpyDeviceToHost);
 
-  double max_diff = 0;
-  for (int jj = 0; jj < N; ++jj)
-    for (int ii = jj; ii < N; ++ii) {
-      double diff = fabs(host_solution[ii + jj * ldc] - host_cutlass[ii + jj * ldc]);
-      if (diff > max_diff) max_diff = diff;
-    }
-  if (max_diff > 1e-3) {
-    std::cerr << "Solution incorrect. Max diff vs reference: " << max_diff << std::endl;
+  bool upper_ok = true;
+  double sol_rel = SyrkRelError(host_solution, host_cutlass, host_c_init, N, ldc, &upper_ok);
+  std::cout << "Solution vs reference FP64 rel err: " << sol_rel << " (tolerance " << kFp64RelTol << ")" << std::endl;
+  if (!(sol_rel <= kFp64RelTol) || !upper_ok) {
+    std::cerr << "Solution incorrect. Max error vs reference (relative to max|ref|): " << sol_rel
+              << (upper_ok ? "" : "; strict upper triangle of C was modified") << std::endl;
     cudaFree(C_solution); cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(A);
     return cudaErrorUnknown;
   }
@@ -441,7 +492,8 @@ int main(int argc, const char *arg[]) {
   bool explicit_size = (argc >= 3);
 
   std::vector<TestConfig> configs;
-  double alpha = 1.0, beta = 0.0;
+  // Non-trivial alpha/beta so the alpha*A*A^T + beta*C epilogue is exercised.
+  double alpha = 1.1, beta = -0.7;
   int iterations = 20;
 
   if (explicit_size) {

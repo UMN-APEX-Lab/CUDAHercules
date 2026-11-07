@@ -28,9 +28,11 @@ Where:
 - B is K x N
 - C is M x N
 
-## Data Types
+## Data Types and Precision
 
-All matrices are `float` (FP32).
+All matrices are `float` (FP32). The product must be computed at FP32 precision (FP32
+multiplies and FP32 accumulation); lower-precision arithmetic (TF32, BF16, FP16, FP8 or INT8,
+including tensor-core paths that use them) is not allowed even if it passes the tolerance.
 
 ## Memory Layout
 
@@ -43,13 +45,38 @@ All matrices are **column-major**:
 
 ```bash
 make test                    # requires solution.h in task directory
-./test                       # default: runs small/medium/large sizes
-./test 1024 1024 1024        # custom single size: M N K
-./test 1024 1024 1024 1.0 0.0 20  # M N K alpha beta iterations
+./test                       # default: runs all benchmark sizes below
+./test 16384 10240 5120      # custom single size: M N K
+./test 16384 10240 5120 1.0 0.0 20  # M N K alpha beta iterations
 ```
 
-Correctness is verified against a reference implementation at multiple problem sizes
-(small: 1024x1024x1024, medium: 4096x4096x4096, large: 8192x8192x8192).
-Performance is timed for both reference and your solution at each size.
+## Problem Sizes
+
+The linear layers of Qwen3-32B served on one GPU (hidden 5120, 64 query / 8 KV heads of
+dimension 128, FFN 25600, vocabulary 151936); M = tokens, either a 16K-token prefill chunk or
+one decode step of 128 concurrent sequences:
+
+| label            | M     | N      | K     | layer                                  |
+|------------------|-------|--------|-------|----------------------------------------|
+| decode_qkv       | 128   | 10240  | 5120  | fused QKV projection, decode           |
+| prefill_qkv      | 16384 | 10240  | 5120  | fused QKV projection, prefill          |
+| prefill_o_proj   | 16384 | 5120   | 8192  | attention output projection, prefill   |
+| prefill_mlp_up   | 16384 | 51200  | 5120  | fused gate+up projection, prefill      |
+| prefill_mlp_down | 16384 | 5120   | 25600 | down projection, prefill               |
+| decode_lm_head   | 128   | 151936 | 5120  | LM head, decode                        |
+
+alpha = 1, beta = 0, lda = M, ldb = K, ldc = M. With beta = 0 the initial contents of C are
+arbitrary finite values that must not affect the result.
+
+## Correctness
+
+Inputs are random FP32 values in [-1, 1) that use the full 24-bit significand. Every element of
+C is compared with the exact (FP64-accumulated) result:
+- every element must be finite and satisfy |C - exact| <= 1.5e-6 * sqrt(K) * RMS(exact);
+- the relative Frobenius error ||C - exact|| / ||exact|| must be <= 1.2e-7 * sqrt(K).
+Elements that are not written fail the check.
+
+Performance is timed for both the reference and your solution at each size; the task score is
+the geometric mean of the per-size speedups.
 
 CUTLASS headers are available on the include path.

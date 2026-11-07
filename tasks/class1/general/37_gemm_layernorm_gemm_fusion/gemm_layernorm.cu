@@ -30,59 +30,38 @@
  **************************************************************************************************/
 
 /*! \file
-    \brief CUTLASS Layernorm Example.
+    \brief GEMM -> LayerNorm -> GEMM (FP16 data, FP32 accumulation) benchmark harness.
 
-    This workload provides a layer normalization example using a one-pass, square-sum-based
-    variance calculation. Specifically, we fuse the reduction operation to find 
-    local mean and local square sum mean in the epilogue of 1st GEMM. After a light 
-    full reduction kernel, the mean / variance values are readily calculated for element-wise
-    operations which are fused into the 2nd GEMM.
+    Column-major formulation of CUTLASS example 37 (transformer block: hidden size H, T tokens):
+      C0   = alpha * A0 B0            A0: H x H (row-major), B0: H x T (column-major)
+      Norm = LayerNorm over H of every column of C0 (eps 1e-6), scaled by gamma and shifted by beta
+      C1   = alpha * A1 Norm          A1: 4H x H (column-major), C1: 4H x T (column-major)
 
-    As stated in https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Computing_shifted_data,
-    the square-sum based one-pass implementation may raise concerns on numerical stability issues. 
-    That being said, though this fully fused layernorm example almost perfectly hides all the memory cost to 
-    access the intermediate matrix for layernorm computation, the numerical issue might hinder a persuasive 
-    usage in real-world scenarios. If that is the case, a user may turn to the stand-alone CUTLASS layernorm
-    example in tools/util/include/cutlass/util/device_layernorm.h
+    The reference is CUTLASS GemmLayernorm (gemm_with_layernorm.h: LayerNorm statistics fused into
+    the epilogue of the first GEMM and the normalization fused into the mainloop of the second) with
+    FP32 accumulation and a per-shape tile configuration. The candidate (solution.h,
+    -DKH_TEST_SOLUTION) implements gemm_layernorm_gemm_solution(). Both are verified against a golden
+    result: FP32-accumulated GEMMs on the device, LayerNorm statistics in FP64 on the host.
 
-    Examples:
-
-      # Run a CUTLASS layernorm example with default setup , 
-      # using the language of the transformer model as an example,
-      (Column Major output matrix, hidden dimension = 768, valid word number = 4096, intermediate_scale = 4)
-      $ ./examples/37_gemm_layernorm_gemm_fusion/37_gemm_layernorm_gemm_fusion
-
-      # Run an attention example with hidden dimension = 512
-      $ ./examples/37_gemm_layernorm_gemm_fusion/37_gemm_layernorm_gemm_fusion --hidden_dim=512
-
+    Usage:
+      ./test                                          # all problem sizes
+      ./test --hidden_dim=1024 --valid_word_num=4096  # custom size (hidden_dim multiple of 128, valid_word_num multiple of 8)
+      ./test --iterations=50                          # profiling iterations (0 disables)
 */
 
+#include <cfloat>
+#include <climits>
+#include <cstdint>
+#include <cstdlib>
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <iostream>
-#include <vector>
 #include <limits>
+#include <vector>
 
 #include "cutlass/cutlass.h"
-#include "cutlass/arch/memory.h"
-#include "cutlass/arch/memory_sm75.h"
-#include "cutlass/gemm/device/gemm_complex.h"
-#include "cutlass/epilogue/thread/scale_type.h"
-
-#include "cutlass/util/command_line.h"
-#include "cutlass/util/host_tensor.h"
-#include "cutlass/util/reference/device/gemm.h"
-#include "cutlass/util/reference/host/gemm_complex.h"
-#include "cutlass/util/reference/host/tensor_reduce.h"
-#include "cutlass/util/reference/host/tensor_compare.h"
-#include "cutlass/util/reference/host/tensor_norm.h"
-#include "cutlass/util/reference/host/tensor_copy.h"
-#include "cutlass/util/reference/host/tensor_fill.h"
-#include "cutlass/util/reference/host/error_metrics.h"
-#include "cutlass/util/tensor_view_io.h"
-#include "cutlass/fast_math.h"
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-#include "gemm_with_layernorm.h"
+#include "cutlass/numeric_types.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -92,938 +71,361 @@
 #endif
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
+// Reference and golden-reference headers (included after the solution on purpose)
 
-enum class Disposition {
-  kPassed,
-  kIncorrect,
-  kNotVerified
-};
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Command line options parsing
-template<typename LayoutOutput_>
-struct Options {
-
-  using LayoutOutput = LayoutOutput_;
-
-  static bool const kIsColumnMajorOutput = cutlass::platform::is_same<LayoutOutput, cutlass::layout::ColumnMajor>::value;
-
-  bool help;
-  cutlass::gemm::GemmCoord problem_size0;
-  cutlass::gemm::GemmCoord problem_size1;
-  int hidden_dim;
-  int valid_word_num;
-  int intermediate_scale;
-  int iterations;
-  unsigned seed;
-  float alpha;
-  float beta;
-  bool verification_enabled;
-  double tolerance;
-
-  Options():
-    help(false),
-    iterations(20),
-    seed(2022),
-    hidden_dim(768),
-    valid_word_num(4096),
-    intermediate_scale(4),
-    alpha(1),
-    beta(0),
-    verification_enabled(true),
-    tolerance(0.01),
-    problem_size1(problem_size0.m() * 4, problem_size0.n(), problem_size0.m())
-  { }
-
-  bool valid() {
-
-    return true;
-  }
-
-  // Parses the command line
-  void parse(int argc, char const **args) {
-    cutlass::CommandLine cmd(argc, args);
-
-    if (cmd.check_cmd_line_flag("help")) {
-      help = true;
-    }
-
-    cmd.get_cmd_line_argument("hidden_dim", hidden_dim, 768);
-    cmd.get_cmd_line_argument("valid_word_num", valid_word_num, 4096);
-    cmd.get_cmd_line_argument("iterations", iterations);
-    cmd.get_cmd_line_argument("verify", verification_enabled);
-    cmd.get_cmd_line_argument("seed", seed);
-    cmd.get_cmd_line_argument("tolerance", tolerance);
-
-    if (kIsColumnMajorOutput) {
-      // column major output setup
-      problem_size0.m() = hidden_dim;
-      problem_size0.n() = valid_word_num;
-      problem_size0.k() = hidden_dim;
-
-      problem_size1.m() = hidden_dim * intermediate_scale;
-      problem_size1.n() = valid_word_num;
-      problem_size1.k() = hidden_dim;
-    }else{
-      // row major output setup
-      problem_size0.m() = valid_word_num;
-      problem_size0.n() = hidden_dim;
-      problem_size0.k() = hidden_dim;
-
-      problem_size1.m() = valid_word_num;
-      problem_size1.n() = hidden_dim * intermediate_scale;
-      problem_size1.k() = hidden_dim;
-    }
-
-  }
-
-  /// Prints the usage statement.
-  std::ostream & print_usage(std::ostream &out) const {
-
-    out << "37_gemm_layernorm_gemm_fusion example\n\n"
-      << "  This example uses the CUTLASS Library to compute GEMM + Layernorm for arbitrary problem sizes.\n\n"
-      << "Options:\n\n"
-      << "  --help                      If specified, displays this usage statement.\n\n"
-      << "  --hidden_dim=<int>          Hidden dimension\n"
-      << "  --valid_word_num=<int>      Valid word number\n"
-      << "  --seed=<int>                Random number seed (1*)\n\n"
-      << "  --iterations=<int>          Number of profiling iterations to perform (0 to disable profiling).\n\n"
-      << "  --verify=<bool>             If true, performs reference calculation.\n\n"
-      << "  --tolerance <float>         Error tolerance\n"
-    ;
-
-    out << "\n\nExamples:\n\n"
-      << "$ ./examples/37_gemm_layernorm_gemm_fusion/37_gemm_layernorm_gemm_fusion \\\n"
-      << "     --hidden_dim=768 --valid_word_num=1024 \n\n";
-
-    return out;
-  }
-
-  /// Returns true if the environment and Toolkit support this
-  bool supported(bool verbose = true) const {
-
-    // Ampere Tensor Core operations exposed with mma.sync and ldmatrix are first available
-    // in CUDA 11.0.
-    //
-    // CUTLASS must be compiled with CUDA 11.0 Toolkit to run these examples.
-    if (!(__CUDACC_VER_MAJOR__ >= 11)) {
-      if (verbose) {
-        std::cerr << "Ampere Tensor Core operations must be compiled with CUDA 11.0 Toolkit or later." << std::endl;
-      }
-      return false;
-    }
-
-    cudaDeviceProp props;
-
-    cudaError_t error = cudaGetDeviceProperties(&props, 0);
-    if (error != cudaSuccess) {
-      if (verbose) {
-        std::cerr << "cudaGetDeviceProperties() returned an error: " << cudaGetErrorString(error) << std::endl;
-      }
-      return false;
-    }
-
-    if (!((props.major * 10 + props.minor) >= 80)) {
-      if (verbose) {
-        std::cerr << "Ampere Tensor Core operations must be run on a machine with compute capability at least 80."
-                  << std::endl;
-      }
-      return false;
-    }
-
-    //
-    // CUTLASS attempts to load 128b vectors of cutlass::half_t (F16) elements. Consequently,
-    // all pointers, strides, and tensor extents must be divisible by 8 elements.
-    //
-    int const kAlignment = 8;
-
-    if ((problem_size0.m() % kAlignment) ||
-        (problem_size0.n() % kAlignment) ||
-        (problem_size0.k() % kAlignment)) {
-      if (verbose) {
-        std::cerr << "Misaligned input in 1st GEMM." << std::endl;
-      }
-      // misaligned tensors for Gemm1
-      return false;
-    }
-
-    if ((problem_size1.m() % kAlignment) ||
-        (problem_size1.n() % kAlignment) ||
-        (problem_size1.k() % kAlignment)) {
-      if (verbose) {
-        std::cerr << "Misaligned input in 2nd GEMM." << std::endl;
-      }
-      // misaligned tensors for Gemm2
-      return false;
-    }
-
-    return true;
-  }
-};
+#include "cutlass/arch/memory.h"
+#include "cutlass/arch/memory_sm75.h"
+#include "cutlass/gemm/device/gemm_complex.h"
+#include "cutlass/epilogue/thread/scale_type.h"
+#include "cutlass/util/command_line.h"
+#include "cutlass/util/device_memory.h"
+#include "cutlass/util/reference/device/gemm.h"
+#include "cutlass/util/reference/device/tensor_fill.h"
+#include "cutlass/fast_math.h"
+#include "gemm_with_layernorm.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<
-  typename LayoutOutput_>
-struct Testbed {
+using Element = cutlass::half_t;
+using RowMajor = cutlass::layout::RowMajor;
+using ColumnMajor = cutlass::layout::ColumnMajor;
 
-  //
-  // Type definitions
-  //
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Reference: CUTLASS GemmLayernorm, FP32 accumulation, per-shape tile configuration
+// (offline sweep on RTX PRO 6000 Blackwell)
 
-  // User-defined data types
-  using ElementInputA0 = cutlass::half_t;
-  using ElementInputB0 = cutlass::half_t;
-  using ElementOutput = cutlass::half_t;
-  using ElementCompute = cutlass::half_t;
-
-  using LayoutInputA0 = cutlass::layout::RowMajor;
-  using LayoutInputB0 = cutlass::layout::ColumnMajor;
-  using LayoutOutput = LayoutOutput_;
-
-  static bool const kIsColumnMajorOutput = cutlass::platform::is_same<LayoutOutput, cutlass::layout::ColumnMajor>::value;
-  // turn of shifted K by default
-  static bool const kIsShiftedVariance = false;
-
-  /// Linear scaling operator
-  using EpilogueFunctorOp = cutlass::epilogue::thread::LinearCombination<
-    ElementOutput,
-    128 / cutlass::sizeof_bits<ElementOutput>::value,
-    ElementCompute,
-    ElementCompute
-  >;
-
-  using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 32>;
-  using WarpShape        = cutlass::gemm::GemmShape<64, 64, 32>;
-  using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
-  
-  static int const kStages0  = 3;
-  static int const kStages1  = 4;
-
+template <int TbM, int TbN, int WarpM, int WarpN, int Stages0, int Stages1, int Swizzle>
+struct kh_ref_config {
+  using EpilogueOp = cutlass::epilogue::thread::LinearCombination<Element, 8, float, float>;
   using GemmLayernorm = cutlass::GemmLayernorm<
-    ElementInputA0,
-    LayoutInputA0,
-    ElementInputB0,
-    LayoutInputB0,
-    ElementOutput,
-    LayoutOutput,
-    ElementCompute,
-    EpilogueFunctorOp,
-    ThreadblockShape,
-    WarpShape,
-    InstructionShape,
-    kStages0,
-    kStages1,
-    kIsShiftedVariance
-  >;
-  
-  using ElementInputA1 = typename GemmLayernorm::ElementInputA1;
-  using ElementOutputC1 = typename GemmLayernorm::ElementOutputC1;
-  using ElementInputScaleBias = typename GemmLayernorm::ElementInputScaleBias;
-  using ElementLayernormCompute = typename GemmLayernorm::ElementLayernormCompute;
+    Element, RowMajor,       // A0
+    Element, ColumnMajor,    // B0
+    Element, ColumnMajor,    // C0 / C1
+    float,                   // accumulation and epilogue compute type
+    EpilogueOp,
+    cutlass::gemm::GemmShape<TbM, TbN, 32>,
+    cutlass::gemm::GemmShape<WarpM, WarpN, 32>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    Stages0, Stages1,
+    false,                   // no shifted variance
+    Swizzle>;
+};
 
-  using LayoutInputA1 = typename GemmLayernorm::LayoutInputA1;
-  using LayoutOutputC0 = typename GemmLayernorm::LayoutOutputC0;
-  using LayoutOutputC1 = typename GemmLayernorm::LayoutOutputC1;
-  using LayoutInputScaleBias = typename GemmLayernorm::LayoutInputScaleBias;
+/// Arguments of one reference invocation (column-major output formulation).
+struct kh_ref_problem {
+  int hidden, tokens;
+  float alpha, beta;
+  Element const *A0, *B0, *A1, *gamma, *beta_ln;
+  Element *C0, *C1;
+  Element *variance, *mean;  // partial statistics, (hidden / 64) x tokens elements each
+};
 
-  //
-  // Data members
-  //
-
-  Options<LayoutOutput> const &options;
-
-  cutlass::HostTensor<ElementInputA0, LayoutInputA0>                 tensor_A0;
-  cutlass::HostTensor<ElementInputB0, LayoutInputB0>                 tensor_B0;
-  cutlass::HostTensor<ElementOutput, LayoutOutputC0>                 tensor_C0;
-  cutlass::HostTensor<ElementInputA1, LayoutInputA1>                 tensor_A1;
-  cutlass::HostTensor<ElementOutputC1, LayoutOutputC1>               tensor_C1;
-
-  cutlass::HostTensor<ElementOutput, LayoutOutputC0>                 reference_C0;
-  cutlass::HostTensor<ElementOutputC1, LayoutOutputC1>               reference_C1;
-
-  cutlass::HostTensor<ElementInputScaleBias, LayoutInputScaleBias>   tensor_Variance;
-  cutlass::HostTensor<ElementInputScaleBias, LayoutInputScaleBias>   tensor_Mean;
-  cutlass::HostTensor<ElementInputScaleBias, LayoutInputScaleBias>   tensor_Beta;
-  cutlass::HostTensor<ElementInputScaleBias, LayoutInputScaleBias>   tensor_Gamma;
-
-  cutlass::HostTensor<ElementInputScaleBias, LayoutInputScaleBias>   reference_Mean;
-  cutlass::HostTensor<ElementInputScaleBias, LayoutInputScaleBias>   reference_Variance;
-
-  // shifted K tensor to better ensure the numerical stability
-  // According to https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance
-  // the closer shifted K to the actual mean, the better numerical stability we'll observe
-  cutlass::HostTensor<ElementOutput, LayoutOutputC0>                 tensor_Shifted_K;
-
-#ifdef KH_TEST_SOLUTION
-  cutlass::HostTensor<ElementOutputC1, LayoutOutputC1>              sol_C1;
-#endif
-
-  //
-  // Methods
-  //
-
-  Testbed(
-    Options<LayoutOutput> const &options_
-  ):
-    options(options_)
-  {
-
-    tensor_A0.reset({options.problem_size0.m(), options.problem_size0.k()});
-    tensor_B0.reset({options.problem_size0.k(), options.problem_size0.n()});
-
-    tensor_C0.reset({options.problem_size0.m(), options.problem_size0.n()});
-
-    tensor_A1.reset({options.problem_size1.m(), options.problem_size1.k()});
-    tensor_C1.reset({options.problem_size1.m(), options.problem_size1.n()});
-
-    reference_C0.reset({options.problem_size0.m(), options.problem_size0.n()});
-    reference_C1.reset({options.problem_size1.m(), options.problem_size1.n()});
-
-    int leading_dim_0 = kIsColumnMajorOutput ? options.problem_size0.n() : options.problem_size0.m();
-    int leading_dim_1 = kIsColumnMajorOutput ? options.problem_size0.m() : options.problem_size0.n();
-
-    int block_num = (leading_dim_1 + GemmLayernorm::ThreadblockShape::kM - 1) / GemmLayernorm::ThreadblockShape::kM;
-
-    tensor_Variance.reset({block_num, leading_dim_0});
-    tensor_Mean.reset({block_num, leading_dim_0});
-    tensor_Shifted_K.reset({1, leading_dim_0});
-
-    tensor_Beta.reset({1, leading_dim_1});
-    tensor_Gamma.reset({1, leading_dim_1});
-
-    reference_Mean.reset({1, leading_dim_0}, false);
-    reference_Variance.reset({1, leading_dim_0}, false);
-    
-  }
-
-  /// Run
-  Disposition run() {
-
-    Disposition disposition = Disposition::kNotVerified;
-
-    //
-    // Initialize the workspace
-    //
-
-    initialize();
-
-    //
-    // Launch device kernel
-    //
-    cutlass::Status status = cutlass::Status::kSuccess;
-
-    status = execute_device_kernel();
-
-    if (status != cutlass::Status::kSuccess) {
-      std::cerr << "Device execution failed." << std::endl;
-      return disposition;
-    }
-
-    cudaError_t result = cudaDeviceSynchronize();
-    if (result != cudaSuccess) {
-      std::cerr << "Device synchronize failed with error "
-        << cudaGetErrorString(result) << std::endl;
-      return disposition;
-    }
-
-    //
-    // Compute the reference
-    //
-    compute_reference();
-
-    //
-    // Verify
-    //
-
-    if (options.verification_enabled) {
-
-      bool passed = verify();
-
-      if (passed) {
-        disposition = Disposition::kPassed;
-      }
-      else {
-        disposition = Disposition::kIncorrect;
-      }
-    }
-
-#ifdef KH_TEST_SOLUTION
-    //
-    // Run and verify LLM solution against CUTLASS reference
-    //
-    if (disposition == Disposition::kPassed) {
-      cudaError_t sol_err = execute_solution_kernel();
-      if (sol_err != cudaSuccess) {
-        std::cerr << "Solution execution failed: " << cudaGetErrorString(sol_err) << std::endl;
-        disposition = Disposition::kIncorrect;
-      } else {
-        cudaError_t sync_err = cudaDeviceSynchronize();
-        if (sync_err != cudaSuccess) {
-          std::cerr << "Solution synchronize failed: " << cudaGetErrorString(sync_err) << std::endl;
-          disposition = Disposition::kIncorrect;
-        } else if (!verify_solution()) {
-          disposition = Disposition::kIncorrect;
-        }
-      }
-    }
-#endif
-
-    //
-    // Profiling
-    //
-    if (options.iterations) {
-      profile();
-    }
-
-    return disposition;
-  }
-
-  /// Random initialization
-  void initialize() {
-
-    cutlass::reference::host::TensorFillRandomUniform(
-      tensor_A0.host_view(),
-        options.seed,
-        ElementInputA0(4),
-        ElementInputA0(-4),
-        0
-      );
-
-    cutlass::reference::host::TensorFillRandomUniform(
-      tensor_B0.host_view(),
-        options.seed + 1,
-        ElementInputB0(4),
-        ElementInputB0(-4),
-        0
-      );
-
-    cutlass::reference::host::TensorFillRandomUniform(
-      tensor_A1.host_view(),
-        options.seed + 2,
-        ElementInputA1(4),
-        ElementInputA1(-4),
-        0
-      );
-
-    cutlass::reference::host::TensorFillRandomUniform(
-      tensor_Beta.host_view(),
-        options.seed + 3,
-        ElementInputScaleBias(4),
-        ElementInputScaleBias(-4),
-        0
-      );
-
-    cutlass::reference::host::TensorFillRandomUniform(
-      tensor_Gamma.host_view(),
-        options.seed + 4,
-        ElementInputScaleBias(4),
-        ElementInputScaleBias(-4),
-        0
-      );
-
-    cutlass::reference::host::TensorFillRandomUniform(
-      tensor_Shifted_K.host_view(),
-        options.seed + 5,
-        ElementOutput(4),
-        ElementOutput(-5),
-        0
-      );
-
-    tensor_A0.sync_device();
-    tensor_B0.sync_device();
-    tensor_A1.sync_device();
-    tensor_Beta.sync_device();
-    tensor_Gamma.sync_device();
-
-#ifdef KH_TEST_SOLUTION
-    sol_C1.reset({options.problem_size1.m(), options.problem_size1.n()});
-#endif
-
-  }
-
-
-
-  cutlass::Status execute_device_kernel() {
-
-    cutlass::Status status = cutlass::Status::kSuccess;
-
-    //
-    // Setup arguments
-    //
-
-    typename GemmLayernorm::Arguments args(
-      options.problem_size0,
-      options.problem_size1,
-      tensor_A0.device_ref().data(),
-      tensor_B0.device_ref().data(),
-      tensor_C0.device_ref().data(),
-      tensor_C0.device_ref().data(),
-      tensor_A1.device_ref().data(),
-      tensor_C1.device_ref().data(),
-      tensor_A0.device_ref().stride(0),
-      tensor_B0.device_ref().stride(0),
-      tensor_C0.device_ref().stride(0),
-      tensor_C0.device_ref().stride(0),
-      tensor_A1.device_ref().stride(0),
-      tensor_C1.device_ref().stride(0),
-      {
-        ElementCompute(options.alpha),
-        ElementCompute(options.beta)
-      },
-      tensor_Variance.device_ref(),
-      tensor_Mean.device_ref(),
-      tensor_Gamma.device_ref(),
-      tensor_Beta.device_ref(),
-      tensor_Shifted_K.device_ref().data()
-    );
-
-    //
-    // Launch
-    //
-
-    GemmLayernorm gemm_layernorm;
-
-    // Initialize
-    status = gemm_layernorm.initialize(args);
-    if (status != cutlass::Status::kSuccess) {
-      return status;
-    }
-
-    // Run
-    status = gemm_layernorm();
-
+template <typename Config>
+cutlass::Status kh_ref_run_config(kh_ref_problem const &p) {
+  using G = typename Config::GemmLayernorm;
+  int const H = p.hidden, T = p.tokens, N1 = 4 * p.hidden;
+  cutlass::gemm::GemmCoord problem0(H, T, H), problem1(N1, T, H);
+  typename G::TensorVariance ref_var(p.variance, RowMajor(T));
+  typename G::TensorMean ref_mean(p.mean, RowMajor(T));
+  typename G::TensorVariance ref_gamma(const_cast<Element *>(p.gamma), RowMajor(H));
+  typename G::TensorMean ref_beta(const_cast<Element *>(p.beta_ln), RowMajor(H));
+  typename G::Arguments args(
+    problem0, problem1,
+    const_cast<Element *>(p.A0), const_cast<Element *>(p.B0), p.C0, p.C0,
+    const_cast<Element *>(p.A1), p.C1,
+    H, H, H, H, N1, N1,
+    {p.alpha, p.beta},
+    ref_var, ref_mean, ref_gamma, ref_beta, nullptr);
+  G op;
+  cutlass::Status status = op.initialize(args);
+  if (status != cutlass::Status::kSuccess) {
     return status;
   }
+  return op();
+}
 
+cutlass::Status kh_ref_run(kh_ref_problem const &p) {
+  // 256x128x32 tiles, 3 stages and a threadblock swizzle of 4 for both GEMMs (offline sweep; the
+  // CUTLASS example's 128x128 tiles with identity rasterization thrash the L2 cache at H >= 5120).
+  return kh_ref_run_config<kh_ref_config<256, 128, 64, 64, 3, 3, 4>>(p);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct Testbed {
+
+  // Verification of C1 against the golden result G (non-finite values always fail):
+  //   every element: |x - g| <= kAtol * rms(G) + kRtol * |g|;   whole tensor: rms(x - G) <= kRmsTol * rms(G)
+  // The reference (FP32 accumulation; C0, LayerNorm statistics and normalized operand rounded to
+  // FP16) stays at rms(err)/rms(G) ~ 4.6e-4; FP16 accumulation (1.7e-3 - 3.7e-3), BF16 operands
+  // (3.1e-3) and FP8 operands (4.8e-2) exceed the RMS limit.
+  static constexpr double kAtol = 0.01;
+  static constexpr double kRtol = 4e-3;
+  static constexpr double kRmsTol = 1.4e-3;
+
+  int H, T, N1;
+  float alpha, beta;
+  bool verify_reference;
+  int iterations;
+  unsigned seed;
+
+  int64_t count_A0, count_B0, count_C0, count_A1, count_C1, count_stats;
+
+  cutlass::DeviceAllocation<Element> block_A0, block_B0, block_C0, block_A1, block_C1;
+  cutlass::DeviceAllocation<Element> block_gamma, block_beta, block_var, block_mean;
+  cutlass::DeviceAllocation<Element> block_shift;  // optional shift for the variance (zeros)
+  std::vector<float> host_golden_C1;
 #ifdef KH_TEST_SOLUTION
-  cudaError_t execute_solution_kernel() {
-    // The CUTLASS example uses ColumnMajor output.
-    // In ColumnMajor, the data in memory for a matrix {M_rows, N_cols} with stride=M
-    // is column-by-column: element (m, n) at offset m + n * stride.
-    //
-    // For the solution, we present this as a row-major problem by transposing:
-    //   ColumnMajor [hidden_dim, valid_word_num] with stride=hidden_dim
-    //   is equivalent to RowMajor [valid_word_num, hidden_dim] with stride=hidden_dim.
-    //
-    // GEMM0 ColumnMajor: C0[hidden_dim, valid_word_num] = A0[hidden_dim, hidden_dim] * B0[hidden_dim, valid_word_num]
-    // In row-major equivalent:
-    //   (valid_word_num x hidden_dim) = (valid_word_num x hidden_dim) * (hidden_dim x hidden_dim)
-    //   i.e. C0^T = B0^T * A0^T
-    //
-    // The solution receives raw pointers and dimensions.
-    // For simplicity, it receives the "transposed" row-major interpretation:
-    //   M_sol = valid_word_num (= problem_size0.n())
-    //   N0_sol = hidden_dim (= problem_size0.m())
-    //   K0_sol = hidden_dim (= problem_size0.k())
-    //   N1_sol = hidden_dim * 4 (= problem_size1.m())
+  cutlass::DeviceAllocation<Element> sol_C1;
+#endif
 
-    int M_sol, N0_sol, K0_sol, N1_sol;
-    if (kIsColumnMajorOutput) {
-      M_sol = options.problem_size0.n();   // valid_word_num
-      N0_sol = options.problem_size0.m();  // hidden_dim
-      K0_sol = options.problem_size0.k();  // hidden_dim
-      N1_sol = options.problem_size1.m();  // hidden_dim * intermediate_scale
-    } else {
-      M_sol = options.problem_size0.m();
-      N0_sol = options.problem_size0.n();
-      K0_sol = options.problem_size0.k();
-      N1_sol = options.problem_size1.n();
-    }
-
-    // B0 is ColumnMajor [K0, N0] with stride = K0 in memory.
-    // Transposed: RowMajor [N0, K0] with stride K0 => this is A_sol (the first GEMM left matrix)
-    // Actually B0^T with RowMajor stride is: element (n0, k0) at B0[k0 + n0 * ldb0]
-    // which means in row-major, row n0 has stride ldb0. So ldb0_T = ldb0.
-
-    // A0 is RowMajor [K0, K0] with stride = K0 in memory.
-    // Transposed: ColumnMajor interpretation => A0^T is [K0, K0] ColumnMajor.
-    // In the transposed GEMM: right side = A0^T, element (k0, n0) at A0[n0 * lda0 + k0]
-
-    return gemm_layernorm_gemm_solution(
-      M_sol, N0_sol, K0_sol, N1_sol,
-      float(options.alpha), float(options.beta),
-      reinterpret_cast<const __half*>(tensor_A0.device_data()),
-      tensor_A0.device_ref().stride(0),
-      reinterpret_cast<const __half*>(tensor_B0.device_data()),
-      tensor_B0.device_ref().stride(0),
-      reinterpret_cast<const __half*>(tensor_A1.device_data()),
-      tensor_A1.device_ref().stride(0),
-      reinterpret_cast<__half*>(sol_C1.device_data()),
-      sol_C1.device_ref().stride(0),
-      reinterpret_cast<const __half*>(tensor_Gamma.device_data()),
-      reinterpret_cast<const __half*>(tensor_Beta.device_data()),
-      reinterpret_cast<const __half*>(tensor_Shifted_K.device_data()),
-      kIsColumnMajorOutput);
+  Testbed(int hidden, int tokens, float alpha_, float beta_, bool verify_ref, int iters, unsigned seed_):
+    H(hidden), T(tokens), N1(4 * hidden), alpha(alpha_), beta(beta_), verify_reference(verify_ref),
+    iterations(iters), seed(seed_) {
+    count_A0 = int64_t(H) * H;
+    count_B0 = int64_t(H) * T;
+    count_C0 = int64_t(H) * T;
+    count_A1 = int64_t(N1) * H;
+    count_C1 = int64_t(N1) * T;
+    count_stats = int64_t((H + 63) / 64) * T;
   }
 
-  bool verify_solution() {
-    sol_C1.sync_host();
-    tensor_C1.sync_host();
+  void initialize() {
+    block_A0.reset(count_A0);
+    block_B0.reset(count_B0);
+    block_C0.reset(count_C0);
+    block_A1.reset(count_A1);
+    block_C1.reset(count_C1);
+    block_gamma.reset(H);
+    block_beta.reset(H);
+    block_var.reset(count_stats);
+    block_mean.reset(count_stats);
+    block_shift.reset(T);
+    cudaMemset(block_shift.get(), 0, T * sizeof(Element));
 
-    float const kAbsThreshold = 0.5f;
-    float const kRelativeThreshold = 0.1f;
-    float const kBias = 1e-5f;
-    float const kThreshold = float(options.tolerance);
-    int counter = 0;
-    int total = options.problem_size1.m() * options.problem_size1.n();
+    // Random values at full FP16 precision: activations and weights uniform in [-1, 1),
+    // LayerNorm scale uniform in [0.5, 1.5) and shift uniform in [-0.5, 0.5).
+    cutlass::reference::device::BlockFillRandomUniform(block_A0.get(), count_A0, seed, Element(1), Element(-1), -1);
+    cutlass::reference::device::BlockFillRandomUniform(block_B0.get(), count_B0, seed + 1, Element(1), Element(-1), -1);
+    cutlass::reference::device::BlockFillRandomUniform(block_A1.get(), count_A1, seed + 2, Element(1), Element(-1), -1);
+    cutlass::reference::device::BlockFillRandomUniform(block_gamma.get(), H, seed + 3, Element(1.5f), Element(0.5f), -1);
+    cutlass::reference::device::BlockFillRandomUniform(block_beta.get(), H, seed + 4, Element(0.5f), Element(-0.5f), -1);
 
-    for (int m = 0; m < options.problem_size1.m(); m++) {
-      for (int n = 0; n < options.problem_size1.n(); ++n) {
-        float val = (float)sol_C1.at({m, n});
-        float ref = (float)tensor_C1.at({m, n});
-        float diff = fabs(val - ref);
-        float rel_diff = diff / fabs(ref + kBias);
-        if (diff > kAbsThreshold && rel_diff > kRelativeThreshold) {
-          counter++;
-        }
-      }
+    // 0xFFFF is a NaN in FP16: any element left unwritten fails verification.
+    cudaMemset(block_C1.get(), 0xFF, count_C1 * sizeof(Element));
+#ifdef KH_TEST_SOLUTION
+    sol_C1.reset(count_C1);
+#endif
+  }
+
+  cutlass::Status run_reference_() {
+    kh_ref_problem p{H, T, alpha, beta, block_A0.get(), block_B0.get(), block_A1.get(), block_gamma.get(),
+                 block_beta.get(), block_C0.get(), block_C1.get(), block_var.get(), block_mean.get()};
+    return kh_ref_run(p);
+  }
+
+#ifdef KH_TEST_SOLUTION
+  cudaError_t run_solution_() {
+    // Row-major view of the column-major problem: M_sol = tokens, N0_sol = K0_sol = hidden,
+    // N1_sol = 4 * hidden (see description.txt for the layouts).
+    return gemm_layernorm_gemm_solution(
+      T, H, H, N1,
+      alpha, beta,
+      reinterpret_cast<const __half*>(block_A0.get()), H,
+      reinterpret_cast<const __half*>(block_B0.get()), H,
+      reinterpret_cast<const __half*>(block_A1.get()), N1,
+      reinterpret_cast<__half*>(sol_C1.get()), N1,
+      reinterpret_cast<const __half*>(block_gamma.get()),
+      reinterpret_cast<const __half*>(block_beta.get()),
+      reinterpret_cast<const __half*>(block_shift.get()),
+      true);
+  }
+
+  /// Poisons the solution output (NaN), runs the solution once and verifies it.
+  bool run_and_verify_solution_(char const *who) {
+    cudaMemset(sol_C1.get(), 0xFF, count_C1 * sizeof(Element));
+    cudaError_t err = run_solution_();
+    if (err == cudaSuccess) {
+      err = cudaDeviceSynchronize();
     }
-
-    float err_rate = float(counter) / float(total);
-    if (err_rate >= kThreshold) {
-      std::cerr << "Solution verification failed (error rate: " << err_rate << ")" << std::endl;
+    if (err != cudaSuccess) {
+      std::cerr << who << ": execution failed: " << cudaGetErrorString(err) << std::endl;
       return false;
     }
-    return true;
+    return check_output(who, sol_C1);
   }
 #endif
 
-  /// Reference calculation
-  void compute_reference() {
+  /// Golden result: C0 = alpha A0 B0 (FP32 accumulation, not rounded), LayerNorm over the hidden
+  /// dimension with FP64 statistics on the host, C1 = alpha A1 Norm (FP32 accumulation).
+  bool compute_golden() {
+    cutlass::DeviceAllocation<float> golden_C0(count_C0), golden_C1(count_C1);
+    cudaMemset(golden_C0.get(), 0, count_C0 * sizeof(float));
+    cudaMemset(golden_C1.get(), 0, count_C1 * sizeof(float));
 
-    cutlass::reference::device::Gemm<
-      ElementInputA0,
-      LayoutInputA0,
-      ElementInputB0,
-      LayoutInputB0,
-      ElementOutput,
-      LayoutOutputC0,
-      ElementCompute,
-      ElementCompute
-    > gemm_device0;
+    cutlass::reference::device::Gemm<Element, RowMajor, Element, ColumnMajor, float, ColumnMajor, float, float> gemm0;
+    cutlass::reference::device::Gemm<Element, ColumnMajor, float, ColumnMajor, float, ColumnMajor, float, float> gemm1;
 
-    cutlass::reference::device::Gemm<
-      ElementInputA1,
-      LayoutInputA1,
-      ElementOutput,
-      LayoutOutputC0,
-      ElementOutputC1,
-      LayoutOutputC1,
-      ElementCompute,
-      ElementCompute
-    > gemm_device1;
+    cutlass::TensorRef<float, ColumnMajor> ref_C0(golden_C0.get(), ColumnMajor(H));
+    cutlass::TensorRef<float, ColumnMajor> ref_C1(golden_C1.get(), ColumnMajor(N1));
 
-    // Compute 1st GEMM
-    gemm_device0(
-      options.problem_size0,
-      ElementCompute(options.alpha),
-      tensor_A0.device_ref(),
-      tensor_B0.device_ref(),
-      ElementCompute(options.beta),
-      tensor_C0.device_ref(),
-      reference_C0.device_ref()
-    );
+    gemm0({H, T, H}, alpha,
+          cutlass::TensorRef<Element, RowMajor>(block_A0.get(), RowMajor(H)),
+          cutlass::TensorRef<Element, ColumnMajor>(block_B0.get(), ColumnMajor(H)),
+          0.0f, ref_C0, ref_C0);
 
-    reference_C0.sync_host();
+    std::vector<float> host_C0(count_C0);
+    std::vector<Element> host_gamma(H), host_beta(H);
+    cutlass::device_memory::copy_to_host(host_C0.data(), golden_C0.get(), count_C0);
+    cutlass::device_memory::copy_to_host(host_gamma.data(), block_gamma.get(), H);
+    cutlass::device_memory::copy_to_host(host_beta.data(), block_beta.get(), H);
 
-    tensor_Mean.sync_host();
-    tensor_Variance.sync_host();
-    tensor_Gamma.sync_host();
-    tensor_Beta.sync_host();
-    tensor_Shifted_K.sync_host();
-
-    // Compute the sum and square sum for verification purpose
-    if (kIsColumnMajorOutput) {
-      for (int n = 0; n < options.problem_size0.n(); ++n) {
-      
-        ElementLayernormCompute sum = ElementLayernormCompute(0);
-        ElementLayernormCompute square_sum = ElementLayernormCompute(0);
-        for (int m = 0; m < options.problem_size0.m(); ++m) {
-          sum += ElementLayernormCompute(reference_C0.at({m, n}));
-          square_sum += ElementLayernormCompute(reference_C0.at({m, n})) * ElementLayernormCompute(reference_C0.at({m, n}));
-        }
-        
-        ElementLayernormCompute mean = sum / ElementLayernormCompute(options.problem_size0.m());
-        ElementLayernormCompute square_mean = square_sum / ElementLayernormCompute(options.problem_size0.m());
-        ElementLayernormCompute variance = cutlass::constants::one<ElementLayernormCompute>() / cutlass::fast_sqrt(square_mean - mean * mean + ElementLayernormCompute(1e-6) ) ;
-
-        mean = -mean * variance;
-
-        reference_Mean.at({0, n}) = ElementInputScaleBias(mean);
-        reference_Variance.at({0, n}) = ElementInputScaleBias(variance);
+    // LayerNorm over the hidden dimension (column n of C0 = token n), two-pass, FP64 statistics
+    for (int n = 0; n < T; ++n) {
+      float *col = host_C0.data() + int64_t(n) * H;
+      double sum = 0;
+      for (int m = 0; m < H; ++m) sum += col[m];
+      double const mean = sum / H;
+      double sq = 0;
+      for (int m = 0; m < H; ++m) {
+        double const d = col[m] - mean;
+        sq += d * d;
       }
-    }else{
-      for (int m = 0; m < options.problem_size0.m(); ++m) {
-      
-        ElementLayernormCompute sum = ElementLayernormCompute(0);
-        ElementLayernormCompute square_sum = ElementLayernormCompute(0);
-        for (int n = 0; n < options.problem_size0.n(); ++n) {
-          sum += ElementLayernormCompute(reference_C0.at({m, n})) ;
-          square_sum += ElementLayernormCompute(reference_C0.at({m, n})) * ElementLayernormCompute(reference_C0.at({m, n})) ;
-        }
-
-        ElementLayernormCompute mean = sum / ElementLayernormCompute(options.problem_size0.n());
-        ElementLayernormCompute square_mean = square_sum / ElementLayernormCompute(options.problem_size0.n());
-        ElementLayernormCompute variance = cutlass::constants::one<ElementLayernormCompute>() / cutlass::fast_sqrt(square_mean - mean * mean + ElementLayernormCompute(1e-6)) ;
-
-        mean = -mean * variance;
-
-        reference_Mean.at({0, m}) = ElementInputScaleBias(mean);
-        reference_Variance.at({0, m}) = ElementInputScaleBias(variance);
+      double const inv_std = 1.0 / std::sqrt(sq / H + 1e-6);
+      for (int m = 0; m < H; ++m) {
+        col[m] = float((col[m] - mean) * inv_std * double(float(host_gamma[m])) + double(float(host_beta[m])));
       }
     }
+    cutlass::device_memory::copy_to_device(golden_C0.get(), host_C0.data(), count_C0);
 
-    // Element-wise transform for OutputC0 using 1-pass layernorm algo
-    if (kIsColumnMajorOutput) {
-      for (int n = 0; n < options.problem_size0.n(); ++n) {
+    gemm1({N1, T, H}, alpha,
+          cutlass::TensorRef<Element, ColumnMajor>(block_A1.get(), ColumnMajor(N1)),
+          cutlass::TensorRef<float, ColumnMajor>(golden_C0.get(), ColumnMajor(H)),
+          0.0f, ref_C1, ref_C1);
 
-        ElementLayernormCompute sum = ElementLayernormCompute(0);
-        for (int m = 0; m < options.problem_size0.m(); ++m) {
-          sum += ElementLayernormCompute(reference_C0.at({m, n})) ;
-        }
-
-        ElementInputScaleBias mean = ElementInputScaleBias(sum / ElementLayernormCompute(options.problem_size0.m()));
-        sum = ElementLayernormCompute(0);
-        for (int m = 0; m < options.problem_size0.m(); ++m) {
-          sum += ElementLayernormCompute(reference_C0.at({m, n}) - ElementLayernormCompute(mean)) * ElementLayernormCompute(reference_C0.at({m, n}) - ElementLayernormCompute(mean)) ;
-        }
-
-        ElementLayernormCompute square_mean = sum / ElementLayernormCompute(options.problem_size0.m());
-        ElementInputScaleBias variance = ElementInputScaleBias(cutlass::constants::one<ElementLayernormCompute>() 
-                            / cutlass::fast_sqrt(square_mean + ElementLayernormCompute(1e-6))) ;
-
-        for (int m = 0; m < options.problem_size0.m(); ++m) {
-          reference_C0.at({m, n}) = 
-              ElementOutput( ( (ElementInputScaleBias(reference_C0.at({m, n})) - mean) * variance )
-                * tensor_Gamma.at({0, m}) + tensor_Beta.at({0, m}));
-
-        }
-
-      }
-    }else{
-
-      for (int m = 0; m < options.problem_size0.m(); ++m) {
-
-        float sum = float(0);
-        for (int n = 0; n < options.problem_size0.n(); ++n) {
-          sum += float(reference_C0.at({m, n})) ;
-        }
-
-        float mean = sum / float(options.problem_size0.n());
-        sum = float(0);
-        for (int n = 0; n < options.problem_size0.n(); ++n) {
-          sum += float(reference_C0.at({m, n}) - mean) * float(reference_C0.at({m, n}) - mean) ;
-        }
-
-        float square_mean = sum / float(options.problem_size0.n());
-        float variance = cutlass::constants::one<float>() / cutlass::fast_sqrt(square_mean + ElementLayernormCompute(1e-6)) ;
-
-        for (int n = 0; n < options.problem_size0.n(); ++n) {
-          reference_C0.at({m, n}) = 
-              ElementOutput( ( (float(reference_C0.at({m, n})) - mean) * variance )
-                * float(tensor_Gamma.at({0, n})) + float(tensor_Beta.at({0, n})));
-
-        }
-
-      }
-
-    }
-
-
-    // Sync host data with device after element-wise transform
-    reference_C0.sync_device();
-
-    // Compute 2nd GEMM
-    gemm_device1(
-      options.problem_size1,
-      ElementCompute(options.alpha),
-      kIsColumnMajorOutput ? tensor_A1.device_ref() : reference_C0.device_ref(),
-      kIsColumnMajorOutput ? reference_C0.device_ref() :tensor_A1.device_ref(),
-      ElementCompute(options.beta),
-      reference_C1.device_ref(),
-      reference_C1.device_ref()
-    );
-
-  }
-
-  /// Emits all tensor values
-  void emit_results() {
-    std::cout << "tensor_C1 = \n" << tensor_C1.host_view() << "\n\n";
-    std::cout << "Reference C1 = \n" << reference_C1.host_view() << "\n\n";
-    std::cout << "Mean = \n" << tensor_Mean.host_view() << "\n\n";
-    std::cout << "rsqrt(Variance) = \n" << tensor_Variance.host_view() << "\n\n";
-    std::cout << "Reference Mean = \n" << reference_Mean.host_view() << "\n\n";
-    std::cout << "Reference rsqrt(Variance) = \n" << reference_Variance.host_view() << "\n\n";
-  }
-
-  template<typename Element, typename Layout>
-  bool verify_tensor(cutlass::HostTensor<Element, Layout> tensor, \
-                       cutlass::HostTensor<Element, Layout> reference,
-                       int leading_dim0, int leading_dim1, bool is_print = false) {
-    float const kThreshold = float(options.tolerance);
-    float const kAbsThreshold = 0.5f;
-    float const kRelativeThreshold = 0.1f;
-    // Adds a constant bias to avoid being divided by '0'
-    float const kBias = 1e-5f;
-    int counter = 0;
-    for (int m = 0; m < leading_dim0; m++) {
-      for (int n = 0; n < leading_dim1; ++n) {
-        float diff = (float)(tensor.at({m, n}) - reference.at({m, n}));
-        float rel_diff = fabs(diff) / fabs(reference.at({m, n}) + kBias);
-        if (fabs(diff) > kAbsThreshold && rel_diff > kRelativeThreshold) {
-          counter++;
-        }
-      }
-    }
-
-    float err_rate = float(counter) / (float(leading_dim0) * float(leading_dim1));
-    return (err_rate < kThreshold);
-  }
-
-  /// Verifies the reference matches
-  bool verify() {
-
-    tensor_Variance.sync_host();
-    tensor_Mean.sync_host();
-    tensor_C1.sync_host();
-    reference_C1.sync_host();
-
-    // Verification checks - set any of these to 'true' to override the verification checks.
-    bool verified_C1 = false;
-    bool verified_Mean = false;
-    bool verified_Variance = false;
-
-    // Verify layernorm output
-    if (!verified_C1) {
-      verified_C1 = verify_tensor<ElementOutputC1, LayoutOutputC1>(tensor_C1, reference_C1, options.problem_size1.m(), options.problem_size1.n());
-    }
-
-    if (!verified_Variance) {
-      verified_Variance = verify_tensor<ElementInputScaleBias, LayoutInputScaleBias>(tensor_Variance, reference_Variance, 1, options.problem_size0.n());
-    }
-
-    if (!verified_Mean) {
-      verified_Mean = verify_tensor<ElementInputScaleBias, LayoutInputScaleBias>(tensor_Mean, reference_Mean, 1, options.problem_size0.n());
-    }
-
-    if (!verified_C1 || !verified_Mean || !verified_Variance) {
-
-      // emit_results();
-
-      std::cerr << "Verification check failed for tensor Layernorm" << std::endl;
-
-      // Summarize which checks failed
-      if (!verified_C1) {
-        std::cerr << "Verification of O tensor failed\n";
-      }
-
-      if (!verified_Mean) {
-        std::cerr << "Verification of Mean tensor failed\n";
-      }
-
-      if (!verified_Variance) {
-        std::cerr << "Verification of Variance tensor failed\n";
-      }
-
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      std::cerr << "Golden reference failed: " << cudaGetErrorString(err) << std::endl;
       return false;
     }
-
+    host_golden_C1.resize(count_C1);
+    cutlass::device_memory::copy_to_host(host_golden_C1.data(), golden_C1.get(), count_C1);
     return true;
   }
 
-  /// Profiles
-  bool profile() {
+  /// Checks every element of C1 and the aggregate error against the golden result.
+  bool check_output(char const *who, cutlass::DeviceAllocation<Element> const &out) {
+    std::vector<Element> x(count_C1);
+    cutlass::device_memory::copy_to_host(x.data(), out.get(), count_C1);
 
-    int const kIterations = options.iterations;
+    double gold_sq = 0;
+    for (int64_t i = 0; i < count_C1; ++i) gold_sq += double(host_golden_C1[i]) * double(host_golden_C1[i]);
+    double const rms = std::sqrt(gold_sq / double(count_C1));
+    double const atol = kAtol * rms;
+
+    double max_ratio = 0, err_sq = 0;
+    int64_t bad = 0;
+    for (int64_t i = 0; i < count_C1; ++i) {
+      double const v = double(float(x[i]));
+      double const g = double(host_golden_C1[i]);
+      double err = std::fabs(v - g);
+      double const tol = atol + kRtol * std::fabs(g);
+      if (!std::isfinite(v) || !(err <= tol)) {
+        if (bad++ == 0) {
+          fprintf(stderr, "%s: C1 mismatch at row %lld, col %lld: got %g, expected %g (tol %g)\n",
+                  who, (long long)(i % N1), (long long)(i / N1), v, g, tol);
+        }
+        if (!std::isfinite(v)) err = INFINITY;
+      }
+      max_ratio = std::max(max_ratio, err / tol);
+      err_sq += err * err;
+    }
+    double const rel_rms_err = std::sqrt(err_sq / double(count_C1)) / rms;
+    printf("%s: max |err|/tol = %.3f, rms(err)/rms(C1) = %.3g (limit %.3g), rms(C1) = %.4g, "
+           "%lld of %lld elements out of tolerance\n",
+           who, max_ratio, rel_rms_err, kRmsTol, rms, (long long)bad, (long long)count_C1);
+    if (bad) {
+      return false;
+    }
+    if (!(rel_rms_err <= kRmsTol)) {
+      fprintf(stderr, "%s: C1 RMS error too large: %g > %g\n", who, rel_rms_err, kRmsTol);
+      return false;
+    }
+    return true;
+  }
+
+  template <typename Fn>
+  float time_min_ms_(Fn &&fn, char const *label) {
+    for (int i = 0; i < 3; ++i) {
+      fn();
+    }
+    cudaDeviceSynchronize();
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-
-    //
-    // Warmup reference
-    //
-    for (int i = 0; i < 3; i++) {
-      execute_device_kernel();
-      cudaDeviceSynchronize();
-    }
-
-    //
-    // Profile reference (per-iteration timing)
-    //
-    float ref_total_ms = 0;
-    float ref_min_ms = 1e30f;
-
-    for (int iter = 0; iter < kIterations; ++iter) {
+    float total_ms = 0, min_ms = 1e30f;
+    for (int iter = 0; iter < iterations; ++iter) {
       cudaEventRecord(start);
-      execute_device_kernel();
+      fn();
       cudaEventRecord(stop);
       cudaEventSynchronize(stop);
-
-      float ms;
+      float ms = 0;
       cudaEventElapsedTime(&ms, start, stop);
-      ref_total_ms += ms;
-      if (ms < ref_min_ms) ref_min_ms = ms;
+      total_ms += ms;
+      min_ms = std::min(min_ms, ms);
     }
-
-    fprintf(stdout, "Ref time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
-            ref_total_ms / kIterations, kIterations, ref_min_ms);
-
-#ifdef KH_TEST_SOLUTION
-    //
-    // Warmup solution
-    //
-    for (int i = 0; i < 3; i++) {
-      execute_solution_kernel();
-      cudaDeviceSynchronize();
-    }
-
-    //
-    // Profile solution (per-iteration timing)
-    //
-    float sol_total_ms = 0;
-    float sol_min_ms = 1e30f;
-
-    for (int iter = 0; iter < kIterations; ++iter) {
-      cudaEventRecord(start);
-      execute_solution_kernel();
-      cudaEventRecord(stop);
-      cudaEventSynchronize(stop);
-
-      float ms;
-      cudaEventElapsedTime(&ms, start, stop);
-      sol_total_ms += ms;
-      if (ms < sol_min_ms) sol_min_ms = ms;
-    }
-
-    fprintf(stdout, "Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
-            sol_total_ms / kIterations, kIterations, sol_min_ms);
-
-    float speedup = ref_min_ms / sol_min_ms;
-    fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", speedup);
-#endif
-
-    //
-    // Stats (based on reference timing)
-    //
-    int64_t flops = int64_t(options.problem_size0.m()) * options.problem_size0.n() * options.problem_size0.k() * 2 \
-                   + int64_t(options.problem_size1.m()) * options.problem_size1.n() * options.problem_size1.k() * 2;
-
-    double gflops_per_second = double(flops) * kIterations / double(ref_total_ms / 1000.0f) / double(1.0e9);
-
-    std::cout << "    1st  GEMM: "
-              << options.problem_size0.m() << "-by-" << options.problem_size0.n() << "-by-" << options.problem_size0.k() << "\n"
-              << "    2nd  GEMM: "
-              << options.problem_size1.m() << "-by-" << options.problem_size1.n() << "-by-" << options.problem_size1.k()
-              << std::endl;
-
-    std::cout << " Runtime / iteration: " << (ref_total_ms / kIterations) << " ms\n" << std::endl;
-    std::cout << "              GFLOPs: " << gflops_per_second << "  GFLOPs" << std::endl;
-
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
+    fprintf(stdout, "%s: %.4f ms (avg over %d trials, min: %.4f ms)\n", label, total_ms / iterations, iterations, min_ms);
+    return min_ms;
+  }
 
+  bool run() {
+    initialize();
+
+    cutlass::Status status = run_reference_();
+    cudaError_t err = cudaDeviceSynchronize();
+    if (status != cutlass::Status::kSuccess || err != cudaSuccess) {
+      std::cerr << "Reference execution failed: " << cutlass::cutlassGetStatusString(status) << ", "
+                << cudaGetErrorString(err) << std::endl;
+      return false;
+    }
+
+#ifdef KH_TEST_SOLUTION
+    bool const need_golden = true;
+#else
+    bool const need_golden = verify_reference;
+#endif
+    if (need_golden && !compute_golden()) {
+      return false;
+    }
+    if (verify_reference && !check_output("Reference", block_C1)) {
+      std::cerr << "Reference verification failed" << std::endl;
+      return false;
+    }
+
+#ifdef KH_TEST_SOLUTION
+    if (!run_and_verify_solution_("Solution")) {
+      return false;
+    }
+#endif
+
+    std::cout << "Passed" << std::endl;
+    if (iterations <= 0) {
+      return true;
+    }
+
+    float const ref_min_ms = time_min_ms_([&]() { run_reference_(); }, "Ref time");
+#ifdef KH_TEST_SOLUTION
+    float const sol_min_ms = time_min_ms_([&]() { run_solution_(); }, "Kernel time");
+    fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
+    // The output must still be produced by a fresh call after the timed runs.
+    if (!run_and_verify_solution_("Solution (re-run after timing)")) {
+      return false;
+    }
+#endif
+    double const flops = 2.0 * T * double(H) * H + 2.0 * T * double(N1) * H;
+    printf("Reference: %.1f TFLOP/s\n", flops / ref_min_ms / 1e9);
     return true;
   }
 };
@@ -1032,21 +434,29 @@ struct Testbed {
 
 int main(int argc, const char **argv) {
 
-  // Define final layout
-  using LayoutOutput = cutlass::layout::ColumnMajor;
-
-  // Options parsing
-  Options<LayoutOutput> options;
-  options.parse(argc, argv);
-
-  if (options.help) {
-    options.print_usage(std::cout) << std::endl;
+  cutlass::CommandLine cmd(argc, argv);
+  if (cmd.check_cmd_line_flag("help")) {
+    std::cout << "37_gemm_layernorm_gemm_fusion\n\n"
+              << "  --hidden_dim=<int>        hidden size (multiple of 128)\n"
+              << "  --valid_word_num=<int>    number of tokens (multiple of 8)\n"
+              << "  --iterations=<int>        profiling iterations (default 20, 0 disables)\n"
+              << "  --verify=<bool>           verify the reference too (default true)\n"
+              << "  --seed=<int>\n";
     return 0;
   }
 
-  if (!options.supported()) {
+  cudaDeviceProp props;
+  if (cudaGetDeviceProperties(&props, 0) != cudaSuccess || props.major < 8) {
+    std::cerr << "This benchmark requires a GPU with compute capability 80 or greater." << std::endl;
     return 0;
   }
+
+  int iterations = 20;
+  bool verify = true;
+  unsigned seed = 2022;
+  cmd.get_cmd_line_argument("iterations", iterations, 20);
+  cmd.get_cmd_line_argument("verify", verify, true);
+  cmd.get_cmd_line_argument("seed", seed, 2022u);
 
   struct TestConfig {
     const char* label;
@@ -1055,66 +465,41 @@ int main(int argc, const char **argv) {
   };
 
   std::vector<TestConfig> configs;
-
-  if (argc <= 1) {
-    configs = {
-      {"small",   128,  256},
-      {"medium",  256, 1024},
-      {"large",   512, 2048},
-    };
+  if (cmd.check_cmd_line_flag("hidden_dim") || cmd.check_cmd_line_flag("valid_word_num")) {
+    TestConfig c{"custom", 768, 4096};
+    cmd.get_cmd_line_argument("hidden_dim", c.hidden_dim, 768);
+    cmd.get_cmd_line_argument("valid_word_num", c.valid_word_num, 4096);
+    configs.push_back(c);
   } else {
-    configs.push_back({"custom", options.hidden_dim, options.valid_word_num});
+    // Transformer blocks as run on one RTX PRO 6000 (96 GB): hidden size x tokens, FFN = 4 x hidden
+    //   bert_large_train: BERT-large training, hidden 1024, 64 sequences x 512 tokens
+    //   qwen3_8b:         Qwen3-8B width (hidden 4096), 16K-token prefill chunk
+    //   qwen3_32b:        Qwen3-32B width (hidden 5120), 16K-token prefill chunk
+    //   gemma3_27b:       Gemma-3-27B width (hidden 5376), 16K-token prefill chunk
+    configs = {
+      {"bert_large_train", 1024, 32768},
+      {"qwen3_8b",         4096, 16384},
+      {"qwen3_32b",        5120, 16384},
+      {"gemma3_27b",       5376, 16384},
+    };
   }
 
-  for (const auto& cfg : configs) {
-    fprintf(stdout, "\n=== %s: hidden_dim=%d, valid_word_num=%d ===\n",
-            cfg.label, cfg.hidden_dim, cfg.valid_word_num);
-
-    options.hidden_dim = cfg.hidden_dim;
-    options.valid_word_num = cfg.valid_word_num;
-
-    // Recompute problem sizes based on new hidden_dim/valid_word_num
-    if (Options<LayoutOutput>::kIsColumnMajorOutput) {
-      options.problem_size0.m() = cfg.hidden_dim;
-      options.problem_size0.n() = cfg.valid_word_num;
-      options.problem_size0.k() = cfg.hidden_dim;
-      options.problem_size1.m() = cfg.hidden_dim * options.intermediate_scale;
-      options.problem_size1.n() = cfg.valid_word_num;
-      options.problem_size1.k() = cfg.hidden_dim;
-    } else {
-      options.problem_size0.m() = cfg.valid_word_num;
-      options.problem_size0.n() = cfg.hidden_dim;
-      options.problem_size0.k() = cfg.hidden_dim;
-      options.problem_size1.m() = cfg.valid_word_num;
-      options.problem_size1.n() = cfg.hidden_dim * options.intermediate_scale;
-      options.problem_size1.k() = cfg.hidden_dim;
+  for (auto const &cfg : configs) {
+    fprintf(stdout, "\n=== %s: hidden_dim=%d, valid_word_num=%d ===\n", cfg.label, cfg.hidden_dim, cfg.valid_word_num);
+    fflush(stdout);
+    if (cfg.hidden_dim % 128 || cfg.valid_word_num % 8 || cfg.hidden_dim <= 0 || cfg.valid_word_num <= 0) {
+      std::cerr << "hidden_dim must be a multiple of 128 and valid_word_num a multiple of 8" << std::endl;
+      std::cout << "Incorrect" << std::endl;
+      return -1;
     }
-
-    if (!options.supported(false)) {
-      fprintf(stdout, "Skipped (not supported)\n");
-      continue;
-    }
-
-    Testbed<LayoutOutput> testbed(options);
-    Disposition disposition = testbed.run();
-
-    std::cout << std::endl;
-
-    switch (disposition) {
-      case Disposition::kPassed:
-        std::cout << "Passed" << std::endl;
-        break;
-      case Disposition::kIncorrect:
-        std::cout << "Incorrect" << std::endl;
-        return -1;
-      case Disposition::kNotVerified:
-        std::cout << "Not verified" << std::endl;
-        return -1;
+    Testbed testbed(cfg.hidden_dim, cfg.valid_word_num, 1.0f, 0.0f, verify, iterations, seed);
+    if (!testbed.run()) {
+      std::cout << "Incorrect" << std::endl;
+      return -1;
     }
   }
 
   return 0;
 }
-
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

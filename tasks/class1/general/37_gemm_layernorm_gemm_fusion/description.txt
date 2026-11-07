@@ -5,7 +5,8 @@ Fused GEMM + LayerNorm + GEMM on half-precision (FP16) data.
 ## Operation
 
 The pipeline computes:
-  1. GEMM0: C0 = alpha * A0 * B0 + beta * C0_in     (column-major output)
+  1. GEMM0: C0 = alpha * A0 * B0 + beta * C0_in     (column-major output; there is no C0_in
+                                                     input, the test uses beta = 0)
   2. LayerNorm: normalized = (C0 - mean) * inv_std * gamma + beta_ln   (per-column normalization)
   3. GEMM1: C1 = alpha * A1 * normalized              (column-major output)
 
@@ -33,7 +34,7 @@ cudaError_t gemm_layernorm_gemm_solution(
 
 ## Memory Layouts (Column-Major Case, is_column_major=true)
 
-The CUTLASS example uses column-major output. In this mode:
+The test always uses column-major output (is_column_major = true). In this mode:
 
 - **A0**: row-major, shape [N0_sol, K0_sol], stride lda0. Element (i,j) at `A0[i * lda0 + j]`.
 - **B0**: column-major, shape [K0_sol, M_sol], stride ldb0. Element (i,j) at `B0[i + j * ldb0]`.
@@ -43,7 +44,7 @@ The CUTLASS example uses column-major output. In this mode:
 - **C1** (output): column-major, shape [N1_sol, M_sol], stride ldc1. Element (i,j) at `C1[i + j * ldc1]`.
 - **gamma**: [N0_sol] LayerNorm scale factors.
 - **beta_ln**: [N0_sol] LayerNorm bias.
-- **shifted_K**: optional shifted-K value for numerical stability (can be ignored).
+- **shifted_K**: optional per-token shift for the variance computation (all zeros; can be ignored).
 
 ## LayerNorm Details
 
@@ -58,19 +59,47 @@ LayerNorm is applied per-column of C0 (column-major). For each column `c`:
 - M_sol = valid_word_num (number of token positions)
 - N0_sol = hidden_dim (feature dimension)
 - K0_sol = hidden_dim
-- N1_sol = hidden_dim * intermediate_scale (typically 4x hidden_dim)
+- N1_sol = 4 * hidden_dim
+- alpha = 1, beta = 0
+
+## Data Types and Precision
+
+All matrices, gamma and beta_ln are `__half` (FP16). Both GEMMs must accumulate in FP32 and the
+LayerNorm statistics and normalization must be computed in FP32 (the intermediate C0 and the
+normalized operand may be stored in FP16). Lower-precision arithmetic (FP16 accumulation, BF16,
+FP8, INT8 or narrower formats) is not allowed, even if it passes the tolerance.
+
+## Problem Sizes
+
+Transformer blocks of models that run on a single 96 GB GPU (N1_sol = 4 * hidden_dim):
+
+| name             | hidden_dim | valid_word_num | workload                                         |
+|------------------|------------|----------------|--------------------------------------------------|
+| bert_large_train | 1024       | 32768          | BERT-large training, 64 sequences x 512 tokens   |
+| qwen3_8b         | 4096       | 16384          | Qwen3-8B width, 16K-token prefill chunk          |
+| qwen3_32b        | 5120       | 16384          | Qwen3-32B width, 16K-token prefill chunk         |
+| gemma3_27b       | 5376       | 16384          | Gemma-3-27B width, 16K-token prefill chunk       |
+
+## Correctness
+
+Inputs are random FP16 values at full precision: A0, B0, A1 uniform in [-1, 1), gamma uniform in
+[0.5, 1.5), beta_ln uniform in [-0.5, 0.5). Every element of C1 is compared with a reference that
+uses FP32-accumulated GEMMs and FP64 LayerNorm statistics (C0 and the normalized values are not
+rounded):
+- per element: |C1 - ref| <= 0.01 * rms(ref) + 4e-3 * |ref|
+- whole output: rms(C1 - ref) <= 1.4e-3 * rms(ref)
+Every element of C1 must be written and finite. The output is checked again after the timed runs.
 
 ## Build & Test
 
 ```bash
-make test                             # requires solution.h in task directory
-./test                                # default: runs small/medium/large sizes
-./test --hidden_dim=256 --valid_word_num=512  # custom single size
-./test --iterations=50                # more profiling iterations (default: 20)
+make test                                         # requires solution.h in task directory
+./test                                            # default: runs all sizes listed above
+./test --hidden_dim=1024 --valid_word_num=4096    # custom single size (hidden_dim multiple of 128)
+./test --iterations=50                            # more profiling iterations (default: 20)
 ```
 
-Correctness is verified against a reference implementation at multiple problem sizes
-(small: 128x256, medium: 256x1024, large: 512x2048).
-Performance is timed for both reference and your solution at each size.
+Performance is timed for both the reference and your solution at each size; the task speedup is
+the geometric mean of the per-size speedups.
 
 CUTLASS headers are available on the include path.

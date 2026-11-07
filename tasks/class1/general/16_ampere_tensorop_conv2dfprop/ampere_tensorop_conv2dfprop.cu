@@ -39,382 +39,453 @@ Output tensor uses float (F32) in NHWC layout.
 Accumulation is done in float.
 
 C = alpha * Conv2dFprop(A, B) + beta * C
+
+Benchmark harness: the reference is the CUTLASS implicit-GEMM kernel with a per-problem-size
+tile configuration (selected by an offline sweep on the target GPU). Correctness is checked
+against an FP64 golden model computed on the device, element by element.
 */
 
 #include <iostream>
-#include <fstream>
 #include <sstream>
 #include <vector>
 #include <cmath>
+#include <cstring>
+#include <memory>
+#include <functional>
+#include <string>
 
 #include "cutlass/cutlass.h"
-#include "cutlass/gemm/device/gemm.h"
 #include "cutlass/conv/kernel/default_conv2d_fprop.h"
 #include "cutlass/conv/device/implicit_gemm_convolution.h"
-
-#include "cutlass/util/command_line.h"
-#include "cutlass/util/host_tensor.h"
-#include "cutlass/util/tensor_view_io.h"
-#include "cutlass/util/reference/device/gemm.h"
-#include "cutlass/util/reference/host/tensor_compare.h"
-#include "cutlass/util/reference/host/tensor_copy.h"
-#include "cutlass/util/reference/host/tensor_fill.h"
-#include "cutlass/util/reference/host/convolution.h"
-#include "cutlass/util/tensor_view_io.h"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/util/device_memory.h"
 
 #include "helper.h"
 
-#ifdef KH_TEST_SOLUTION
-#include "solution.h"
-#endif
+// KH_VERIFY_BEGIN
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Verification utilities: full-mantissa random inputs, FP64 golden model on the device,
+// per-element tolerance check (every element, NaN/Inf fail).
+/////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Data types for input and output tensors
-// and computation between elements
+__host__ __device__ inline unsigned kh_hash32(unsigned x) {
+  x ^= x >> 16; x *= 0x7FEB352Du; x ^= x >> 15; x *= 0x846CA68Bu; x ^= x >> 16;
+  return x;
+}
+
+/// Uniform double in [lo, hi) with 64 random bits per element (no periodic pattern), so every
+/// mantissa bit of the stored FP16/FP32 value is random.
+__device__ inline double kh_uniform(size_t i, unsigned seed, double lo, double hi) {
+  unsigned h1 = kh_hash32(unsigned(i) * 0x9E3779B1u + seed * 0x85EBCA77u + unsigned(i >> 32) * 0xC2B2AE3Du + 0x165667B1u);
+  unsigned h2 = kh_hash32(h1 ^ (unsigned(i) * 0x27D4EB2Fu + seed));
+  double u = (double(h1) * 4294967296.0 + double(h2)) * (1.0 / 18446744073709551616.0);
+  return lo + (hi - lo) * u;
+}
+
+template <typename T>
+__global__ void kh_fill_uniform_kernel(T *p, size_t n, unsigned seed, double lo, double hi) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
+    p[i] = T(float(kh_uniform(i, seed, lo, hi)));
+}
+
+template <typename T>
+void kh_fill_uniform(T *p, size_t n, unsigned seed, double lo, double hi) {
+  kh_fill_uniform_kernel<<<1024, 256>>>(p, n, seed, lo, hi);
+}
+
+template <typename T>
+__global__ void kh_fill_value_kernel(T *p, size_t n, T v) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
+    p[i] = v;
+}
+
+/// FP64 tiled "implicit GEMM" golden model: out[o(z,m,n)] = sum_k a(z,m,k) * b(z,k,n), accumulated
+/// in double; also accumulates sum |a*b| and sum (a*b)^2 (FP32, used to scale the tolerance).
+/// blockIdx.z = cls * splits + split; split-K partial sums are combined with atomics, so the
+/// output buffers must be zeroed first.
+template <typename Prob>
+__global__ void __launch_bounds__(256) kh_golden_kernel(Prob pb, double *G, float *Aabs, float *Asq) {
+  __shared__ double As[16][65];
+  __shared__ double Bs[16][65];
+  __shared__ float Asf[16][65];
+  __shared__ float Bsf[16][65];
+  int cls = blockIdx.z / pb.splits, split = blockIdx.z % pb.splits;
+  int M = pb.rows(cls), Ncol = pb.ncols, Kd = pb.depth(cls);
+  int m0 = blockIdx.x * 64, n0 = blockIdx.y * 64;
+  if (m0 >= M || n0 >= Ncol) return;
+  int chunk = ((Kd + pb.splits - 1) / pb.splits + 15) / 16 * 16;
+  int kbeg = split * chunk, kend = min(Kd, kbeg + chunk);
+  int tx = threadIdx.x % 16, ty = threadIdx.x / 16;
+  double acc[4][4];
+  float aab[4][4], asq[4][4];
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 4; ++j) { acc[i][j] = 0.0; aab[i][j] = 0.f; asq[i][j] = 0.f; }
+  for (int k0 = kbeg; k0 < kend; k0 += 16) {
+    for (int l = 0; l < 4; ++l) {
+      int idx = threadIdx.x + l * 256, kk = idx % 16, rr = idx / 16;
+      int m = m0 + rr, n = n0 + rr, k = k0 + kk;
+      double av = (m < M && k < kend) ? pb.a(cls, m, k) : 0.0;
+      double bv = (n < Ncol && k < kend) ? pb.b(cls, k, n) : 0.0;
+      As[kk][rr] = av; Asf[kk][rr] = float(av);
+      Bs[kk][rr] = bv; Bsf[kk][rr] = float(bv);
+    }
+    __syncthreads();
+    for (int kk = 0; kk < 16; ++kk) {
+      double a[4], b[4];
+      float af[4], bf[4];
+      for (int i = 0; i < 4; ++i) { a[i] = As[kk][ty * 4 + i]; af[i] = Asf[kk][ty * 4 + i]; }
+      for (int j = 0; j < 4; ++j) { b[j] = Bs[kk][tx * 4 + j]; bf[j] = Bsf[kk][tx * 4 + j]; }
+      for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+          acc[i][j] = fma(a[i], b[j], acc[i][j]);
+          float p = af[i] * bf[j];
+          aab[i][j] += fabsf(p);
+          asq[i][j] = fmaf(p, p, asq[i][j]);
+        }
+    }
+    __syncthreads();
+  }
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 4; ++j) {
+      int m = m0 + ty * 4 + i, n = n0 + tx * 4 + j;
+      if (m < M && n < Ncol) {
+        size_t o = pb.out(cls, m, n);
+        if (pb.splits == 1) { G[o] = acc[i][j]; Aabs[o] = aab[i][j]; Asq[o] = asq[i][j]; }
+        else { atomicAdd(&G[o], acc[i][j]); atomicAdd(&Aabs[o], aab[i][j]); atomicAdd(&Asq[o], asq[i][j]); }
+      }
+    }
+}
+
+template <typename Prob>
+void kh_golden(Prob pb, int max_rows, int classes, double *G, float *Aabs, float *Asq, size_t count) {
+  cudaMemset(G, 0, count * sizeof(double));
+  cudaMemset(Aabs, 0, count * sizeof(float));
+  cudaMemset(Asq, 0, count * sizeof(float));
+  dim3 grid((max_rows + 63) / 64, (pb.ncols + 63) / 64, classes * pb.splits);
+  // (pb.ncols: number of GEMM columns)
+  kh_golden_kernel<<<grid, 256>>>(pb, G, Aabs, Asq);
+}
+
+/// Result of a tolerance check over every output element.
+struct KhCheckResult {
+  float max_ratio;                  // max over elements of |got - expected| / tol (inf if NaN/Inf)
+  unsigned long long n_bad;         // elements outside tolerance (including NaN/Inf)
+  unsigned long long n_nonfinite;   // NaN/Inf elements
+  bool ok() const { return n_bad == 0 && n_nonfinite == 0; }
+};
+
+/// Cmp functor: void operator()(size_t i, double &got, double &expected, double &tol) const
+template <typename Cmp>
+__global__ void kh_compare_kernel(Cmp cmp, size_t n, unsigned *max_bits, unsigned long long *n_bad,
+                                  unsigned long long *n_nonfinite) {
+  float local = 0.f;
+  unsigned long long bad = 0, nf = 0;
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
+    double got, expected, tol;
+    cmp(i, got, expected, tol);
+    float r;
+    if (!isfinite(got)) { ++nf; ++bad; r = INFINITY; }
+    else {
+      double e = fabs(got - expected);
+      tol = fmax(tol, 1e-30);
+      if (!(e <= tol)) ++bad;
+      r = float(e / tol);
+      if (!(r >= 0.f)) r = INFINITY;
+    }
+    local = fmaxf(local, r);
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    local = fmaxf(local, __shfl_xor_sync(0xffffffffu, local, o));
+    bad += __shfl_xor_sync(0xffffffffu, bad, o);
+    nf += __shfl_xor_sync(0xffffffffu, nf, o);
+  }
+  if ((threadIdx.x & 31) == 0) {
+    atomicMax(max_bits, __float_as_uint(local));
+    if (bad) atomicAdd(n_bad, bad);
+    if (nf) atomicAdd(n_nonfinite, nf);
+  }
+}
+
+template <typename Cmp>
+KhCheckResult kh_compare(Cmp cmp, size_t n) {
+  static unsigned long long *d_buf = nullptr;
+  if (!d_buf) cudaMalloc(&d_buf, 3 * sizeof(unsigned long long));
+  cudaMemset(d_buf, 0, 3 * sizeof(unsigned long long));
+  kh_compare_kernel<<<1024, 256>>>(cmp, n, reinterpret_cast<unsigned *>(d_buf), d_buf + 1, d_buf + 2);
+  unsigned long long h[3];
+  cudaMemcpy(h, d_buf, sizeof(h), cudaMemcpyDeviceToHost);
+  KhCheckResult r;
+  unsigned bits = unsigned(h[0] & 0xffffffffu);
+  memcpy(&r.max_ratio, &bits, sizeof(float));
+  r.n_bad = h[1];
+  r.n_nonfinite = h[2];
+  return r;
+}
+// KH_VERIFY_END
+
+/// Golden problem: implicit GEMM view of conv2d fprop (M = N*P*Q, N = K, K-dim = R*S*C).
+struct KhFpropProblem {
+  cutlass::half_t const *x, *w;
+  int N, C, H, W, K, R, S, P, Q, pad_h, pad_w, stride_h, stride_w;
+  int splits, ncols;
+  __device__ int rows(int) const { return N * P * Q; }
+  __device__ int depth(int) const { return R * S * C; }
+  __device__ double a(int, int m, int k) const {
+    int c = k % C, rs = k / C, s = rs % S, r = rs / S;
+    int q = m % Q, t = m / Q, p = t % P, n = t / P;
+    int h = p * stride_h + r - pad_h, wi = q * stride_w + s - pad_w;
+    if (h < 0 || h >= H || wi < 0 || wi >= W) return 0.0;
+    return double(float(x[((size_t(n) * H + h) * W + wi) * C + c]));
+  }
+  __device__ double b(int, int k, int n) const { return double(float(w[size_t(n) * R * S * C + k])); }
+  __device__ size_t out(int, int m, int n) const { return size_t(m) * K + n; }
+};
+
+/// expected = alpha * conv + beta * C;  tol = kTolScale * (|alpha| * sum|x*w| + |beta * C|)
+struct KhFpropCompare {
+  float const *got; double const *G; float const *Aabs; float const *Cin;
+  float alpha, beta; double tol_scale;
+  __device__ void operator()(size_t i, double &g, double &e, double &tol) const {
+    double c = Cin ? double(Cin[i]) : 0.0;
+    g = got[i];
+    e = double(alpha) * G[i] + double(beta) * c;
+    tol = tol_scale * (fabs(double(alpha)) * Aabs[i] + fabs(double(beta) * c));
+  }
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Data types for input and output tensors and computation between elements
 using ElementAccumulator = float;                  // Data type of accumulator
 using ElementComputeEpilogue = float;              // Data type of epilogue computation (alpha, beta)
 using ElementInputA = cutlass::half_t;             // Data type of elements in input tensor
-using ElementInputB = cutlass::half_t;             // Data type of elements in input tensor
+using ElementInputB = cutlass::half_t;             // Data type of elements in filter tensor
 using ElementOutput = float;                       // Data type of elements in output tensor
 
 using LayoutInputA = cutlass::layout::TensorNHWC;
 using LayoutInputB = cutlass::layout::TensorNHWC;
 using LayoutOutput = cutlass::layout::TensorNHWC;
 
-// Whether to use tensor cores or regular SIMT cores on GPU SM
-using MMAOp = cutlass::arch::OpClassTensorOp;
-
-// SM architecture number
-using SmArch = cutlass::arch::Sm80;
-
-// Threadblock tile shape
-using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 64>;
-
-// Warp tile shape
-using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
-
-// MMA (Tensor Core instruction, in this case) tile shape
-using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
-
-// How the kernel schedules threadblocks
-using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
-
-// Number of pipeline stages to use
-constexpr int NumStages = 3;
-
-// Which iterator algorithm to use: Analytic or Optimized
-static cutlass::conv::IteratorAlgorithm const IteratorAlgorithm = cutlass::conv::IteratorAlgorithm::kOptimized;
-
-// Is the output packed or strided
-static cutlass::conv::StrideSupport const OutputStride = cutlass::conv::StrideSupport::kUnity;
-
 // The epilogue part of the kernel
 using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
     ElementOutput,                                     // Data type of output matrix.
-    128 / cutlass::sizeof_bits<ElementOutput>::value,  // The number of elements per vectorized
-                                                       // memory access.
+    128 / cutlass::sizeof_bits<ElementOutput>::value,  // The number of elements per vectorized memory access.
     ElementAccumulator,                                // Data type of accumulator
     ElementComputeEpilogue>;                           // Data type for alpha/beta in linear combination
 
-// Kernel properties type
-using Conv2dFpropKernel = typename cutlass::conv::kernel::DefaultConv2dFprop<
-  ElementInputA, LayoutInputA,
-  ElementInputB, LayoutInputB,
-  ElementOutput, LayoutOutput,
-  ElementAccumulator,
-  MMAOp,
-  SmArch,
-  ThreadblockShape,
-  WarpShape,
-  InstructionShape,
-  EpilogueOp,
-  SwizzleThreadBlock,
-  NumStages,
-  cutlass::arch::OpMultiplyAdd,
-  IteratorAlgorithm,
-  OutputStride
->::Kernel;
+/// CUTLASS Ampere tensor-core fprop (F16 x F16 -> F32 accumulate -> F32) for a given tile configuration.
+template <int TbM, int TbN, int TbK, int WM, int WN, int WK, int Stages>
+struct FpropConfig {
+  using Kernel = typename cutlass::conv::kernel::DefaultConv2dFprop<
+    ElementInputA, LayoutInputA,
+    ElementInputB, LayoutInputB,
+    ElementOutput, LayoutOutput,
+    ElementAccumulator,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<TbM, TbN, TbK>,
+    cutlass::gemm::GemmShape<WM, WN, WK>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    EpilogueOp,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+    Stages,
+    cutlass::arch::OpMultiplyAdd,
+    cutlass::conv::IteratorAlgorithm::kOptimized,
+    cutlass::conv::StrideSupport::kStrided
+  >::Kernel;
+  using Op = cutlass::conv::device::ImplicitGemmConvolution<Kernel>;
+};
 
-// Type of the actual kernel
-using ImplicitGemm = cutlass::conv::device::ImplicitGemmConvolution<Conv2dFpropKernel>;
+// Tile configurations; the per-size choice comes from an offline sweep on the target GPU.
+using Fprop_128x128x64_s3 = FpropConfig<128, 128, 64, 64, 64, 64, 3>;   // default (custom sizes)
+using Fprop_128x64x32_s4  = FpropConfig<128,  64, 32, 64, 32, 32, 4>;
+using Fprop_128x64x64_s3  = FpropConfig<128,  64, 64, 64, 32, 64, 3>;
+using Fprop_128x256x32_s3 = FpropConfig<128, 256, 32, 64, 64, 32, 3>;
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
+/// A prepared (initialized) reference convolution; run() only launches the kernel.
+struct RefConv {
+  std::function<cutlass::Status()> run;
+  std::string name;
+};
 
-/// Run the CUTLASS conv2d fprop using HostTensor utilities
-cudaError_t CutlassConv2dFprop(
-  cutlass::conv::Conv2dProblemSize const &problem_size,
-  cutlass::HostTensor<ElementInputA, LayoutInputA> &tensor_a,
-  cutlass::HostTensor<ElementInputB, LayoutInputB> &tensor_b,
-  cutlass::HostTensor<ElementOutput, LayoutOutput> &tensor_c,
-  cutlass::HostTensor<ElementOutput, LayoutOutput> &tensor_d,
-  float alpha, float beta) {
-
-  typename ImplicitGemm::Arguments arguments{
+template <typename Op>
+cutlass::Status MakeRefConv(RefConv &rc, char const *name,
+    cutlass::conv::Conv2dProblemSize const &problem_size,
+    cutlass::half_t const *input, cutlass::half_t const *filter, float const *C, float *D,
+    cutlass::Tensor4DCoord input_size, cutlass::Tensor4DCoord filter_size, cutlass::Tensor4DCoord output_size,
+    float alpha, float beta) {
+  typename Op::Arguments arguments{
     problem_size,
-    tensor_a.device_ref(),
-    tensor_b.device_ref(),
-    tensor_c.device_ref(),
-    tensor_d.device_ref(),
+    {const_cast<cutlass::half_t *>(input), LayoutInputA::packed(input_size)},
+    {const_cast<cutlass::half_t *>(filter), LayoutInputB::packed(filter_size)},
+    {const_cast<float *>(C), LayoutOutput::packed(output_size)},
+    {D, LayoutOutput::packed(output_size)},
     {alpha, beta},
   };
+  auto op = std::make_shared<Op>();
+  auto workspace = std::make_shared<cutlass::device_memory::allocation<uint8_t>>(op->get_workspace_size(arguments));
+  cutlass::Status status = op->can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) return status;
+  status = op->initialize(arguments, workspace->get());
+  if (status != cutlass::Status::kSuccess) return status;
+  rc.name = name;
+  rc.run = [op, workspace]() { return op->run(); };
+  return cutlass::Status::kSuccess;
+}
 
-  ImplicitGemm implicit_gemm_op;
-  size_t workspace_size = implicit_gemm_op.get_workspace_size(arguments);
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+struct TestConfig {
+  const char* label;
+  int N, H, W, C, K, R, S, pad_h, pad_w, stride_h, stride_w;
+};
 
-  cutlass::Status status = implicit_gemm_op.can_implement(arguments);
-  if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
-
-  status = implicit_gemm_op.initialize(arguments, workspace.get());
-  if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
-
-  status = implicit_gemm_op();
-  if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
-
-  return cudaSuccess;
+/// Per-size reference kernel selection (benchmark sizes); anything else uses the default tile.
+cutlass::Status PrepareReference(RefConv &rc, TestConfig const &cfg,
+    cutlass::conv::Conv2dProblemSize const &ps, cutlass::half_t const *x, cutlass::half_t const *w,
+    float const *C, float *D, cutlass::Tensor4DCoord is, cutlass::Tensor4DCoord fs, cutlass::Tensor4DCoord os,
+    float alpha, float beta) {
+  std::string l = cfg.label;
+  if (l == "resnet50_conv2_b256")
+    return MakeRefConv<Fprop_128x64x32_s4::Op>(rc, "128x64x32_s4", ps, x, w, C, D, is, fs, os, alpha, beta);
+  if (l == "resnet50_conv4_b256" || l == "sdxl_unet_128" || l == "sdxl_unet_64")
+    return MakeRefConv<Fprop_128x64x64_s3::Op>(rc, "128x64x64_s3", ps, x, w, C, D, is, fs, os, alpha, beta);
+  if (l == "sdxl_unet_32")
+    return MakeRefConv<Fprop_128x256x32_s3::Op>(rc, "128x256x32_s3", ps, x, w, C, D, is, fs, os, alpha, beta);
+  return MakeRefConv<Fprop_128x128x64_s3::Op>(rc, "128x128x64_s3", ps, x, w, C, D, is, fs, os, alpha, beta);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Naive reference conv2d forward: NHWC layout, half input, float output
-__global__ void ReferenceConv2d_kernel(
-  cutlass::half_t const *input, cutlass::half_t const *filter,
-  float const *C_in, float *output,
-  int N, int C, int H, int W, int K, int R, int S,
-  int P, int Q, int pad_h, int pad_w, int stride_h, int stride_w,
-  float alpha, float beta) {
+// The solution is included after all reference / verification code so that its macros cannot
+// change the harness.
+#ifdef KH_TEST_SOLUTION
+#include "solution.h"
+#endif
 
-  int idx = threadIdx.x + blockIdx.x * blockDim.x;
-  int total = N * P * Q * K;
-  if (idx >= total) return;
+// Tolerance: |out - expected| <= kTolScale * (|alpha| * sum_{c,r,s} |x*w| + |beta * C|), where
+// `expected` is the FP64 golden result for the given FP16 inputs. FP32 accumulation of the exact
+// FP16 products stays far below this; FP16 products/accumulation or BF16/FP8/INT8 operands do not.
+constexpr double kTolScale = 5.0e-6;
 
-  int k_idx = idx % K; int tmp = idx / K;
-  int q_idx = tmp % Q; tmp /= Q;
-  int p_idx = tmp % P; int n_idx = tmp / P;
+#ifdef KH_TEST_SOLUTION
+// Second correctness check: non-trivial alpha/beta with the prior output values as source.
+constexpr float kCheckAlpha = 0.8125f;
+constexpr float kCheckBeta = -1.375f;
 
-  float acc = 0.0f;
-  for (int c = 0; c < C; ++c)
-    for (int r = 0; r < R; ++r)
-      for (int s = 0; s < S; ++s) {
-        int h = p_idx * stride_h + r - pad_h;
-        int w = q_idx * stride_w + s - pad_w;
-        if (h >= 0 && h < H && w >= 0 && w < W) {
-          float inp = float(input[((n_idx * H + h) * W + w) * C + c]);
-          float flt = float(filter[((k_idx * R + r) * S + s) * C + c]);
-          acc += inp * flt;
-        }
-      }
-  int out_idx = ((n_idx * P + p_idx) * Q + q_idx) * K + k_idx;
-  output[out_idx] = alpha * acc + beta * C_in[out_idx];
+// Finite poison for the output buffer when beta == 0 (beta * C must then contribute 0; any
+// element the solution does not write stays at this value and fails the check).
+constexpr float kPoison = -1.0e30f;
+#endif
+
+static bool ReportCheck(char const *what, KhCheckResult const &r) {
+  fprintf(stdout, "%s: max err/tol = %.3g, elements outside tolerance = %llu, non-finite = %llu\n",
+          what, double(r.max_ratio), r.n_bad, r.n_nonfinite);
+  return r.ok();
 }
 
-cudaError_t ReferenceConv2d(
-  cutlass::half_t const *input, cutlass::half_t const *filter,
-  float const *C_in, float *output,
-  int N, int C, int H, int W, int K, int R, int S,
-  int P, int Q, int pad_h, int pad_w, int stride_h, int stride_w,
-  float alpha, float beta) {
-
-  int total = N * P * Q * K;
-  int threads = 256;
-  int blocks = (total + threads - 1) / threads;
-  ReferenceConv2d_kernel<<<blocks, threads>>>(
-    input, filter, C_in, output,
-    N, C, H, W, K, R, S, P, Q,
-    pad_h, pad_w, stride_h, stride_w, alpha, beta);
-  return cudaGetLastError();
-}
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Test correctness: CUTLASS reference vs naive, and (if KH_TEST_SOLUTION) solution vs CUTLASS
-cudaError_t TestCorrectness(
-  int N, int H, int W, int C, int K, int R, int S,
-  int pad_h, int pad_w, int stride_h, int stride_w,
-  float alpha, float beta) {
-
+/// Runs correctness checks and (if iterations > 0) timing for one problem size.
+/// Returns false on any failure.
+bool RunSize(TestConfig const &cfg, float alpha, float beta, int iterations) {
+  int N = cfg.N, H = cfg.H, W = cfg.W, C = cfg.C, K = cfg.K, R = cfg.R, S = cfg.S;
+  int pad_h = cfg.pad_h, pad_w = cfg.pad_w, stride_h = cfg.stride_h, stride_w = cfg.stride_w;
   int P = (H + 2 * pad_h - R) / stride_h + 1;
   int Q = (W + 2 * pad_w - S) / stride_w + 1;
 
   cutlass::Tensor4DCoord input_size(N, H, W, C);
   cutlass::Tensor4DCoord filter_size(K, R, S, C);
   cutlass::Tensor4DCoord output_size(N, P, Q, K);
-  cutlass::Tensor4DCoord padding(pad_h, pad_h, pad_w, pad_w);
-  cutlass::MatrixCoord conv_stride(stride_h, stride_w);
-  cutlass::MatrixCoord dilation(1, 1);
-
   cutlass::conv::Conv2dProblemSize problem_size(
-      input_size, filter_size, padding, conv_stride, dilation,
+      input_size, filter_size, cutlass::Tensor4DCoord(pad_h, pad_h, pad_w, pad_w),
+      cutlass::MatrixCoord(stride_h, stride_w), cutlass::MatrixCoord(1, 1),
       output_size, cutlass::conv::Mode::kCrossCorrelation, 1);
 
-  // Allocate host-device tensors
-  cutlass::HostTensor<ElementInputA, LayoutInputA> tensor_a(input_size);
-  cutlass::HostTensor<ElementInputB, LayoutInputB> tensor_b(filter_size);
-  cutlass::HostTensor<ElementOutput, LayoutOutput> tensor_c(output_size);
-  cutlass::HostTensor<ElementOutput, LayoutOutput> tensor_d_cutlass(output_size);
-  cutlass::HostTensor<ElementOutput, LayoutOutput> tensor_d_ref(output_size);
+  size_t in_count = size_t(input_size.product()), f_count = size_t(filter_size.product());
+  size_t out_count = size_t(output_size.product());
 
-  // Fill with random data
-  cutlass::reference::host::TensorFillRandomUniform(tensor_a.host_view(), 1,
-      ElementInputA(7), ElementInputA(-8), 0);
-  cutlass::reference::host::TensorFillRandomUniform(tensor_b.host_view(), 1,
-      ElementInputB(7), ElementInputB(-8), 0);
-  cutlass::reference::host::TensorFillRandomUniform(tensor_c.host_view(), 1,
-      ElementOutput(7), ElementOutput(-8), 0);
-  cutlass::reference::host::TensorFill(tensor_d_cutlass.host_view());
-  cutlass::reference::host::TensorFill(tensor_d_ref.host_view());
+  cutlass::device_memory::allocation<cutlass::half_t> d_x(in_count), d_w(f_count);
+  cutlass::device_memory::allocation<float> d_c(out_count), d_ref(out_count), d_sol(out_count);
+  cutlass::device_memory::allocation<double> d_golden(out_count);
+  cutlass::device_memory::allocation<float> d_abs(out_count), d_sq(out_count);
 
-  tensor_a.sync_device();
-  tensor_b.sync_device();
-  tensor_c.sync_device();
-  tensor_d_cutlass.sync_device();
-  tensor_d_ref.sync_device();
+  // Random inputs with full FP16 mantissa, uniform in [-1, 1); C (source) uniform in [-1, 1).
+  kh_fill_uniform(d_x.get(), in_count, 11u, -1.0, 1.0);
+  kh_fill_uniform(d_w.get(), f_count, 23u, -1.0, 1.0);
+  kh_fill_uniform(d_c.get(), out_count, 37u, -1.0, 1.0);
 
-  // Run CUTLASS reference
-  cudaError_t result = CutlassConv2dFprop(
-    problem_size, tensor_a, tensor_b, tensor_c, tensor_d_cutlass, alpha, beta);
-  if (result != cudaSuccess) {
-    std::cerr << "CUTLASS conv2d failed: " << cudaGetErrorString(result) << std::endl;
-    return result;
+  // FP64 golden model on the device.
+  KhFpropProblem pb{d_x.get(), d_w.get(), N, C, H, W, K, R, S, P, Q, pad_h, pad_w, stride_h, stride_w, 1, K};
+  kh_golden(pb, N * P * Q, 1, d_golden.get(), d_abs.get(), d_sq.get(), out_count);
+  cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    std::cerr << "Golden model failed: " << cudaGetErrorString(err) << std::endl;
+    return false;
   }
-  cudaDeviceSynchronize();
 
-  // Run naive reference
-  result = ReferenceConv2d(
-    tensor_a.device_data(), tensor_b.device_data(),
-    tensor_c.device_data(), tensor_d_ref.device_data(),
-    N, C, H, W, K, R, S, P, Q,
-    pad_h, pad_w, stride_h, stride_w, alpha, beta);
-  if (result != cudaSuccess) {
-    std::cerr << "Reference conv2d failed: " << cudaGetErrorString(result) << std::endl;
-    return result;
+  // Reference (CUTLASS) with the timed alpha/beta.
+  RefConv ref;
+  cutlass::Status st = PrepareReference(ref, cfg, problem_size, d_x.get(), d_w.get(), d_c.get(), d_ref.get(),
+                                        input_size, filter_size, output_size, alpha, beta);
+  if (st != cutlass::Status::kSuccess || ref.run() != cutlass::Status::kSuccess ||
+      cudaDeviceSynchronize() != cudaSuccess) {
+    std::cerr << "CUTLASS reference failed: " << cutlassGetStatusString(st) << std::endl;
+    return false;
   }
-  cudaDeviceSynchronize();
-
-  // Verify CUTLASS vs naive
-  tensor_d_cutlass.sync_host();
-  tensor_d_ref.sync_host();
-
-  float max_diff = 0;
-  for (int n = 0; n < N; ++n)
-    for (int p = 0; p < P; ++p)
-      for (int q = 0; q < Q; ++q)
-        for (int k = 0; k < K; ++k) {
-          float cutlass_val = tensor_d_cutlass.at({n, p, q, k});
-          float ref_val = tensor_d_ref.at({n, p, q, k});
-          max_diff = fmaxf(max_diff, fabsf(cutlass_val - ref_val));
-        }
-
-  if (max_diff > 1e-2f) {
-    std::cerr << "CUTLASS reference incorrect vs naive. Max diff: " << max_diff << std::endl;
-    return cudaErrorUnknown;
+  KhFpropCompare cmp{d_ref.get(), d_golden.get(), d_abs.get(), d_c.get(), alpha, beta, kTolScale};
+  if (!ReportCheck("Reference check (CUTLASS vs FP64 golden)", kh_compare(cmp, out_count))) {
+    std::cerr << "CUTLASS reference incorrect vs FP64 golden model." << std::endl;
+    return false;
   }
 
 #ifdef KH_TEST_SOLUTION
-  {
-  // Allocate solution output (copy initial C values)
-  int output_count = N * P * Q * K;
-  float *d_solution;
-  cudaMalloc(&d_solution, output_count * sizeof(float));
-  cudaMemcpy(d_solution, tensor_c.device_data(), output_count * sizeof(float), cudaMemcpyDeviceToDevice);
+  // Prepares the solution's output buffer: poison (beta == 0) or the source values C (beta != 0).
+  auto prepare_output = [&](float b) {
+    if (b == 0.0f) kh_fill_value_kernel<<<1024, 256>>>(d_sol.get(), out_count, kPoison);
+    else cudaMemcpy(d_sol.get(), d_c.get(), out_count * sizeof(float), cudaMemcpyDeviceToDevice);
+  };
+  auto check_solution = [&](char const *what, float a, float b) {
+    KhFpropCompare c{d_sol.get(), d_golden.get(), d_abs.get(), d_c.get(), a, b, kTolScale};
+    return ReportCheck(what, kh_compare(c, out_count));
+  };
+  auto call_solution = [&](float a, float b) {
+    return Conv2dFpropF16(
+      reinterpret_cast<__half const *>(d_x.get()), reinterpret_cast<__half const *>(d_w.get()),
+      d_sol.get(), N, C, H, W, K, R, S, pad_h, pad_w, stride_h, stride_w, a, b);
+  };
 
-  // Run solution
-  result = Conv2dFpropF16(
-    reinterpret_cast<__half const *>(tensor_a.device_data()),
-    reinterpret_cast<__half const *>(tensor_b.device_data()),
-    d_solution,
-    N, C, H, W, K, R, S,
-    pad_h, pad_w, stride_h, stride_w,
-    alpha, beta);
-  if (result != cudaSuccess) {
-    std::cerr << "Solution kernel failed: " << cudaGetErrorString(result) << std::endl;
-    cudaFree(d_solution);
-    return result;
-  }
-  cudaDeviceSynchronize();
-
-  // Verify solution vs CUTLASS reference
-  std::vector<float> host_solution(output_count);
-  cudaMemcpy(host_solution.data(), d_solution, output_count * sizeof(float), cudaMemcpyDeviceToHost);
-
-  float sol_max_diff = 0;
-  int sol_idx = 0;
-  for (int n = 0; n < N; ++n)
-    for (int p = 0; p < P; ++p)
-      for (int q = 0; q < Q; ++q)
-        for (int k = 0; k < K; ++k) {
-          float cutlass_val = tensor_d_cutlass.at({n, p, q, k});
-          sol_max_diff = fmaxf(sol_max_diff, fabsf(host_solution[sol_idx] - cutlass_val));
-          sol_idx++;
-        }
-
-  if (sol_max_diff > 1e-1f) {
-    std::cerr << "Solution incorrect. Max diff vs reference: " << sol_max_diff << std::endl;
-    cudaFree(d_solution);
-    return cudaErrorUnknown;
-  }
-
-  cudaFree(d_solution);
+  float const check_alpha[2] = {alpha, kCheckAlpha};
+  float const check_beta[2] = {beta, kCheckBeta};
+  for (int t = 0; t < 2; ++t) {
+    prepare_output(check_beta[t]);
+    cudaDeviceSynchronize();
+    cudaError_t result = call_solution(check_alpha[t], check_beta[t]);
+    cudaError_t sync = cudaDeviceSynchronize();
+    if (result != cudaSuccess || sync != cudaSuccess) {
+      std::cerr << "Solution kernel failed: "
+                << cudaGetErrorString(result != cudaSuccess ? result : sync) << std::endl;
+      return false;
+    }
+    char what[128];
+    snprintf(what, sizeof(what), "Solution check (alpha=%g, beta=%g)", check_alpha[t], check_beta[t]);
+    if (!check_solution(what, check_alpha[t], check_beta[t])) {
+      std::cerr << "Solution incorrect (" << what << ")." << std::endl;
+      return false;
+    }
   }
 #endif
 
-  return cudaSuccess;
-}
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Profile reference (and solution if KH_TEST_SOLUTION) with CUDA events.
-void Profile(
-  int N, int H, int W, int C, int K, int R, int S,
-  int pad_h, int pad_w, int stride_h, int stride_w,
-  float alpha, float beta, int iterations) {
-
-  int P = (H + 2 * pad_h - R) / stride_h + 1;
-  int Q = (W + 2 * pad_w - S) / stride_w + 1;
-
-  cutlass::Tensor4DCoord input_size(N, H, W, C);
-  cutlass::Tensor4DCoord filter_size(K, R, S, C);
-  cutlass::Tensor4DCoord output_size(N, P, Q, K);
-  cutlass::Tensor4DCoord padding(pad_h, pad_h, pad_w, pad_w);
-  cutlass::MatrixCoord conv_stride(stride_h, stride_w);
-  cutlass::MatrixCoord dilation(1, 1);
-
-  cutlass::conv::Conv2dProblemSize problem_size(
-      input_size, filter_size, padding, conv_stride, dilation,
-      output_size, cutlass::conv::Mode::kCrossCorrelation, 1);
-
-  cutlass::HostTensor<ElementInputA, LayoutInputA> tensor_a(input_size);
-  cutlass::HostTensor<ElementInputB, LayoutInputB> tensor_b(filter_size);
-  cutlass::HostTensor<ElementOutput, LayoutOutput> tensor_c(output_size);
-  cutlass::HostTensor<ElementOutput, LayoutOutput> tensor_d(output_size);
-
-  cutlass::reference::host::TensorFillRandomUniform(tensor_a.host_view(), 1,
-      ElementInputA(7), ElementInputA(-8), 0);
-  cutlass::reference::host::TensorFillRandomUniform(tensor_b.host_view(), 1,
-      ElementInputB(7), ElementInputB(-8), 0);
-  cutlass::reference::host::TensorFillRandomUniform(tensor_c.host_view(), 1,
-      ElementOutput(7), ElementOutput(-8), 0);
-  cutlass::reference::host::TensorFill(tensor_d.host_view());
-
-  tensor_a.sync_device();
-  tensor_b.sync_device();
-  tensor_c.sync_device();
-  tensor_d.sync_device();
+  std::cout << "Passed" << std::endl;
+  if (iterations <= 0) return true;
 
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
-  // Warmup reference
-  for (int i = 0; i < 3; i++) {
-    CutlassConv2dFprop(problem_size, tensor_a, tensor_b, tensor_c, tensor_d, alpha, beta);
-  }
+  // Profile reference (kernel launch only; the CUTLASS operator is initialized once above).
+  for (int i = 0; i < 3; ++i) ref.run();
   cudaDeviceSynchronize();
-
-  // Profile reference
   float ref_total_ms = 0, ref_min_ms = 1e30f;
   for (int iter = 0; iter < iterations; ++iter) {
     cudaEventRecord(start);
-    CutlassConv2dFprop(problem_size, tensor_a, tensor_b, tensor_c, tensor_d, alpha, beta);
+    ref.run();
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     float ms;
@@ -422,51 +493,47 @@ void Profile(
     ref_total_ms += ms;
     if (ms < ref_min_ms) ref_min_ms = ms;
   }
-  fprintf(stdout, "Ref time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
-          ref_total_ms / iterations, iterations, ref_min_ms);
+  fprintf(stdout, "Ref time: %.4f ms (avg over %d trials, min: %.4f ms) [config %s]\n",
+          ref_total_ms / iterations, iterations, ref_min_ms, ref.name.c_str());
 
 #ifdef KH_TEST_SOLUTION
   {
-  int output_count = N * P * Q * K;
   // Warmup solution
-  float *d_sol_output;
-  cudaMalloc(&d_sol_output, output_count * sizeof(float));
   for (int i = 0; i < 3; i++) {
-    cudaMemcpy(d_sol_output, tensor_c.device_data(), output_count * sizeof(float), cudaMemcpyDeviceToDevice);
-    Conv2dFpropF16(
-      reinterpret_cast<__half const *>(tensor_a.device_data()),
-      reinterpret_cast<__half const *>(tensor_b.device_data()),
-      d_sol_output, N, C, H, W, K, R, S,
-      pad_h, pad_w, stride_h, stride_w, alpha, beta);
+    prepare_output(beta);
+    call_solution(alpha, beta);
   }
   cudaDeviceSynchronize();
 
-  // Profile solution
+  // Profile solution; every timed call is verified as well (untimed).
   float sol_total_ms = 0, sol_min_ms = 1e30f;
   for (int iter = 0; iter < iterations; ++iter) {
-    cudaMemcpy(d_sol_output, tensor_c.device_data(), output_count * sizeof(float), cudaMemcpyDeviceToDevice);
+    prepare_output(beta);
+    cudaDeviceSynchronize();
     cudaEventRecord(start);
-    Conv2dFpropF16(
-      reinterpret_cast<__half const *>(tensor_a.device_data()),
-      reinterpret_cast<__half const *>(tensor_b.device_data()),
-      d_sol_output, N, C, H, W, K, R, S,
-      pad_h, pad_w, stride_h, stride_w, alpha, beta);
+    call_solution(alpha, beta);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     float ms;
     cudaEventElapsedTime(&ms, start, stop);
     sol_total_ms += ms;
     if (ms < sol_min_ms) sol_min_ms = ms;
+    KhFpropCompare c{d_sol.get(), d_golden.get(), d_abs.get(), d_c.get(), alpha, beta, kTolScale};
+    KhCheckResult r = kh_compare(c, out_count);
+    if (!r.ok()) {
+      std::cerr << "Solution incorrect on timed call " << iter << " (max err/tol = " << r.max_ratio << ")." << std::endl;
+      return false;
+    }
   }
   fprintf(stdout, "Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
           sol_total_ms / iterations, iterations, sol_min_ms);
   fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
-  cudaFree(d_sol_output);
   }
 #endif
 
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
+  return true;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -480,11 +547,6 @@ int main(int argc, const char *arg[]) {
     std::cerr << "Ampere Tensor Ops require compute capability >= 80." << std::endl;
     return 0;
   }
-
-  struct TestConfig {
-    const char* label;
-    int N, H, W, C, K, R, S, pad_h, pad_w, stride_h, stride_w;
-  };
 
   bool explicit_size = (argc >= 8);
   std::vector<TestConfig> configs;
@@ -506,31 +568,24 @@ int main(int argc, const char *arg[]) {
     if (argc > 10) std::stringstream(arg[10]) >> iterations;
     configs.push_back({"custom", N, H, W, C, K, R, S, pad_h, pad_w, 1, 1});
   } else {
+    // Real 3x3 conv layers: ResNet-50 at training batch 256, and the SDXL UNet at 1024x1024
+    // (128x128 latents; batch 4 = 2 images x classifier-free guidance).
     configs = {
-      {"small",   1, 56, 56,  64,  64, 3, 3, 1, 1, 1, 1},
-      {"medium",  1, 112, 112, 128, 128, 3, 3, 1, 1, 1, 1},
-      {"large",   4, 56, 56, 256, 256, 3, 3, 1, 1, 1, 1},
+      {"resnet50_conv2_b256",      256,  56,  56,   64,   64, 3, 3, 1, 1, 1, 1},
+      {"resnet50_conv3_down_b256", 256,  56,  56,  128,  128, 3, 3, 1, 1, 2, 2},
+      {"resnet50_conv4_b256",      256,  14,  14,  256,  256, 3, 3, 1, 1, 1, 1},
+      {"sdxl_unet_128",              4, 128, 128,  320,  320, 3, 3, 1, 1, 1, 1},
+      {"sdxl_unet_64",               4,  64,  64,  640,  640, 3, 3, 1, 1, 1, 1},
+      {"sdxl_unet_32",               4,  32,  32, 1280, 1280, 3, 3, 1, 1, 1, 1},
     };
   }
 
   for (const auto& cfg : configs) {
-    fprintf(stdout, "\n=== %s: N=%d, H=%d, W=%d, C=%d, K=%d, R=%d, S=%d ===\n",
-            cfg.label, cfg.N, cfg.H, cfg.W, cfg.C, cfg.K, cfg.R, cfg.S);
-
-    cudaError_t result = TestCorrectness(
-      cfg.N, cfg.H, cfg.W, cfg.C, cfg.K, cfg.R, cfg.S,
-      cfg.pad_h, cfg.pad_w, cfg.stride_h, cfg.stride_w,
-      alpha, beta);
-    if (result != cudaSuccess) {
+    fprintf(stdout, "\n=== %s: N=%d, H=%d, W=%d, C=%d, K=%d, R=%d, S=%d, pad=%d, stride=%d ===\n",
+            cfg.label, cfg.N, cfg.H, cfg.W, cfg.C, cfg.K, cfg.R, cfg.S, cfg.pad_h, cfg.stride_h);
+    if (!RunSize(cfg, alpha, beta, iterations)) {
       std::cout << "Incorrect" << std::endl;
       return -1;
-    }
-    std::cout << "Passed" << std::endl;
-
-    if (iterations > 0) {
-      Profile(cfg.N, cfg.H, cfg.W, cfg.C, cfg.K, cfg.R, cfg.S,
-              cfg.pad_h, cfg.pad_w, cfg.stride_h, cfg.stride_w,
-              alpha, beta, iterations);
     }
   }
 

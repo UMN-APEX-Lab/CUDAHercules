@@ -22,7 +22,8 @@ cudaError_t Dsyrk(
 
 C = alpha * A * A^T + beta * C
 
-Only the **lower triangle** of C is computed (elements where i >= j).
+Only the **lower triangle** of C is computed (elements where i >= j). The strictly upper
+triangle of C (i < j) must be left unchanged.
 
 Where:
 - A is N x K
@@ -31,6 +32,10 @@ Where:
 ## Data Types
 
 All matrices are `double` (FP64).
+
+The computation must be carried out in FP64: lower-precision paths (FP32, TF32, FP16, BF16,
+FP8, INT8 arithmetic or tensor cores, or rounding the inputs to a lower precision) are not
+allowed, even if they happen to pass the tolerance.
 
 ## Memory Layout
 
@@ -43,12 +48,17 @@ All matrices are **column-major**:
 ```bash
 make test                    # requires solution.h in task directory
 ./test                       # default: runs small/medium/large sizes
-./test 1024 1024             # custom single size: N K
-./test 1024 1024 1.0 0.0 20 # N K alpha beta iterations
+./test 4096 4096             # custom single size: N K
+./test 4096 4096 1.1 -0.7 20 # N K alpha beta iterations
 ```
 
-Correctness is verified against a reference implementation at multiple problem sizes
+Default run: alpha = 1.1, beta = -0.7, lda = ldc = N, at three problem sizes
 (small: N=K=1024, medium: N=K=4096, large: N=4096 K=8192).
+A and the initial C hold pseudo-random FP64 values in [-1, 1) (full 52-bit mantissa).
+
+Correctness is verified against a reference implementation at every size: each
+lower-triangle element must satisfy |C - C_ref| <= 1e-10 * max|C_ref| (NaN/Inf fail), and
+the strictly upper triangle must be bit-identical to the initial C.
 Performance is timed for both reference and your solution at each size.
 
 CUTLASS headers are available on the include path.

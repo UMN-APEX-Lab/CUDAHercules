@@ -31,8 +31,8 @@ execute:
 correctness:
   mode: tensor_compare
   tolerances:
-    atol: 0.05
-    rtol: 0.05
+    atol: 0.001
+    rtol: 0.01
 performance:
   enabled: true
   parser: {}
@@ -47,6 +47,8 @@ anti_cheat:
   - '#include\s*[<"]flash_attn'
   - '#include\s*[<"]flash_fwd'
   - '#include\s*[<"]flash_bwd'
+  # precision floor: FP16 accumulation in tensor-core MMA
+  - mma[^"\n;]*\.f16\.f16\.f16\.f16|wmma::accumulator\s*,[^;>\n]*\b(?:half|__half)\s*>|\bSM\d+_\d+x\d+x\d+_F16F16F16F16
   required_patterns:
   - __global__\s+void
   - <<<.*>>>

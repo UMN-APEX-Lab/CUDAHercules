@@ -30,38 +30,28 @@
  **************************************************************************************************/
 
 /**
-The example demonstrates how to reduce one of the operands of the GEMM along the k-dimension when
-computing GEMM.  So the output also contains either a Mx1 or 1XN vector.  It only works with Ampere
-16x8x16 FP16/BF16 tensor cores, though it is not difficult to apply to other Turing/Ampere tensor
-core instructions.
-
-Most of the reduction is done in gemm/warp level, see gemm/warp/mma_with_reduction_tensor_op.h
-A few bit of reduction is done in the epilogue before storing the vector, see
-epilogue/threadblock/epilogue_gemm_k_reduction.h
+Based on CUTLASS example 23 (GEMM with an operand reduction). The task computes the backward
+data-gradient GEMM of a linear layer together with the layer's bias gradient:
+  D[M=tokens, N=in_features] = alpha * A[M, K=out_features] * B[K, N] + beta * C
+  row_reduction[k] = sum_m A[m, k]
+The reduction runs over the GEMM's M dimension (not K), so it cannot use CUTLASS's fused
+K-reduction; the reference is a CUTLASS BF16 tensor-core GEMM (per-size configuration from an
+offline sweep on the benchmark GPU, RTX PRO 6000 Blackwell sm_120) followed by a
+bandwidth-bound column-sum kernel over A.
 */
 
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
-#include <fstream>
 #include <sstream>
 #include <vector>
-#include <cmath>
+#include <cuda_bf16.h>
 
 #include "cutlass/cutlass.h"
-#include "cutlass/gemm/device/gemm_with_k_reduction.h"
-#include "cutlass/gemm/kernel/default_gemm_with_k_reduction.h"
-#include "cutlass/reduction/device/reduce_split_k.h"
-#include "cutlass/reduction/kernel/reduce_split_k.h"
-#include "cutlass/reduction/thread/reduction_operators.h"
-#include "cutlass/matrix_coord.h"
-
-#include "cutlass/util/command_line.h"
-#include "cutlass/util/host_tensor.h"
-#include "cutlass/util/tensor_view_io.h"
-#include "cutlass/util/reference/device/gemm.h"
-#include "cutlass/util/reference/host/tensor_compare.h"
-#include "cutlass/util/reference/host/tensor_copy.h"
-#include "cutlass/util/reference/host/tensor_fill.h"
-#include "cutlass/util/reference/device/convolution.h"
+#include "cutlass/gemm/device/gemm.h"
 
 #include "helper.h"
 
@@ -69,171 +59,85 @@ epilogue/threadblock/epilogue_gemm_k_reduction.h
 #include "solution.h"
 #endif
 
-// The code section below describes datatype for input, output tensors and computation between
-// elements
-using ElementAccumulator = float;                  // Data type of accumulator
-using ElementComputeEpilogue = ElementAccumulator; // Data type of epilogue computation
-using ElementInputA = cutlass::bfloat16_t;         // Data type of elements in input tensor
-using ElementInputB = cutlass::bfloat16_t;         // Data type of elements in input tensor
-using ElementOutput = cutlass::bfloat16_t;         // Data type of elements in output tensor
-
+using ElementAccumulator = float;
+using ElementInputA = cutlass::bfloat16_t;
+using ElementInputB = cutlass::bfloat16_t;
+using ElementOutput = cutlass::bfloat16_t;
 using LayoutInputA = cutlass::layout::ColumnMajor;
 using LayoutInputB = cutlass::layout::RowMajor;
 using LayoutOutput = cutlass::layout::ColumnMajor;
-// Layout of the output vector
-using LayoutGemmKReduction = cutlass::layout::PitchLinear;
 
-// This code section describes whether you want to use tensor cores or regular SIMT cores on GPU SM
-using MMAOp = cutlass::arch::OpClassTensorOp;
+template <int TM, int TN, int TK, int WM, int WN, int WK, int Stages, int Swizzle = 1>
+using BgemmT = cutlass::gemm::device::Gemm<
+    ElementInputA, LayoutInputA, ElementInputB, LayoutInputB, ElementOutput, LayoutOutput,
+    ElementAccumulator, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<TM, TN, TK>, cutlass::gemm::GemmShape<WM, WN, WK>,
+    cutlass::gemm::GemmShape<16, 8, 16>,
+    cutlass::epilogue::thread::LinearCombination<ElementOutput, 8, float, float>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<Swizzle>, Stages, 8, 8,
+    true /*SplitKSerial*/>;
 
-// This code section describes CUDA SM architecture number
-using SmArch = cutlass::arch::Sm80;
+// Per-size configurations (offline sweep):
+//   0: 128x128x32 threadblock, 64x64x32 warp, 3 stages (qkv_dgrad; also small/other shapes)
+//   1: 128x256x32 threadblock, 64x64x32 warp, 3 stages, 2-way swizzle (o_proj/mlp dgrad)
+using Bgemm0 = BgemmT<128, 128, 32, 64, 64, 32, 3>;
+using Bgemm1 = BgemmT<128, 256, 32, 64, 64, 32, 3, 2>;
 
-// This code section describes the tile size a thread block will compute
-using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 32>;  // Threadblock tile shape
+/// Persistent workspace for the split-K semaphores (allocated once, outside the timed region).
+static void *g_ref_workspace = nullptr;
+static size_t g_ref_workspace_bytes = 0;
 
-// This code section describes tile size a warp will compute
-using WarpShape = cutlass::gemm::GemmShape<64, 64, 32>;         // Warp tile shape
-
-// This code section describes the size of MMA op
-using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;    // TensorCore instruction shape
-
-// This code section describes how threadblocks are scheduled on GPU
-using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>;
-
-// Number of pipelines you want to use
-constexpr int NumStages = 4;
-
-// Reduce A or B operand along the K dimension
-constexpr bool ReduceKForA = true;
-
-// Alignment of A operand
-constexpr int AlignmentA = 8;
-
-// Alignment of B operand
-constexpr int AlignmentB = 8;
-
-// This code section describes the epilogue part of the kernel, we use default value
-using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
-    ElementOutput,                                        // Data type of output matrix.
-    128 / cutlass::sizeof_bits<ElementOutput>::value,     // The number of elements per vectorized.
-                                                          // memory access. This becomes the vector width of
-                                                          // math instructions in the epilogue too.
-    ElementAccumulator,                                   // Data type of accumulator
-    ElementComputeEpilogue>;
-
-using Gemm = typename cutlass::gemm::device::GemmWithKReduction<
-  ElementInputA, LayoutInputA,
-  ElementInputB, LayoutInputB,
-  ElementOutput, LayoutOutput,
-  ElementAccumulator,
-  MMAOp,
-  ReduceKForA,
-  SmArch,
-  ThreadblockShape,
-  WarpShape,
-  InstructionShape,
-  EpilogueOp,
-  SwizzleThreadBlock,
-  NumStages,
-  AlignmentA,
-  AlignmentB,
-  cutlass::arch::OpMultiplyAdd,
-  cutlass::ComplexTransform::kNone,
-  cutlass::ComplexTransform::kNone
->;
-
-///////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Kernel to initialize a matrix with small integers (bf16, column-major).
-__global__ void InitializeMatrix_kernel_bf16(
-  cutlass::bfloat16_t *matrix, int rows, int columns, int seed = 0) {
-
-  int i = threadIdx.x + blockIdx.x * blockDim.x;
-  int j = threadIdx.y + blockIdx.y * blockDim.y;
-
-  if (i < rows && j < columns) {
-    int offset = i + j * rows;  // column-major
-    int const k = 16807;
-    int const m = 16;
-    float value = float(((offset + seed) * k % m) - m / 2) * 0.01f;
-    matrix[offset] = cutlass::bfloat16_t(value);
+template <typename Gemm>
+static cudaError_t RunCutlass(int M, int N, int K, float alpha,
+                              cutlass::bfloat16_t const *A, int lda,
+                              cutlass::bfloat16_t const *B, int ldb, float beta,
+                              cutlass::bfloat16_t const *C, int ldc,
+                              cutlass::bfloat16_t *D, int ldd, int split_k) {
+  typename Gemm::Arguments args({M, N, K}, {A, lda}, {B, ldb}, {C, ldc}, {D, ldd},
+                                {alpha, beta}, split_k);
+  size_t ws = Gemm::get_workspace_size(args);
+  if (ws > g_ref_workspace_bytes) {
+    if (g_ref_workspace) cudaFree(g_ref_workspace);
+    if (cudaMalloc(&g_ref_workspace, ws) != cudaSuccess) return cudaErrorMemoryAllocation;
+    g_ref_workspace_bytes = ws;
   }
-}
-
-/// Kernel to initialize a row-major matrix with small integers (bf16).
-__global__ void InitializeMatrix_kernel_bf16_row(
-  cutlass::bfloat16_t *matrix, int rows, int columns, int seed = 0) {
-
-  int i = threadIdx.x + blockIdx.x * blockDim.x;
-  int j = threadIdx.y + blockIdx.y * blockDim.y;
-
-  if (i < rows && j < columns) {
-    int offset = i * columns + j;  // row-major
-    int const k = 16807;
-    int const m = 16;
-    float value = float(((offset + seed) * k % m) - m / 2) * 0.01f;
-    matrix[offset] = cutlass::bfloat16_t(value);
-  }
-}
-
-cudaError_t InitializeMatrix_bf16(cutlass::bfloat16_t *matrix, int rows, int columns, int seed = 0) {
-  dim3 block(16, 16);
-  dim3 grid((rows + block.x - 1) / block.x, (columns + block.y - 1) / block.y);
-  InitializeMatrix_kernel_bf16<<<grid, block>>>(matrix, rows, columns, seed);
+  Gemm gemm_op;
+  if (gemm_op.can_implement(args) != cutlass::Status::kSuccess) return cudaErrorInvalidValue;
+  if (gemm_op.initialize(args, g_ref_workspace) != cutlass::Status::kSuccess) return cudaErrorUnknown;
+  if (gemm_op() != cutlass::Status::kSuccess) return cudaErrorUnknown;
   return cudaGetLastError();
 }
 
-cudaError_t InitializeMatrix_bf16_row(cutlass::bfloat16_t *matrix, int rows, int columns, int seed = 0) {
-  dim3 block(16, 16);
-  dim3 grid((rows + block.x - 1) / block.x, (columns + block.y - 1) / block.y);
-  InitializeMatrix_kernel_bf16_row<<<grid, block>>>(matrix, rows, columns, seed);
-  return cudaGetLastError();
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Naive reference GEMM: A col-major, B row-major, D col-major
-__global__ void ReferenceGemmReduction_kernel(
-  int M, int N, int K,
-  float alpha,
-  cutlass::bfloat16_t const *A, int lda,
-  cutlass::bfloat16_t const *B, int ldb,
-  float beta,
-  cutlass::bfloat16_t const *C, int ldc,
-  cutlass::bfloat16_t *D, int ldd) {
-
-  int i = threadIdx.x + blockIdx.x * blockDim.x;
-  int j = threadIdx.y + blockIdx.y * blockDim.y;
-
-  if (i < M && j < N) {
-    float acc = 0;
-    for (int k = 0; k < K; ++k) {
-      acc += float(A[i + k * lda]) * float(B[k * ldb + j]);
+/// Column sums of a column-major BF16 matrix (FP32 accumulation): out[k] = sum_m A[m + k*lda].
+/// One warp per column, 16-byte vector loads when the column is 16-byte aligned.
+__global__ void __launch_bounds__(256) ColumnSum_kernel(int M, int K, __nv_bfloat16 const *A,
+                                                         int lda, float *out) {
+  int const warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  int const k = blockIdx.x * 8 + warp;
+  if (k >= K) return;
+  __nv_bfloat16 const *col = A + size_t(k) * lda;
+  float s = 0.f;
+  int m = 0;
+  if ((reinterpret_cast<uintptr_t>(col) & 15) == 0) {
+    int const nvec = M / 8;
+    uint4 const *v = reinterpret_cast<uint4 const *>(col);
+    for (int i = lane; i < nvec; i += 32) {
+      uint4 q = __ldg(v + i);
+      __nv_bfloat162 const *h = reinterpret_cast<__nv_bfloat162 const *>(&q);
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        float2 f = __bfloat1622float2(h[t]);
+        s += f.x + f.y;
+      }
     }
-    D[i + j * ldd] = cutlass::bfloat16_t(alpha * acc + beta * float(C[i + j * ldc]));
+    m = nvec * 8;
   }
+  for (int i = m + lane; i < M; i += 32) s += __bfloat162float(col[i]);
+  for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+  if (lane == 0) out[k] = s;
 }
 
-/// Naive reduction: for each column k of A (col-major), sum over rows
-__global__ void ReferenceReduction_kernel(
-  int M, int K,
-  cutlass::bfloat16_t const *A, int lda,
-  float *reduction) {
-
-  int k = threadIdx.x + blockIdx.x * blockDim.x;
-  if (k < K) {
-    float sum = 0;
-    for (int m = 0; m < M; ++m) {
-      sum += float(A[m + k * lda]);
-    }
-    reduction[k] = sum;
-  }
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Run the CUTLASS GemmWithKReduction reference
+/// Reference: D = alpha * A * B + beta * C (CUTLASS) and row_reduction[k] = sum_m A[m, k].
 cudaError_t CutlassGemmWithReduction(
   int M, int N, int K,
   float alpha,
@@ -242,233 +146,379 @@ cudaError_t CutlassGemmWithReduction(
   float beta,
   cutlass::bfloat16_t const *C, int ldc,
   cutlass::bfloat16_t *D, int ldd,
-  cutlass::bfloat16_t *reduction_buf) {
+  float *row_reduction) {
+  cudaError_t err;
+  // qkv_dgrad (16384 x 5120 x 10240) and shapes with M < 4096 use config 0; the other 16K-token
+  // shapes use config 1.
+  bool const wide = M >= 4096 && !(M == 16384 && N == 5120 && K == 10240);
+  if (wide)
+    err = RunCutlass<Bgemm1>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, D, ldd, 1);
+  else
+    err = RunCutlass<Bgemm0>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, D, ldd, 1);
+  if (err != cudaSuccess) return err;
+  ColumnSum_kernel<<<(K + 7) / 8, 256>>>(M, K, reinterpret_cast<__nv_bfloat16 const *>(A), lda,
+                                         row_reduction);
+  return cudaGetLastError();
+}
 
-  cutlass::gemm::GemmCoord problem_size(M, N, K);
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Verification kit: random full-mantissa inputs, golden GEMM on the device (FP64, or FP32 for
+// 16-bit inputs whose products are exact in FP32), NaN-safe comparison of every output element
+// (max error and relative Frobenius error vs the golden).
+///////////////////////////////////////////////////////////////////////////////////////////////////
 
-  int reduce_vector_length = M;  // ReduceKForA => length is M
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
-  cutlass::gemm::GemmUniversalMode mode = cutlass::gemm::GemmUniversalMode::kGemm;
-  int batch_count = 1;
+#define KH_CHECK(call)                                                                         \
+  do {                                                                                         \
+    cudaError_t kh_err_ = (call);                                                              \
+    if (kh_err_ != cudaSuccess) {                                                              \
+      std::cerr << "CUDA error " << cudaGetErrorString(kh_err_) << " at " << __FILE__ << ":"   \
+                << __LINE__ << std::endl;                                                      \
+      std::exit(2);                                                                            \
+    }                                                                                          \
+  } while (0)
 
-  typename Gemm::Arguments arguments(
-    mode,
-    problem_size,
-    batch_count,
-    {alpha, beta},
-    A,
-    B,
-    C,
-    D,
-    reduction_buf,
-    (int64_t)(M * K),
-    (int64_t)(N * K),
-    (int64_t)(M * N),
-    (int64_t)(M * N),
-    (int64_t)reduce_vector_length,
-    lda,
-    ldb,
-    ldc,
-    ldd,
-    0  // reduction stride
-  );
+__host__ __device__ inline unsigned long long kh_hash64(unsigned long long i, unsigned int seed) {
+  unsigned long long x = i * 0x9E3779B97F4A7C15ull + (seed + 1ull) * 0xD1B54A32D192ED03ull;
+  x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 27; x *= 0x94D049BB133111EBull; x ^= x >> 33;
+  return x;
+}
 
-  Gemm gemm_op;
+/// Uniform in [-1, 1): a random 25-bit signed integer times 2^-24. Every value with |v| >= 0.5
+/// carries a full 24-bit significand, so rounding inputs to TF32/BF16/FP16 changes the result.
+__host__ __device__ inline float kh_uniform(unsigned long long i, unsigned int seed) {
+  return float(int(unsigned(kh_hash64(i, seed) >> 32)) >> 7) * (1.0f / 16777216.0f);
+}
 
-  size_t workspace_size = Gemm::get_workspace_size(arguments);
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+__device__ inline double kh_to_double(float x) { return double(x); }
+__device__ inline double kh_to_double(__half x) { return double(__half2float(x)); }
+__device__ inline double kh_to_double(__nv_bfloat16 x) { return double(__bfloat162float(x)); }
+template <typename T> __device__ inline T kh_from_float(float x);
+template <> __device__ inline float kh_from_float<float>(float x) { return x; }
+template <> __device__ inline __half kh_from_float<__half>(float x) { return __float2half_rn(x); }
+template <> __device__ inline __nv_bfloat16 kh_from_float<__nv_bfloat16>(float x) {
+  return __float2bfloat16_rn(x);
+}
 
-  cutlass::Status status = gemm_op.can_implement(arguments);
-  if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+/// Random values: uniform in [-scale, scale) rounded to T (a full T significand).
+template <typename T>
+__global__ void kh_fill_kernel(T *p, size_t n, unsigned int seed, float scale) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    p[i] = kh_from_float<T>(kh_uniform(i, seed) * scale);
+}
 
-  status = gemm_op.initialize(arguments, workspace.get());
-  if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+template <typename T>
+__global__ void kh_fill_value_kernel(T *p, size_t n, float v) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    p[i] = kh_from_float<T>(v);
+}
 
-  status = gemm_op();
-  if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+template <typename T>
+static void kh_fill(T *p, size_t n, unsigned int seed, float scale = 1.0f) {
+  kh_fill_kernel<T><<<4096, 256>>>(p, n, seed, scale);
+  KH_CHECK(cudaGetLastError());
+}
 
-  return cudaSuccess;
+/// Finite poison for outputs that the operation may also read with beta = 0 (0 * poison = 0):
+/// any element the solution leaves unwritten keeps this value and fails the comparison
+/// (65504 = largest finite FP16 value; 3e38 for FP32 outputs).
+static const float kPoison16 = 65504.0f;
+static const float kPoison32 = 3.0e38f;
+
+template <typename T>
+static void kh_fill_value(T *p, size_t n, float v) {
+  kh_fill_value_kernel<T><<<4096, 256>>>(p, n, v);
+  KH_CHECK(cudaGetLastError());
+}
+
+/// Golden GEMM: G(i,j) = alpha * sum_k A(i,k) B(k,j) + beta * C(i,j), G row-major M x N (FP64),
+/// accumulated in Acc (double, or float for 16-bit inputs whose products are exact in FP32).
+/// Element (i,k) of A is A[i*sam + k*sak]; B(k,j) = B[k*sbk + j*sbn]; C(i,j) = C[i*scm + j*scn].
+template <typename Acc, typename TA, typename TB, typename TC>
+__global__ void __launch_bounds__(256) kh_golden_gemm_kernel(
+    int M, int N, int K, double alpha,
+    TA const *A, long long sam, long long sak,
+    TB const *B, long long sbk, long long sbn,
+    double beta, TC const *C, long long scm, long long scn,
+    double *G) {
+  __shared__ Acc As[16][65];
+  __shared__ Acc Bs[16][65];
+  int const tx = threadIdx.x % 16, ty = threadIdx.x / 16;
+  int const m0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+  Acc acc[4][4];
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) acc[r][c] = Acc(0);
+  bool const a_m_fast = (sam == 1);
+  bool const b_n_fast = (sbn == 1);
+  for (int k0 = 0; k0 < K; k0 += 16) {
+    for (int e = threadIdx.x; e < 16 * 64; e += 256) {
+      int kk = a_m_fast ? e / 64 : e % 16;
+      int mm = a_m_fast ? e % 64 : e / 16;
+      int gi = m0 + mm, gk = k0 + kk;
+      As[kk][mm] = (gi < M && gk < K) ? Acc(kh_to_double(A[gi * sam + gk * sak])) : Acc(0);
+      int kb = b_n_fast ? e / 64 : e % 16;
+      int nn = b_n_fast ? e % 64 : e / 16;
+      int gj = n0 + nn, gkb = k0 + kb;
+      Bs[kb][nn] = (gj < N && gkb < K) ? Acc(kh_to_double(B[gkb * sbk + gj * sbn])) : Acc(0);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < 16; ++kk) {
+      Acc a[4], b[4];
+#pragma unroll
+      for (int r = 0; r < 4; ++r) a[r] = As[kk][ty + 16 * r];
+#pragma unroll
+      for (int c = 0; c < 4; ++c) b[c] = Bs[kk][tx + 16 * c];
+#pragma unroll
+      for (int r = 0; r < 4; ++r)
+#pragma unroll
+        for (int c = 0; c < 4; ++c) acc[r][c] = fma(a[r], b[c], acc[r][c]);
+    }
+    __syncthreads();
+  }
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) {
+      int i = m0 + ty + 16 * r, j = n0 + tx + 16 * c;
+      if (i < M && j < N) {
+        double v = alpha * double(acc[r][c]);
+        if (beta != 0.0) v += beta * kh_to_double(C[i * scm + j * scn]);
+        G[size_t(i) * N + j] = v;
+      }
+    }
+}
+
+template <typename Acc, typename TA, typename TB, typename TC>
+static void kh_golden_gemm(int M, int N, int K, double alpha,
+                           TA const *A, long long sam, long long sak,
+                           TB const *B, long long sbk, long long sbn,
+                           double beta, TC const *C, long long scm, long long scn, double *G) {
+  dim3 grid((N + 63) / 64, (M + 63) / 64);
+  kh_golden_gemm_kernel<Acc, TA, TB, TC><<<grid, 256>>>(M, N, K, alpha, A, sam, sak, B, sbk, sbn,
+                                                       beta, C, scm, scn, G);
+  KH_CHECK(cudaGetLastError());
+}
+
+struct KhStats {
+  double sum_g2, sum_d2;
+  unsigned long long max_d_bits, nonfinite, nbad;
+};
+
+__device__ inline void kh_block_add(double v, double *dst) {
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+  if ((threadIdx.x & 31) == 0) atomicAdd(dst, v);
+}
+
+__global__ void kh_sumsq_kernel(double const *G, size_t n, KhStats *st) {
+  double s = 0.0;
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    s += G[i] * G[i];
+  kh_block_add(s, &st->sum_g2);
+}
+
+/// Compares X(i,j) = X[i*sxm + j*sxn] with G (row-major M x N). Counts non-finite outputs and
+/// elements with !(|x - g| <= tol_abs) (NaN-safe), accumulates sum (x-g)^2 and max |x-g|.
+template <typename TX>
+__global__ void kh_compare_kernel(TX const *X, long long sxm, long long sxn, double const *G,
+                                  int M, int N, double tol_abs, double tol_rel, KhStats *st) {
+  size_t const n = size_t(M) * N;
+  double s = 0.0, mx = 0.0;
+  unsigned long long nf = 0, nb = 0;
+  for (size_t idx = blockIdx.x * size_t(blockDim.x) + threadIdx.x; idx < n;
+       idx += size_t(gridDim.x) * blockDim.x) {
+    long long i = (long long)(idx / N), j = (long long)(idx % N);
+    double x = kh_to_double(X[i * sxm + j * sxn]);
+    double d = fabs(x - G[idx]);
+    if (!isfinite(x)) { ++nf; continue; }
+    if (!(d <= tol_abs + tol_rel * fabs(G[idx]))) ++nb;
+    s += d * d;
+    mx = fmax(mx, d);
+  }
+  kh_block_add(s, &st->sum_d2);
+  for (int o = 16; o > 0; o >>= 1) {
+    mx = fmax(mx, __shfl_down_sync(0xffffffffu, mx, o));
+    nf += __shfl_down_sync(0xffffffffu, nf, o);
+    nb += __shfl_down_sync(0xffffffffu, nb, o);
+  }
+  if ((threadIdx.x & 31) == 0) {
+    atomicMax(&st->max_d_bits, (unsigned long long)__double_as_longlong(mx));
+    atomicAdd(&st->nonfinite, nf);
+    atomicAdd(&st->nbad, nb);
+  }
+}
+
+struct KhResult {
+  double rms, max_err_rel, fro_rel;
+  unsigned long long nonfinite, nbad;
+  bool pass;
+};
+
+/// Full check of an M x N output against the golden: every element must be finite and within
+/// tol_max * RMS(golden) (+ tol_rel * |golden|) of the golden, and the relative Frobenius error
+/// must be <= tol_fro.
+template <typename TX>
+static KhResult kh_check(TX const *X, long long sxm, long long sxn, double const *G,
+                         int M, int N, double tol_max, double tol_fro, double tol_rel = 0.0) {
+  KhStats *st;
+  KH_CHECK(cudaMalloc(&st, sizeof(KhStats)));
+  KH_CHECK(cudaMemset(st, 0, sizeof(KhStats)));
+  size_t n = size_t(M) * N;
+  kh_sumsq_kernel<<<2048, 256>>>(G, n, st);
+  KH_CHECK(cudaGetLastError());
+  KhStats h;
+  KH_CHECK(cudaMemcpy(&h, st, sizeof(h), cudaMemcpyDeviceToHost));
+  double rms = std::sqrt(h.sum_g2 / double(n));
+  kh_compare_kernel<TX><<<2048, 256>>>(X, sxm, sxn, G, M, N, tol_max * rms, tol_rel, st);
+  KH_CHECK(cudaGetLastError());
+  KH_CHECK(cudaMemcpy(&h, st, sizeof(h), cudaMemcpyDeviceToHost));
+  KH_CHECK(cudaFree(st));
+  double max_d;
+  std::memcpy(&max_d, &h.max_d_bits, sizeof(max_d));
+  KhResult r;
+  r.rms = rms;
+  r.max_err_rel = rms > 0 ? max_d / rms : INFINITY;
+  r.fro_rel = h.sum_g2 > 0 ? std::sqrt(h.sum_d2 / h.sum_g2) : INFINITY;
+  r.nonfinite = h.nonfinite;
+  r.nbad = h.nbad;
+  r.pass = (rms > 0) && h.nonfinite == 0 && h.nbad == 0 && r.fro_rel <= tol_fro;
+  return r;
+}
+
+static void kh_print(char const *who, KhResult const &r, double tol_max, double tol_fro) {
+  std::printf("  %s: max|err|/rms = %.3e (tol %.1e), rel_fro_err = %.3e (tol %.1e), "
+              "non-finite = %llu, elements over tol = %llu -> %s\n",
+              who, r.max_err_rel, tol_max, r.fro_rel, tol_fro, r.nonfinite, r.nbad,
+              r.pass ? "ok" : "FAIL");
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Test correctness
-cudaError_t TestCorrectness(int M, int N, int K, float alpha, float beta) {
-  cudaError_t result;
+/// Golden column sums in FP64: G[k] = sum_m A[m + k*lda].
+__global__ void GoldenColumnSum_kernel(int M, int K, __nv_bfloat16 const *A, int lda, double *G) {
+  int const warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  int const k = blockIdx.x * 8 + warp;
+  if (k >= K) return;
+  double s = 0.0;
+  for (int m = lane; m < M; m += 32) s += double(__bfloat162float(A[m + size_t(k) * lda]));
+  for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+  if (lane == 0) G[k] = s;
+}
 
+// D (BF16 output of an FP32-accumulated product): a correct result is within half a BF16 ulp
+// (<= 2^-8 relative) of the exact value plus a small FP32 accumulation error. Element bound:
+// |D - exact| <= kTolRel * |exact| + kTolMax * RMS(exact) (3x the rounding bound, >= 4x the
+// accumulation error); relative Frobenius error <= kTolFro (>= 3x a correct result).
+// FP8/INT8 operands or BF16/FP16 accumulation exceed both bounds.
+static const double kTolRel = 1.2e-2;
+static const double kTolMax = 2e-4;
+static const double kTolFro = 5e-3;
+// row_reduction (FP32 sums of M BF16 values): FP32-accumulation tolerances scaled with sqrt(M);
+// BF16/FP16 accumulation fails.
+static double RedTolMax(int M) { return 1.5e-6 * std::sqrt(double(M)); }
+static double RedTolFro(int M) { return 1.2e-7 * std::sqrt(double(M)); }
+
+/// Test correctness of the reference and (if KH_TEST_SOLUTION) the solution against golden
+/// results computed on the device. Every element of D and of row_reduction is checked.
+cudaError_t TestCorrectness(int M, int N, int K, float alpha, float beta) {
   int lda = M;  // col-major
-  int ldb = N;  // row-major (stride = N = number of columns)
+  int ldb = N;  // row-major
   int ldc = M;  // col-major
   int ldd = M;
+  size_t count_A = size_t(lda) * K, count_B = size_t(K) * ldb;
+  size_t count_C = size_t(ldc) * N, count_D = size_t(ldd) * N;
+  double const red_tol_max = RedTolMax(M), red_tol_fro = RedTolFro(M);
 
-  size_t sizeof_A = sizeof(cutlass::bfloat16_t) * lda * K;
-  size_t sizeof_B = sizeof(cutlass::bfloat16_t) * K * ldb;
-  size_t sizeof_C = sizeof(cutlass::bfloat16_t) * ldc * N;
-  size_t sizeof_D = sizeof(cutlass::bfloat16_t) * ldd * N;
-  size_t sizeof_red = sizeof(float) * K;
-  // The CUTLASS reduction output is bf16 with length M (ReduceKForA)
-  size_t sizeof_red_cutlass = sizeof(cutlass::bfloat16_t) * M;
+  __nv_bfloat16 *A, *B, *C, *D_ref;
+  float *red_ref;
+  double *G, *Gr;
+  KH_CHECK(cudaMalloc(&A, count_A * sizeof(__nv_bfloat16)));
+  KH_CHECK(cudaMalloc(&B, count_B * sizeof(__nv_bfloat16)));
+  KH_CHECK(cudaMalloc(&C, count_C * sizeof(__nv_bfloat16)));
+  KH_CHECK(cudaMalloc(&D_ref, count_D * sizeof(__nv_bfloat16)));
+  KH_CHECK(cudaMalloc(&red_ref, K * sizeof(float)));
+  KH_CHECK(cudaMalloc(&G, size_t(M) * N * sizeof(double)));
+  KH_CHECK(cudaMalloc(&Gr, K * sizeof(double)));
+  kh_fill(A, count_A, 1u);
+  kh_fill(B, count_B, 2u);
+  kh_fill(C, count_C, 3u);
+  // Outputs are poisoned (0xFF bytes = NaN in BF16 and FP32): unwritten elements fail.
+  KH_CHECK(cudaMemset(D_ref, 0xFF, count_D * sizeof(__nv_bfloat16)));
+  KH_CHECK(cudaMemset(red_ref, 0xFF, K * sizeof(float)));
 
-  cutlass::bfloat16_t *A, *B, *C_cutlass, *D_cutlass, *D_naive, *reduction_cutlass;
-  float *reduction_naive;
+  // Golden: FP32 accumulation of exact BF16 products, FP64 column sums.
+  kh_golden_gemm<float>(M, N, K, alpha, A, 1, lda, B, ldb, 1, beta, C, 1, ldc, G);
+  GoldenColumnSum_kernel<<<(K + 7) / 8, 256>>>(M, K, A, lda, Gr);
+  KH_CHECK(cudaGetLastError());
 
-  result = cudaMalloc((void**)&A, sizeof_A); if (result != cudaSuccess) return result;
-  result = cudaMalloc((void**)&B, sizeof_B); if (result != cudaSuccess) return result;
-  result = cudaMalloc((void**)&C_cutlass, sizeof_C); if (result != cudaSuccess) return result;
-  result = cudaMalloc((void**)&D_cutlass, sizeof_D); if (result != cudaSuccess) return result;
-  result = cudaMalloc((void**)&D_naive, sizeof_D); if (result != cudaSuccess) return result;
-  result = cudaMalloc((void**)&reduction_cutlass, sizeof_red_cutlass); if (result != cudaSuccess) return result;
-  result = cudaMalloc((void**)&reduction_naive, sizeof_red); if (result != cudaSuccess) return result;
-
-  InitializeMatrix_bf16(A, M, K, 0);       // col-major A: M rows, K cols
-  InitializeMatrix_bf16_row(B, K, N, 17);  // row-major B: K rows, N cols
-  InitializeMatrix_bf16(C_cutlass, M, N, 101); // col-major C
-
-  cudaMemset(D_cutlass, 0, sizeof_D);
-  cudaMemset(D_naive, 0, sizeof_D);
-  cudaMemset(reduction_cutlass, 0, sizeof_red_cutlass);
-  cudaMemset(reduction_naive, 0, sizeof_red);
-
-  // Run CUTLASS reference
-  result = CutlassGemmWithReduction(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc,
-                                     D_cutlass, ldd, reduction_cutlass);
+  cudaError_t result = CutlassGemmWithReduction(
+      M, N, K, alpha, reinterpret_cast<cutlass::bfloat16_t const *>(A), lda,
+      reinterpret_cast<cutlass::bfloat16_t const *>(B), ldb, beta,
+      reinterpret_cast<cutlass::bfloat16_t const *>(C), ldc,
+      reinterpret_cast<cutlass::bfloat16_t *>(D_ref), ldd, red_ref);
+  if (result == cudaSuccess) result = cudaDeviceSynchronize();
   if (result != cudaSuccess) {
-    std::cerr << "CUTLASS GemmWithReduction failed: " << cudaGetErrorString(result) << std::endl;
-    cudaFree(A); cudaFree(B); cudaFree(C_cutlass); cudaFree(D_cutlass);
-    cudaFree(D_naive); cudaFree(reduction_cutlass); cudaFree(reduction_naive);
-    return result;
+    std::cerr << "CUTLASS reference failed: " << cudaGetErrorString(result) << std::endl;
+  } else {
+    KhResult r = kh_check(D_ref, 1, ldd, G, M, N, kTolMax, kTolFro, kTolRel);
+    kh_print("reference D        ", r, kTolMax, kTolFro);
+    KhResult rr = kh_check(red_ref, 1, 0, Gr, K, 1, red_tol_max, red_tol_fro);
+    kh_print("reference reduction", rr, red_tol_max, red_tol_fro);
+    if (!r.pass || !rr.pass) {
+      std::cerr << "Reference incorrect vs golden." << std::endl;
+      result = cudaErrorUnknown;
+    }
   }
-
-  // Run naive reference GEMM
-  {
-    dim3 block(16, 16);
-    dim3 grid((M + 15) / 16, (N + 15) / 16);
-    ReferenceGemmReduction_kernel<<<grid, block>>>(M, N, K, alpha, A, lda, B, ldb, beta, C_cutlass, ldc, D_naive, ldd);
-  }
-
-  // Run naive reduction
-  {
-    dim3 block(256);
-    dim3 grid((K + 255) / 256);
-    ReferenceReduction_kernel<<<grid, block>>>(M, K, A, lda, reduction_naive);
-  }
-  cudaDeviceSynchronize();
-
-  // Verify CUTLASS GEMM output vs naive
-  int count_D = ldd * N;
-  std::vector<float> host_cutlass_D(count_D), host_naive_D(count_D);
-  {
-    std::vector<cutlass::bfloat16_t> tmp(count_D);
-    cudaMemcpy(tmp.data(), D_cutlass, count_D * sizeof(cutlass::bfloat16_t), cudaMemcpyDeviceToHost);
-    for (int i = 0; i < count_D; i++) host_cutlass_D[i] = float(tmp[i]);
-    cudaMemcpy(tmp.data(), D_naive, count_D * sizeof(cutlass::bfloat16_t), cudaMemcpyDeviceToHost);
-    for (int i = 0; i < count_D; i++) host_naive_D[i] = float(tmp[i]);
-  }
-
-  float max_diff = 0;
-  for (int i = 0; i < count_D; i++) {
-    max_diff = fmaxf(max_diff, fabsf(host_cutlass_D[i] - host_naive_D[i]));
-  }
-  if (max_diff > 1.0f) {
-    std::cerr << "CUTLASS reference incorrect vs naive GEMM. Max diff: " << max_diff << std::endl;
-    cudaFree(A); cudaFree(B); cudaFree(C_cutlass); cudaFree(D_cutlass);
-    cudaFree(D_naive); cudaFree(reduction_cutlass); cudaFree(reduction_naive);
-    return cudaErrorUnknown;
-  }
-
-  // Verify CUTLASS reduction vs naive reduction
-  // CUTLASS outputs bf16 reduction of length M (sum along K for each row m)
-  // But the harness wants: reduction[k] = sum_m A[m,k]  (length K)
-  // Actually CUTLASS ReduceKForA=true reduces along K for the A operand,
-  // producing a vector of length M. The harness wants column-reduction of A.
-  // We only check the GEMM part for CUTLASS vs naive. Reduction check is done
-  // between naive and the solution.
-  std::vector<float> host_naive_red(K);
-  cudaMemcpy(host_naive_red.data(), reduction_naive, K * sizeof(float), cudaMemcpyDeviceToHost);
 
 #ifdef KH_TEST_SOLUTION
-  // Allocate solution output
-  cutlass::bfloat16_t *D_solution;
-  float *reduction_solution;
-  result = cudaMalloc((void**)&D_solution, sizeof_D); if (result != cudaSuccess) return result;
-  result = cudaMalloc((void**)&reduction_solution, sizeof_red); if (result != cudaSuccess) return result;
-  cudaMemset(D_solution, 0, sizeof_D);
-  cudaMemset(reduction_solution, 0, sizeof_red);
-
-  // Re-initialize C for solution (same seed)
-  cutlass::bfloat16_t *C_solution;
-  result = cudaMalloc((void**)&C_solution, sizeof_C); if (result != cudaSuccess) return result;
-  InitializeMatrix_bf16(C_solution, M, N, 101);
-
-  // Cast to __nv_bfloat16* for solution interface
-  result = GemmWithReduction(M, N, K, alpha,
-    reinterpret_cast<__nv_bfloat16 const*>(A), lda,
-    reinterpret_cast<__nv_bfloat16 const*>(B), ldb,
-    beta,
-    reinterpret_cast<__nv_bfloat16 const*>(C_solution), ldc,
-    reinterpret_cast<__nv_bfloat16*>(D_solution), ldd,
-    reduction_solution);
-  if (result != cudaSuccess) {
-    std::cerr << "Solution kernel failed: " << cudaGetErrorString(result) << std::endl;
-    cudaFree(A); cudaFree(B); cudaFree(C_cutlass); cudaFree(D_cutlass);
-    cudaFree(D_naive); cudaFree(reduction_cutlass); cudaFree(reduction_naive);
-    cudaFree(D_solution); cudaFree(reduction_solution); cudaFree(C_solution);
-    return result;
+  if (result == cudaSuccess) {
+    __nv_bfloat16 *D_sol;
+    float *red_sol;
+    KH_CHECK(cudaMalloc(&D_sol, count_D * sizeof(__nv_bfloat16)));
+    KH_CHECK(cudaMalloc(&red_sol, K * sizeof(float)));
+    KH_CHECK(cudaMemset(D_sol, 0xFF, count_D * sizeof(__nv_bfloat16)));
+    KH_CHECK(cudaMemset(red_sol, 0xFF, K * sizeof(float)));
+    result = GemmWithReduction(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, D_sol, ldd, red_sol);
+    cudaError_t sync = cudaDeviceSynchronize();
+    if (result == cudaSuccess) result = sync;
+    if (result != cudaSuccess) {
+      std::cerr << "Solution kernel failed: " << cudaGetErrorString(result) << std::endl;
+    } else {
+      KhResult r = kh_check(D_sol, 1, ldd, G, M, N, kTolMax, kTolFro, kTolRel);
+      kh_print("solution  D        ", r, kTolMax, kTolFro);
+      KhResult rr = kh_check(red_sol, 1, 0, Gr, K, 1, red_tol_max, red_tol_fro);
+      kh_print("solution  reduction", rr, red_tol_max, red_tol_fro);
+      if (!r.pass) {
+        std::cerr << "Solution GEMM incorrect vs golden: max|err|/rms = " << r.max_err_rel
+                  << ", rel_fro_err = " << r.fro_rel << ", non-finite = " << r.nonfinite
+                  << ", elements over tolerance (" << kTolRel << "*|ref| + " << kTolMax
+                  << "*rms) = " << r.nbad << std::endl;
+        result = cudaErrorUnknown;
+      }
+      if (!rr.pass) {
+        std::cerr << "Solution row_reduction incorrect vs golden: max|err|/rms = "
+                  << rr.max_err_rel << ", rel_fro_err = " << rr.fro_rel
+                  << ", non-finite = " << rr.nonfinite << ", elements over tolerance = "
+                  << rr.nbad << std::endl;
+        result = cudaErrorUnknown;
+      }
+    }
+    cudaFree(red_sol);
+    cudaFree(D_sol);
   }
-  cudaDeviceSynchronize();
-
-  // Verify solution GEMM vs naive
-  {
-    std::vector<cutlass::bfloat16_t> tmp(count_D);
-    std::vector<float> host_sol_D(count_D);
-    cudaMemcpy(tmp.data(), D_solution, count_D * sizeof(cutlass::bfloat16_t), cudaMemcpyDeviceToHost);
-    for (int i = 0; i < count_D; i++) host_sol_D[i] = float(tmp[i]);
-
-    float sol_max_diff = 0;
-    for (int i = 0; i < count_D; i++) {
-      sol_max_diff = fmaxf(sol_max_diff, fabsf(host_sol_D[i] - host_naive_D[i]));
-    }
-    if (sol_max_diff > 2.0f) {
-      std::cerr << "Solution GEMM incorrect. Max diff vs naive: " << sol_max_diff << std::endl;
-      cudaFree(A); cudaFree(B); cudaFree(C_cutlass); cudaFree(D_cutlass);
-      cudaFree(D_naive); cudaFree(reduction_cutlass); cudaFree(reduction_naive);
-      cudaFree(D_solution); cudaFree(reduction_solution); cudaFree(C_solution);
-      return cudaErrorUnknown;
-    }
-  }
-
-  // Verify solution reduction vs naive
-  {
-    std::vector<float> host_sol_red(K);
-    cudaMemcpy(host_sol_red.data(), reduction_solution, K * sizeof(float), cudaMemcpyDeviceToHost);
-
-    float red_max_diff = 0;
-    for (int i = 0; i < K; i++) {
-      red_max_diff = fmaxf(red_max_diff, fabsf(host_sol_red[i] - host_naive_red[i]));
-    }
-    if (red_max_diff > 2.0f) {
-      std::cerr << "Solution reduction incorrect. Max diff: " << red_max_diff << std::endl;
-      cudaFree(A); cudaFree(B); cudaFree(C_cutlass); cudaFree(D_cutlass);
-      cudaFree(D_naive); cudaFree(reduction_cutlass); cudaFree(reduction_naive);
-      cudaFree(D_solution); cudaFree(reduction_solution); cudaFree(C_solution);
-      return cudaErrorUnknown;
-    }
-  }
-
-  cudaFree(D_solution);
-  cudaFree(reduction_solution);
-  cudaFree(C_solution);
 #endif
 
-  cudaFree(A);
+  cudaFree(Gr);
+  cudaFree(G);
+  cudaFree(red_ref);
+  cudaFree(D_ref);
+  cudaFree(C);
   cudaFree(B);
-  cudaFree(C_cutlass);
-  cudaFree(D_cutlass);
-  cudaFree(D_naive);
-  cudaFree(reduction_cutlass);
-  cudaFree(reduction_naive);
-
-  return cudaSuccess;
+  cudaFree(A);
+  return result;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -476,39 +526,40 @@ cudaError_t TestCorrectness(int M, int N, int K, float alpha, float beta) {
 /// Profile reference (and solution if KH_TEST_SOLUTION) with CUDA events.
 void Profile(int M, int N, int K, float alpha, float beta, int iterations) {
   int lda = M, ldb = N, ldc = M, ldd = M;
+  size_t count_A = size_t(lda) * K, count_B = size_t(K) * ldb;
+  size_t count_C = size_t(ldc) * N, count_D = size_t(ldd) * N;
 
-  size_t sizeof_A = sizeof(cutlass::bfloat16_t) * lda * K;
-  size_t sizeof_B = sizeof(cutlass::bfloat16_t) * K * ldb;
-  size_t sizeof_C = sizeof(cutlass::bfloat16_t) * ldc * N;
-  size_t sizeof_D = sizeof(cutlass::bfloat16_t) * ldd * N;
-  size_t sizeof_red_cutlass = sizeof(cutlass::bfloat16_t) * M;
-
-  cutlass::bfloat16_t *A, *B, *C, *D, *reduction_cutlass;
-  cudaMalloc((void**)&A, sizeof_A);
-  cudaMalloc((void**)&B, sizeof_B);
-  cudaMalloc((void**)&C, sizeof_C);
-  cudaMalloc((void**)&D, sizeof_D);
-  cudaMalloc((void**)&reduction_cutlass, sizeof_red_cutlass);
-
-  InitializeMatrix_bf16(A, M, K, 0);
-  InitializeMatrix_bf16_row(B, K, N, 17);
-  InitializeMatrix_bf16(C, M, N, 101);
+  __nv_bfloat16 *A, *B, *C, *D;
+  float *red;
+  KH_CHECK(cudaMalloc(&A, count_A * sizeof(__nv_bfloat16)));
+  KH_CHECK(cudaMalloc(&B, count_B * sizeof(__nv_bfloat16)));
+  KH_CHECK(cudaMalloc(&C, count_C * sizeof(__nv_bfloat16)));
+  KH_CHECK(cudaMalloc(&D, count_D * sizeof(__nv_bfloat16)));
+  KH_CHECK(cudaMalloc(&red, K * sizeof(float)));
+  kh_fill(A, count_A, 1u);
+  kh_fill(B, count_B, 2u);
+  kh_fill(C, count_C, 3u);
 
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
+  auto ref = [&]() {
+    CutlassGemmWithReduction(M, N, K, alpha, reinterpret_cast<cutlass::bfloat16_t const *>(A), lda,
+                             reinterpret_cast<cutlass::bfloat16_t const *>(B), ldb, beta,
+                             reinterpret_cast<cutlass::bfloat16_t const *>(C), ldc,
+                             reinterpret_cast<cutlass::bfloat16_t *>(D), ldd, red);
+  };
+
   // Warmup reference
-  for (int i = 0; i < 3; i++) {
-    CutlassGemmWithReduction(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, D, ldd, reduction_cutlass);
-  }
+  for (int i = 0; i < 3; i++) ref();
   cudaDeviceSynchronize();
 
   // Profile reference
   float ref_total_ms = 0, ref_min_ms = 1e30f;
   for (int iter = 0; iter < iterations; ++iter) {
     cudaEventRecord(start);
-    CutlassGemmWithReduction(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, D, ldd, reduction_cutlass);
+    ref();
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     float ms;
@@ -520,22 +571,9 @@ void Profile(int M, int N, int K, float alpha, float beta, int iterations) {
           ref_total_ms / iterations, iterations, ref_min_ms);
 
 #ifdef KH_TEST_SOLUTION
-  // Allocate solution buffers
-  size_t sizeof_red = sizeof(float) * K;
-  cutlass::bfloat16_t *D_sol;
-  float *reduction_sol;
-  cudaMalloc((void**)&D_sol, sizeof_D);
-  cudaMalloc((void**)&reduction_sol, sizeof_red);
-
   // Warmup solution
   for (int i = 0; i < 3; i++) {
-    GemmWithReduction(M, N, K, alpha,
-      reinterpret_cast<__nv_bfloat16 const*>(A), lda,
-      reinterpret_cast<__nv_bfloat16 const*>(B), ldb,
-      beta,
-      reinterpret_cast<__nv_bfloat16 const*>(C), ldc,
-      reinterpret_cast<__nv_bfloat16*>(D_sol), ldd,
-      reduction_sol);
+    GemmWithReduction(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, D, ldd, red);
   }
   cudaDeviceSynchronize();
 
@@ -543,13 +581,7 @@ void Profile(int M, int N, int K, float alpha, float beta, int iterations) {
   float sol_total_ms = 0, sol_min_ms = 1e30f;
   for (int iter = 0; iter < iterations; ++iter) {
     cudaEventRecord(start);
-    GemmWithReduction(M, N, K, alpha,
-      reinterpret_cast<__nv_bfloat16 const*>(A), lda,
-      reinterpret_cast<__nv_bfloat16 const*>(B), ldb,
-      beta,
-      reinterpret_cast<__nv_bfloat16 const*>(C), ldc,
-      reinterpret_cast<__nv_bfloat16*>(D_sol), ldd,
-      reduction_sol);
+    GemmWithReduction(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, D, ldd, red);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     float ms;
@@ -560,18 +592,15 @@ void Profile(int M, int N, int K, float alpha, float beta, int iterations) {
   fprintf(stdout, "Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
           sol_total_ms / iterations, iterations, sol_min_ms);
   fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
-
-  cudaFree(D_sol);
-  cudaFree(reduction_sol);
 #endif
 
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
-  cudaFree(A);
-  cudaFree(B);
-  cudaFree(C);
+  cudaFree(red);
   cudaFree(D);
-  cudaFree(reduction_cutlass);
+  cudaFree(C);
+  cudaFree(B);
+  cudaFree(A);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -599,10 +628,15 @@ int main(int argc, const char *arg[]) {
     if (argc > 6) std::stringstream(arg[6]) >> iterations;
     configs.push_back({"custom", M, N, K});
   } else {
+    // Backward data-gradient GEMM of the Qwen3-32B linear layers with the fused bias gradient,
+    // one 16K-token chunk (hidden 5120, fused QKV 10240, attention out 8192, FFN 25600):
+    //   dX[M=tokens, N=in_features] = dY[M, K=out_features] * W[K, N],
+    //   row_reduction[k] = sum_m dY[m, k]  (= bias gradient of the layer)
     configs = {
-      {"small",   1024, 1024, 1024},
-      {"medium",  4096, 4096, 4096},
-      {"large",   8192, 8192, 8192},
+      {"qkv_dgrad",      16384,  5120, 10240},   // fused QKV proj (5120 -> 10240)
+      {"o_proj_dgrad",   16384,  8192,  5120},   // attention output proj (8192 -> 5120)
+      {"mlp_up_dgrad",   16384,  5120, 51200},   // fused gate+up proj (5120 -> 51200)
+      {"mlp_down_dgrad", 16384, 25600,  5120},   // down proj (25600 -> 5120)
     };
   }
 

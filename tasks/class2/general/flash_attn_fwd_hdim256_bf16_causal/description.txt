@@ -2,25 +2,37 @@
 
 ## Description
 
-Implement a CUDA kernel for the forward pass of Flash Attention with causal masking.
+Implement a CUDA kernel for the forward pass of exact softmax attention with causal masking.
+The full Sq x Sk attention matrix must not be materialized in global memory.
 
-Compute scaled dot-product attention WITHOUT materializing the full attention matrix:
+For every batch b and head h (Q, K and V have the same number of heads H):
   S = Q @ K^T * scale
-  Apply causal mask: S[i][j] = -inf for j > i
-  O = softmax(S) @ V
-  lse[i] = log(sum(exp(S[i][:])))
+  Causal mask: S[i][j] = -inf for j > i   (Sq == Sk, so query row i attends keys 0..i)
+  P = softmax(S) along the key axis
+  O = P @ V
+  lse[i] = log(sum_j exp(S[i][j]))   (natural log over the unmasked keys of row i)
 
-Inputs (all bf16, contiguous, [B, H, S, D] layout):
-  Q: [4, 8, 256, 256]
-  K: [4, 8, 256, 256]
-  V: [4, 8, 256, 256]
+Inputs (bf16, contiguous row-major [B, H, S, D] layout, D fastest):
+  Q: [B, H, Sq, D] = [4, 8, 8192, 256]
+  K: [B, H, Sk, D] = [4, 8, 8192, 256]
+  V: [B, H, Sk, D] = [4, 8, 8192, 256]
+  All input elements are i.i.d. standard normal, rounded to bf16.
 
 Outputs:
   O:   [B, H, Sq, D] bf16 — attention output
   lse: [B, H, Sq] fp32 — log-sum-exp per query row
 
 scale = 1/sqrt(D) = 0.062500
-Causal: position i can only attend to positions j <= i.
+
+Precision: matrix products must use bf16 (or higher-precision) operands with FP32
+accumulation, and the softmax statistics / lse must be computed in FP32. Quantizing
+Q, K, V or P to FP8, INT8 or any lower precision is not allowed.
+
+Correctness: O and lse are compared element-wise with a reference
+implementation over 3 random input sets:
+  |out - ref| <= atol + rtol * |ref|,  atol = 0.02, rtol = 0.02
+NaN/Inf fail, and every output element must be written (output buffers are
+pre-filled with NaN).
 
 
 ## Function Signature

@@ -28,8 +28,8 @@ execute:
 correctness:
   mode: tensor_compare
   tolerances:
-    atol: 0.0001
-    rtol: 0.0001
+    atol: 1.0e-05
+    rtol: 1.0e-05
 performance:
   enabled: true
   parser: {}
@@ -44,6 +44,16 @@ anti_cheat:
   - '#include\s*[<"]ln_fwd'
   - '#include\s*[<"]ln_bwd'
   - '#include\s*[<"]ln_parallel'
+  # Precision floor: the task is FP32. FP16/BF16/TF32/FP8/INT8 types, conversions and
+  # tensor-core paths are below spec and blocked.
+  - '\b__(half2?|nv_bfloat162?|nv_fp8\w*|nv_fp6\w*|nv_fp4\w*)\b'
+  - '__float2(half|bfloat16)|__(half|bfloat16)2float'
+  - '\bcutlass::(half_t|bfloat16_t|tfloat32_t|float_e4m3_t|float_e5m2_t|float_e2m1_t|float_e3m2_t|float_e2m3_t)\b'
+  - '\.(b?f16|tf32)(x2)?\b'
+  - '\.e[2-5]m[1-3](x2)?\b'
+  - '\.[su](4|8)\.[su](4|8)\b'
+  - '\b__dp4a\b'
+  - '\bwmma::precision::tf32\b|__float_to_tf32'
   required_patterns:
   - __global__\s+void
   - <<<.*>>>

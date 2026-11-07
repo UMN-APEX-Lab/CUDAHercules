@@ -1,5 +1,5 @@
 /*
- * cuFFT reference: 1D Complex-to-Complex FFT, N=1024, fp32, batch=1024
+ * cuFFT reference: 1D Complex-to-Complex FFT, N=1024, fp32, batch=131072
  */
 #include <cuda_runtime.h>
 #include <cufft.h>

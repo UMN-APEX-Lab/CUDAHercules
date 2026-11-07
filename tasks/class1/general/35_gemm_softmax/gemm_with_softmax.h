@@ -203,7 +203,11 @@ private:
 
     int block_batch = blockIdx.z;
     int block_m = blockIdx.x * ApplyShape::kRow;
-    int block_n = 0;
+    // Each block covers ApplyShape::kColumn * kAlignment columns per step; the gridDim.y blocks of a
+    // row split the columns between them. (The CUTLASS example used block_n = 0 for every block, so
+    // all gridDim.y blocks of a row redundantly recomputed the whole row.)
+    int block_n = blockIdx.y * ApplyShape::kColumn * kAlignment;
+    int const step_n = int(gridDim.y) * ApplyShape::kColumn * kAlignment;
 
     int thread_m = threadIdx.y;
     int thread_n = threadIdx.x * kAlignment;
@@ -262,25 +266,17 @@ private:
     //
     // Loop
     //
-    CUTLASS_PRAGMA_UNROLL
-    for (
-      int idx = 0;
-      idx < params.args.extent.column();
-      idx += ApplyShape::kColumn * kAlignment) {
+    for (; idx_n < params.args.extent.column(); idx_n += step_n) {
+      AccessTypeD fetch;
+      arch::global_load<AccessTypeD, sizeof(AccessTypeD)>(fetch, access_d, true);
 
-      if (idx_n < params.args.extent.column()) {
-        AccessTypeD fetch;
-        arch::global_load<AccessTypeD, sizeof(AccessTypeD)>(fetch, access_d, true);
+      FragmentSoftmax result = mul(exponential(minus(convert_soft_compute(fetch), convert_norm(norm))),  convert_sum(inv_sum));
+      FragmentSoft soft  = convert_soft_output(result);
 
-        FragmentSoftmax result = mul(exponential(minus(convert_soft_compute(fetch), convert_norm(norm))),  convert_sum(inv_sum));
-        FragmentSoft soft  = convert_soft_output(result);
+      arch::global_store<FragmentSoft, sizeof(FragmentSoft)>(soft, access_soft, true);
 
-        arch::global_store<FragmentSoft, sizeof(FragmentSoft)>(soft, access_soft, true);
-      }
-
-      access_d += ApplyShape::kColumn;
-      access_soft += ApplyShape::kColumn;
-      idx_n += ApplyShape::kColumn * kAlignment;
+      access_d += step_n / kAlignment;
+      access_soft += step_n / kAlignment;
     }
   }
 };

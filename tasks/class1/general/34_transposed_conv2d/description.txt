@@ -1,6 +1,7 @@
 # Task: 34_transposed_conv2d
 
-Transposed Conv2D (Deconvolution / Fractionally-Strided Convolution). NHWC layout, half precision input/output.
+Transposed Conv2D (deconvolution / fractionally-strided convolution) used for 2x upsampling.
+FP16 input/filter/output with FP32 accumulation, NHWC layout.
 
 ## Function Signature
 
@@ -26,14 +27,20 @@ Where:
 - w_out = w * stride_w + s - pad_w
 
 Equivalently, gathering into each output pixel:
-- h = (h_out - r + pad_h) / stride_h  (only valid when divisible)
-- w = (w_out - s + pad_w) / stride_w
+- h = (h_out - r + pad_h) / stride_h  (only valid when divisible and 0 <= h < H)
+- w = (w_out - s + pad_w) / stride_w  (only valid when divisible and 0 <= w < W)
 
 Output size: H_out = (H-1)*stride_h + R - 2*pad_h, W_out = (W-1)*stride_w + S - 2*pad_w
+Every output element must be written (the output buffer is not zero-initialized).
 
-## Data Types
+## Data Types and Precision
 
-All tensors are `__half` (FP16). Use FP32 accumulation internally for numerical stability.
+All tensors are `__half` (FP16).
+
+The sum must be computed from the FP16 operands with FP32 accumulation (FP16 x FP16 products
+summed in FP32 or higher precision), and the result rounded to FP16 once at the end. Lower-precision
+arithmetic is not allowed even if it passes the tolerance: no FP16 products or FP16 accumulation
+(also not for partial sums), and no BF16, FP8, INT8 or other narrower operands.
 
 ## Memory Layout
 
@@ -42,15 +49,35 @@ All tensors are **NHWC** (channels-last):
 - filter: Element (c,r,s,k) at `filter[((c*R + r)*S + s)*K + k]`  (CRSK layout)
 - output: Element (n,h_out,w_out,k) at `output[((n*H_out + h_out)*W_out + w_out)*K + k]`
 
+## Problem Sizes
+
+All are exact 2x upsampling layers with R=S=4, pad=1, stride=2 (H, W, C describe the input; K is
+the number of output channels):
+- unet_up_32to64:      N=32, H=W=32,  C=512, K=256 -> output 64x64x256    (U-Net decoder upsampling, batch 32)
+- gan_up_64to128:      N=16, H=W=64,  C=256, K=128 -> output 128x128x128  (GAN generator upsampling, batch 16)
+- decoder_up_128to256: N=8,  H=W=128, C=128, K=64  -> output 256x256x64   (image decoder upsampling, batch 8)
+- decoder_up_256to512: N=4,  H=W=256, C=64,  K=32  -> output 512x512x32   (image decoder upsampling to 512x512, batch 4)
+
+## Correctness
+
+Inputs are random values using the full FP16 mantissa (uniform in [-1, 1)). Every output element
+is compared with an FP64 result computed from the same FP16 inputs and must satisfy
+
+  |output - expected| <= 5e-6 * sum_{c,r,s} |input * filter| + 2^-9 * |expected|
+
+(2^-9 = 4x the maximum error of rounding an exact result to FP16). NaN/Inf fail; the output buffer
+is filled with NaN before each call. Every timed call is verified as well.
+
 ## Build & Test
 
 ```bash
 make test                    # requires solution.h in task directory
-./test                       # default: runs small/medium/large sizes
+./test                       # default: runs all benchmark sizes
+./test 8 32 32 64 64         # custom single size: N H W C K (R=S=4, stride 2, pad 1)
+./test 8 32 32 64 64 4 4 2 1 20   # N H W C K R S stride pad iterations
 ```
 
-Correctness is verified against a CUTLASS reference implementation at multiple problem sizes
-(small: N=1 H=W=56 C=K=64, medium: N=1 H=W=112 C=K=128, large: N=4 H=W=56 C=K=256).
-Performance is timed for both reference and your solution at each size.
+Performance is timed for both the reference and your solution at each size; the task score is the
+geometric mean of the per-size speedups.
 
 CUTLASS headers are available on the include path.

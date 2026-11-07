@@ -2,30 +2,40 @@
 
 ## Description
 
-Implement CUDA kernels for the Flash Attention backward pass.
+Implement CUDA kernels for the backward pass of exact softmax attention.
+The full S x S attention matrix must not be materialized in global memory.
 
-Given upstream gradient dO and saved forward tensors (Q, K, V, O, lse), compute:
-  dQ, dK, dV — gradients w.r.t. Q, K, V
+Forward pass being differentiated (per batch b and head h; Sq = Sk = S):
+  S = Q @ K^T * scale
+  P = exp(S - lse[:, None])        (= softmax(S) along the key axis)
+  O = P @ V
 
-Algorithm (tiled, avoids materializing full attention matrix):
-  1. Preprocessing: dsoftmax_sum[b,h,i] = sum_d(dO[b,h,i,d] * O[b,h,i,d])
-  2. For each K/V tile:
-     For each Q tile:
-       S = Q_tile @ K_tile^T * scale
-       P = exp(S - lse)
-       dV += P^T @ dO_tile
-       dP = dO_tile @ V_tile^T
-       dS = P * (dP - dsoftmax_sum)
-       dQ += dS @ K_tile * scale
-       dK += dS^T @ Q_tile * scale
+Given the upstream gradient dO, compute (per batch b and head h):
+  Dsum[i] = sum_d dO[i, d] * O[i, d]
+  dV = P^T @ dO
+  dP = dO @ V^T
+  dS = P * (dP - Dsum[:, None])
+  dQ = dS @ K * scale
+  dK = dS^T @ Q * scale
 
-Inputs (all bf16, contiguous [B, H, S, D]):
-  dO: [2, 8, 128, 32], Q/K/V/O: same shape
-  lse: [2, 8, 128] fp32
+Inputs (contiguous row-major [B, H, S, D] layout, D fastest):
+  Q, K, V, dO: [16, 32, 8192, 32] bf16, i.i.d. standard normal rounded to bf16
+  O:   same shape, bf16 — forward output (computed in FP32 from Q, K, V, rounded to bf16)
+  lse: [16, 32, 8192] fp32 — natural-log log-sum-exp of each row of S (from the forward pass)
 
-Outputs (bf16): dQ, dK, dV same shape as Q, K, V
+Outputs (bf16): dQ, dK, dV with the same shapes as Q, K, V.
 
 scale = 1/sqrt(D) = 0.176777
+
+Precision: matrix products must use bf16 (or higher-precision) operands with FP32
+accumulation; Dsum and the softmax recomputation must be done in FP32. Quantizing any
+operand to FP8, INT8 or any lower precision is not allowed.
+
+Correctness: dQ, dK and dV are compared element-wise with a reference
+implementation over 3 random input sets:
+  |out - ref| <= atol + rtol * |ref|,  atol = 0.002, rtol = 0.02
+NaN/Inf fail, and every output element must be written (output buffers are
+pre-filled with NaN).
 
 
 ## Function Signature

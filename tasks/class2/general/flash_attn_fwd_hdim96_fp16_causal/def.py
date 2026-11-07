@@ -42,7 +42,7 @@ SCALAR_ARGS = {
     "scale": SCALE,
 }
 
-TOLERANCES = {"atol": 5e-2, "rtol": 5e-2}
+TOLERANCES = {"atol": 0.005, "rtol": 0.005}  # mirrored in task.yaml correctness.tolerances
 
 HAS_CUDA_REFERENCE = True
 REFERENCE_EXTRA_INCLUDES = [
@@ -65,8 +65,9 @@ def get_inputs():
 def get_outputs(inputs):
     Q = inputs[0][1]
     B, H, Sq, D = Q.shape
-    O = torch.empty(B, H, Sq, D, device='cuda', dtype=torch.float16)
-    lse = torch.empty(B, H, Sq, device='cuda', dtype=torch.float32)
+    # NaN-poisoned so that elements the kernel does not write fail the comparison.
+    O = torch.full((B, H, Sq, D), float('nan'), device='cuda', dtype=torch.float16)
+    lse = torch.full((B, H, Sq), float('nan'), device='cuda', dtype=torch.float32)
     return [("O", O), ("lse", lse)]
 
 
@@ -95,25 +96,37 @@ def reference_fn(inputs):
 
 
 DESCRIPTION = """\
-Implement a CUDA kernel for the forward pass of Flash Attention with causal masking.
+Implement a CUDA kernel for the forward pass of exact softmax attention with causal masking.
+The full Sq x Sk attention matrix must not be materialized in global memory.
 
-Compute scaled dot-product attention WITHOUT materializing the full attention matrix:
+For every batch b and head h (Q, K and V have the same number of heads H):
   S = Q @ K^T * scale
-  Apply causal mask: S[i][j] = -inf for j > i
-  O = softmax(S) @ V
-  lse[i] = log(sum(exp(S[i][:])))
+  Causal mask: S[i][j] = -inf for j > i   (Sq == Sk, so query row i attends keys 0..i)
+  P = softmax(S) along the key axis
+  O = P @ V
+  lse[i] = log(sum_j exp(S[i][j]))   (natural log over the unmasked keys of row i)
 
-Inputs (all fp16, contiguous, [B, H, S, D] layout):
-  Q: [%d, %d, %d, %d]
-  K: [%d, %d, %d, %d]
-  V: [%d, %d, %d, %d]
+Inputs (fp16, contiguous row-major [B, H, S, D] layout, D fastest):
+  Q: [B, H, Sq, D] = [%d, %d, %d, %d]
+  K: [B, H, Sk, D] = [%d, %d, %d, %d]
+  V: [B, H, Sk, D] = [%d, %d, %d, %d]
+  All input elements are i.i.d. standard normal, rounded to fp16.
 
 Outputs:
   O:   [B, H, Sq, D] fp16 — attention output
   lse: [B, H, Sq] fp32 — log-sum-exp per query row
 
 scale = 1/sqrt(D) = %f
-Causal: position i can only attend to positions j <= i.
+
+Precision: matrix products must use fp16 (or higher-precision) operands with FP32
+accumulation, and the softmax statistics / lse must be computed in FP32. Quantizing
+Q, K, V or P to FP8, INT8 or any lower precision is not allowed.
+
+Correctness: O and lse are compared element-wise with a reference
+implementation over 3 random input sets:
+  |out - ref| <= atol + rtol * |ref|,  atol = 0.005, rtol = 0.005
+NaN/Inf fail, and every output element must be written (output buffers are
+pre-filled with NaN).
 """ % (BATCH_SIZE, NUM_HEADS, SEQ_LEN_Q, HEAD_DIM,
        BATCH_SIZE, NUM_HEADS, SEQ_LEN_K, HEAD_DIM,
        BATCH_SIZE, NUM_HEADS, SEQ_LEN_K, HEAD_DIM,

@@ -1,6 +1,7 @@
 # Task: 26_ampere_wgrad_mainloop_fusion
 
-Conv2D Weight Gradient (wgrad) with fused per-channel scale + bias + ReLU activation.
+Conv2D weight gradient (wgrad) with a fused per-channel scale + bias + ReLU applied to the input
+activations. FP16 inputs, FP32 weight gradient, NHWC layout.
 
 ## Function Signature
 
@@ -29,14 +30,23 @@ activations BEFORE computing the weight gradient:
 
 Where h = p*stride_h + r - pad_h, w = q*stride_w + s - pad_w.
 Output dimensions: P = (H + 2*pad_h - R) / stride_h + 1, Q = (W + 2*pad_w - S) / stride_w + 1.
+Zero padding applies to the transformed activations (padded positions contribute 0, they are not
+transformed). Every grad_weight element must be written (the output buffer is not
+zero-initialized).
 
-## Data Types
+## Data Types and Precision
 
 - input:       `__half` (FP16) -- NHWC layout, the forward-pass activations
 - grad_output: `__half` (FP16) -- NHWC layout (N x P x Q x K)
 - scale:       `__half` (FP16) -- 1D vector of length C
 - bias:        `__half` (FP16) -- 1D vector of length C
 - grad_weight: `float`  (FP32) -- NHWC-style layout (K x R x S x C)
+
+The transformed activation is an FP16-precision value (computed in FP16 or FP32; it may be rounded
+to FP16). The reduction over N*P*Q must multiply FP16-precision operands and accumulate in FP32
+(or higher precision). Lower-precision arithmetic is not allowed even if it passes the tolerance:
+no FP16 accumulation (also not for partial sums), no products rounded to FP16, and no BF16, FP8,
+INT8 or other narrower operands.
 
 ## Memory Layout
 
@@ -46,17 +56,35 @@ NHWC layout for all 4D tensors:
 - grad_weight: K x R x S x C. Element (k,r,s,c) at offset ((k*R+r)*S+s)*C+c.
 - scale, bias: 1D vectors indexed by channel c.
 
+## Problem Sizes
+
+All 3x3 filters, pad = 1, stride 1 (training):
+- resnet50_conv2_b256: N=256, H=W=56,  C=K=64  (ResNet-50 stage-2 3x3 conv, training batch 256)
+- resnet50_conv4_b256: N=256, H=W=14,  C=K=256 (ResNet-50 stage-4 3x3 conv, training batch 256)
+- sdxl_unet_128_b8:    N=8,   H=W=128, C=K=320 (SDXL UNet fine-tuning at 1024x1024: 128x128 latents, batch 8)
+
+## Correctness
+
+Inputs are random values using the full FP16 mantissa: input, grad_output and bias uniform in
+[-1, 1), scale uniform in [0.25, 2). Every grad_weight element is compared with an FP64 result in
+which the transformed activation is rounded once to FP16, and must satisfy
+
+  |grad_weight - expected| <= 5e-6 * sum_{n,p,q} |dy * t| + 1.97e-3 * sqrt(sum_{n,p,q} (dy * t)^2)
+
+(dy = grad_output, t = transformed activation; the second term covers rounding t to FP16 or
+keeping it in FP32). NaN/Inf fail; the output buffer is filled with NaN before each call. Every
+timed call is verified as well.
+
 ## Build & Test
 
 ```bash
 make test                    # requires solution.h in task directory
-./test                       # default: runs small/medium/large sizes
-./test 1 56 56 64 64 3 3     # custom: N H W C K R S
+./test                       # default: runs all benchmark sizes
+./test 1 56 56 64 64 3 3     # custom: N H W C K R S (pad R/2, stride 1)
 ./test 1 56 56 64 64 3 3 20  # custom with iteration count
 ```
 
-Correctness is verified against a reference implementation at multiple problem sizes
-(small: N=1 56x56 C=64 K=64, medium: N=1 112x112 C=128 K=128, large: N=4 56x56 C=256 K=256).
-Performance is timed for both reference and your solution at each size.
+Performance is timed for both the reference and your solution at each size; the task score is the
+geometric mean of the per-size speedups.
 
 CUTLASS headers are available on the include path.

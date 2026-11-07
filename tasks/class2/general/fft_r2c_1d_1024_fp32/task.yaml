@@ -46,6 +46,7 @@ anti_cheat:
   - '#include\s*[<\"]cufft'
   - cufftExec
   - cufftPlan
+  - __half|__nv_bfloat|__nv_fp8|cuda_fp16\.h|cuda_bf16\.h|cuda_fp8\.h|\b__float2(?:half|bfloat)|wmma::precision::tf32|\.(?:tf32|f16|bf16|e4m3|e5m2)(?:x2)?\b
   required_patterns:
   - __global__\s+void
   - <<<.*>>>

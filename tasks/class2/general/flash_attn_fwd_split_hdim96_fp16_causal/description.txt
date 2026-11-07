@@ -2,28 +2,42 @@
 
 ## Description
 
-Implement a CUDA kernel for the forward pass of Flash Attention using split-KV parallelism with causal masking.
+Implement the causal attention forward pass for a speculative-decoding verification step.
 
-Split-KV approach: split the K/V sequence into num_splits chunks, compute partial
-softmax results independently per chunk, then combine using log-sum-exp correction.
+Workload: speculative-decoding verification on a multi-head-attention LLM
+(40 heads of dimension 128, as in Llama-2-13B) on one GPU: each of the
+8 sequences checks Sq = 8 draft tokens, which are the last 8
+positions of its 8192-token KV cache. This task uses head dimension
+D = 96 with H = 40 heads.
 
-  S = Q @ K^T * scale
-  Apply causal mask: S[i][j] = -inf for j > i
-  O = softmax(S) @ V
-  lse[i] = log(sum(exp(S[i][:])))
+For every batch index b and head h (query rows i, key/value rows j):
+  S[i][j]    = scale * dot(Q[b,h,i,:], K[b,h,j,:])
+  S[i][j]    = -inf where j > i + (Sk - Sq)   (causal, bottom-right aligned)
+  O[b,h,i,:] = sum_j softmax_j(S[i][:]) * V[b,h,j,:]
+  lse[b,h,i] = log(sum_j exp(S[i][j]))      (natural logarithm)
 
-Inputs (all fp16, contiguous, [B, H, S, D] layout):
-  Q: [4, 8, 256, 96]
-  K: [4, 8, 256, 96]
-  V: [4, 8, 256, 96]
-  num_splits: 4
+Causal mask (bottom-right aligned): query row i is the token at absolute
+position i + (Sk - Sq) and attends to keys j <= i + (Sk - Sq); the last query
+row attends to all Sk keys.
+
+Inputs (fp16, contiguous, [B, H, S, D] layout):
+  Q: [8, 40, 8, 96]
+  K: [8, 40, 8192, 96]
+  V: [8, 40, 8192, 96]
+  scale = 1/sqrt(D) = 0.102062
+  num_splits = 4: passed by the caller; O and lse must equal attention over the
+    full key sequence however the work is partitioned.
 
 Outputs:
-  O:   [B, H, Sq, D] fp16 — attention output
-  lse: [B, H, Sq] fp32 — log-sum-exp per query row
+  O:   [8, 40, 8, 96] fp16
+  lse: [8, 40, 8] fp32
 
-scale = 1/sqrt(D) = 0.102062
-Causal: position i can only attend to positions j <= i.
+Precision: dot products, softmax statistics and the P*V sums must be accumulated
+in FP32 (or higher); O is rounded to fp16 once, at the end.
+
+Correctness: on 3 random input sets (Q, K, V ~ N(0, 1)), O and lse are each
+compared element-wise with a reference: |out - ref| <= atol + rtol * |ref|,
+atol = 0.001, rtol = 0.005.
 
 
 ## Function Signature

@@ -123,7 +123,17 @@ cudaError_t CutlassStrmmNN(
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Kernel to initialize a matrix with small integers.
+/// Pseudo-random double in [-1, 1) from (offset, seed) with 52 random mantissa bits.
+/// Full-mantissa FP64 data: FP32 (or lower-precision) arithmetic cannot reproduce the result.
+__host__ __device__ inline double kh_rand_double(unsigned long long offset, unsigned long long seed) {
+  unsigned long long x = offset * 0x9E3779B97F4A7C15ull + (seed + 1ull) * 0xBF58476D1CE4E5B9ull;
+  x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull;
+  x ^= x >> 27; x *= 0x94D049BB133111EBull;
+  x ^= x >> 31;
+  return double(x >> 11) * 0x1.0p-52 - 1.0;
+}
+
+/// Kernel to initialize a matrix with full-mantissa pseudo-random values in [-1, 1).
 __global__ void InitializeMatrix_kernel(
   double *matrix,
   int ldm,
@@ -138,13 +148,8 @@ __global__ void InitializeMatrix_kernel(
   if (i < rows && j < columns) {
     if (fill_mode == cutlass::FillMode::kLower && i < j) return;
     else if (fill_mode == cutlass::FillMode::kUpper && i > j) return;
-    int offset = i + j * ldm;
-
-    int const k = 16807;
-    int const m = 16;
-    double value = double(((offset + seed) * k % m) - m / 2);
-
-    matrix[offset] = value;
+    size_t offset = size_t(i) + size_t(j) * ldm;
+    matrix[offset] = kh_rand_double(offset, (unsigned long long)seed);
   }
 }
 
@@ -165,7 +170,7 @@ cudaError_t InitializeMatrix(double *matrix, int ldm, int rows, int columns, int
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Allocates device memory for a matrix then fills with arbitrary small integers.
+/// Allocates device memory for a matrix then fills it with pseudo-random values in [-1, 1).
 cudaError_t AllocateMatrix(double **matrix, int ldm, int rows, int columns, int seed = 0,
                            cutlass::FillMode fill_mode = cutlass::FillMode::kInvalid) {
   cudaError_t result;
@@ -252,6 +257,27 @@ cudaError_t ReferenceTrmm(
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
+/// FP64 accuracy requirement: every element must satisfy |x - ref| <= kFp64RelTol * max|ref|
+/// (NaN/Inf always fail). Two correct FP64 implementations (any summation order) agree to
+/// ~1e-14 of max|ref| at these sizes; FP32 arithmetic or FP32-rounded inputs give ~1e-7.
+static const double kFp64RelTol = 1e-10;
+
+/// Max element error relative to max|ref|; >= 2*kFp64RelTol (or inf) if any element is NaN/Inf.
+static double TrmmRelError(std::vector<double> const &x, std::vector<double> const &ref) {
+  double ref_scale = 0;
+  for (double r : ref) ref_scale = std::fmax(ref_scale, std::fabs(r));
+  if (ref_scale == 0) ref_scale = 1;
+  double max_rel = 0;
+  bool bad = false;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    double rel = std::fabs(x[i] - ref[i]) / ref_scale;
+    if (!(rel <= kFp64RelTol)) bad = true;   // also catches NaN/Inf
+    if (!std::isfinite(rel)) rel = INFINITY;
+    if (rel > max_rel) max_rel = rel;
+  }
+  return bad ? std::fmax(max_rel, 2 * kFp64RelTol) : max_rel;
+}
+
 /// Test correctness: CUTLASS reference vs naive, and (if KH_TEST_SOLUTION) solution vs CUTLASS.
 cudaError_t TestCorrectness(int M, int N, double alpha) {
   cudaError_t result;
@@ -298,24 +324,28 @@ cudaError_t TestCorrectness(int M, int N, double alpha) {
 
   cudaDeviceSynchronize();
 
-  // Verify CUTLASS vs naive
-  std::vector<double> host_cutlass(ldc * N);
-  std::vector<double> host_reference(ldc * N);
+  // Verify CUTLASS vs naive (FP64 tolerance)
+  std::vector<double> host_cutlass(size_t(ldc) * N);
+  std::vector<double> host_reference(size_t(ldc) * N);
 
   cudaMemcpy(host_cutlass.data(), C_cutlass, sizeof_C, cudaMemcpyDeviceToHost);
   cudaMemcpy(host_reference.data(), C_reference, sizeof_C, cudaMemcpyDeviceToHost);
 
-  if (host_cutlass != host_reference) {
-    std::cerr << "CUTLASS reference incorrect vs naive." << std::endl;
-    cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(B); cudaFree(A);
-    return cudaErrorUnknown;
+  {
+    double rel = TrmmRelError(host_cutlass, host_reference);
+    if (!(rel <= kFp64RelTol)) {
+      std::cerr << "CUTLASS reference incorrect vs naive (rel err " << rel << ")." << std::endl;
+      cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(B); cudaFree(A);
+      return cudaErrorUnknown;
+    }
+    std::cout << "Reference vs naive FP64 rel err: " << rel << std::endl;
   }
 
 #ifdef KH_TEST_SOLUTION
-  // Allocate solution output
+  // Allocate solution output, poisoned with NaN (0xFF bytes) so unwritten elements fail
   double *C_solution;
   cudaMalloc(&C_solution, sizeof_C);
-  cudaMemset(C_solution, 0, sizeof_C);
+  cudaMemset(C_solution, 0xFF, sizeof_C);
 
   // Run solution
   result = Dtrmm(M, N, alpha, A, lda, B, ldb, C_solution, ldc);
@@ -326,16 +356,14 @@ cudaError_t TestCorrectness(int M, int N, double alpha) {
   }
   cudaDeviceSynchronize();
 
-  // Verify solution vs CUTLASS reference
-  std::vector<double> host_solution(ldc * N);
+  // Verify solution vs CUTLASS reference (FP64 tolerance; NaN/Inf and unwritten elements fail)
+  std::vector<double> host_solution(size_t(ldc) * N);
   cudaMemcpy(host_solution.data(), C_solution, sizeof_C, cudaMemcpyDeviceToHost);
 
-  double max_diff = 0;
-  for (int i = 0; i < ldc * N; ++i) {
-    max_diff = fmax(max_diff, fabs(host_solution[i] - host_cutlass[i]));
-  }
-  if (max_diff > 1e-3) {
-    std::cerr << "Solution incorrect. Max diff vs reference: " << max_diff << std::endl;
+  double sol_rel = TrmmRelError(host_solution, host_cutlass);
+  std::cout << "Solution vs reference FP64 rel err: " << sol_rel << " (tolerance " << kFp64RelTol << ")" << std::endl;
+  if (!(sol_rel <= kFp64RelTol)) {
+    std::cerr << "Solution incorrect. Max error vs reference (relative to max|ref|): " << sol_rel << std::endl;
     cudaFree(C_solution); cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(B); cudaFree(A);
     return cudaErrorUnknown;
   }
@@ -454,7 +482,7 @@ int main(int argc, const char *arg[]) {
   bool explicit_size = (argc >= 3);
 
   std::vector<TestConfig> configs;
-  double alpha = 1.0;
+  double alpha = 1.1;   // non-trivial alpha so the alpha scaling is exercised
   int iterations = 20;
 
   if (explicit_size) {

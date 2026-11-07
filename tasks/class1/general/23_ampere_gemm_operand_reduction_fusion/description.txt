@@ -33,11 +33,15 @@ Where:
 - D is M x N (column-major, bf16)
 - row_reduction is a float array of length K
 
-## Data Types
+## Data Types and Precision
 
 - A, B, C, D: `__nv_bfloat16` (BF16)
 - alpha, beta: `float`
 - row_reduction: `float`
+
+Products of the BF16 inputs must be accumulated in FP32 and D rounded to BF16 once at the end;
+row_reduction must be accumulated in FP32. Lower-precision arithmetic (BF16 or FP16
+accumulation, FP8 or INT8 operands) is not allowed even if it passes the tolerance.
 
 ## Memory Layout
 
@@ -50,13 +54,39 @@ Where:
 
 ```bash
 make test                    # requires solution.h in task directory
-./test                       # default: runs small/medium/large sizes
-./test 1024 1024 1024        # custom single size: M N K
-./test 1024 1024 1024 1.0 0.0 20  # M N K alpha beta iterations
+./test                       # default: runs all benchmark sizes below
+./test 16384 5120 10240      # custom single size: M N K
+./test 16384 5120 10240 1.0 0.0 20  # M N K alpha beta iterations
 ```
 
-Correctness is verified against a reference implementation at multiple problem sizes
-(small: 1024x1024x1024, medium: 4096x4096x4096, large: 8192x8192x8192).
-Performance is timed for both reference and your solution at each size.
+## Problem Sizes
+
+The backward data-gradient GEMM of the Qwen3-32B linear layers (hidden 5120, fused QKV 10240,
+attention output 8192, FFN 25600) for one 16K-token chunk on one GPU, with the layer's bias
+gradient fused: A = dY (tokens x out_features), B = W (out_features x in_features), D = dX,
+row_reduction = bias gradient (sum of dY over tokens).
+
+| label          | M (tokens) | N (in_features) | K (out_features) |
+|----------------|------------|-----------------|------------------|
+| qkv_dgrad      | 16384      | 5120            | 10240            |
+| o_proj_dgrad   | 16384      | 8192            | 5120             |
+| mlp_up_dgrad   | 16384      | 5120            | 51200            |
+| mlp_down_dgrad | 16384      | 25600           | 5120             |
+
+alpha = 1, beta = 0, lda = ldc = ldd = M, ldb = N.
+
+## Correctness
+
+Inputs are random BF16 values in [-1, 1) that use the full BF16 significand. D and
+row_reduction are filled with NaN before your function runs, so elements that are not written
+fail. Every element is compared with the exact result:
+- D: every element finite and |D - exact| <= 1.2e-2 * |exact| + 2e-4 * RMS(exact) (three times the
+  BF16 rounding bound plus a small accumulation allowance), and relative Frobenius error
+  ||D - exact|| / ||exact|| <= 5e-3;
+- row_reduction: every element finite and |r - exact| <= 1.5e-6 * sqrt(M) * RMS(exact), and
+  relative Frobenius error <= 1.2e-7 * sqrt(M).
+
+Performance is timed for both the reference and your solution at each size; the task score is
+the geometric mean of the per-size speedups.
 
 CUTLASS headers are available on the include path.

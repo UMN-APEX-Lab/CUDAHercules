@@ -2,9 +2,11 @@
 
 ## Description
 
-Implement a CUDA kernel for LayerNorm backward pass.
+Implement a CUDA kernel for the LayerNorm backward pass (FP32 input and output).
 
-Given upstream gradient dz, saved input x, mean mu, reciprocal std rs, and weight gamma:
+Given upstream gradient dz [rows, cols], saved input x [rows, cols], saved mean mu [rows],
+saved reciprocal std rs [rows] (rs = 1/sqrt(var + 1e-5), biased variance) and weight
+gamma [cols]:
 
 Per-row (data gradient):
   x_hat[i,j] = (x[i,j] - mu[i]) * rs[i]
@@ -17,7 +19,18 @@ Per-column (weight gradients):
   dgamma[j] = sum_i(dz[i,j] * x_hat[i,j])
   dbeta[j] = sum_i(dz[i,j])
 
-Dimensions: rows=16384, cols=1024
+Dimensions: rows=16384, cols=1024. All tensors are contiguous row-major fp32.
+x, gamma and dz are i.i.d. standard normal; mu and rs are the statistics of x.
+Outputs: dx [rows, cols], dgamma [cols], dbeta [cols].
+
+Precision: all arithmetic must be FP32 (or higher). FP16/BF16/FP8 arithmetic or
+storing intermediates in a lower precision is not allowed.
+
+Correctness: dx, dgamma and dbeta are compared element-wise with a reference
+implementation over 3 random input sets:
+  |out - ref| <= atol + rtol * |ref|,  atol = 0.003, rtol = 0.0001
+NaN/Inf fail, and every output element must be written (output buffers are
+pre-filled with NaN).
 
 
 ## Function Signature

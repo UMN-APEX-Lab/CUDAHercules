@@ -2,31 +2,41 @@
 
 ## Description
 
-Implement CUDA kernels for the Flash Attention backward pass with causal masking.
+Implement CUDA kernels for the backward pass of exact softmax attention with causal masking.
+The full S x S attention matrix must not be materialized in global memory.
 
-Given upstream gradient dO and saved forward tensors (Q, K, V, O, lse), compute:
-  dQ, dK, dV — gradients w.r.t. Q, K, V
+Forward pass being differentiated (per batch b and head h; Sq = Sk = S):
+  S = Q @ K^T * scale
+  Causal mask: S[i][j] = -inf (P[i][j] = 0) for j > i   (query row i attends keys 0..i)
+  P = exp(S - lse[:, None])        (= softmax(S) along the key axis)
+  O = P @ V
 
-Algorithm (tiled, avoids materializing full attention matrix):
-  1. Preprocessing: dsoftmax_sum[b,h,i] = sum_d(dO[b,h,i,d] * O[b,h,i,d])
-  2. For each K/V tile:
-     For each Q tile:
-       S = Q_tile @ K_tile^T * scale
-       P = exp(S - lse)
-       dV += P^T @ dO_tile
-       dP = dO_tile @ V_tile^T
-       dS = P * (dP - dsoftmax_sum)
-       dQ += dS @ K_tile * scale
-       dK += dS^T @ Q_tile * scale
+Given the upstream gradient dO, compute (per batch b and head h):
+  Dsum[i] = sum_d dO[i, d] * O[i, d]
+  dV = P^T @ dO
+  dP = dO @ V^T
+  dS = P * (dP - Dsum[:, None])
+  dQ = dS @ K * scale
+  dK = dS^T @ Q * scale
 
-Inputs (all fp16, contiguous [B, H, S, D]):
-  dO: [2, 8, 128, 256], Q/K/V/O: same shape
-  lse: [2, 8, 128] fp32
+Inputs (contiguous row-major [B, H, S, D] layout, D fastest):
+  Q, K, V, dO: [4, 8, 8192, 256] fp16, i.i.d. standard normal rounded to fp16
+  O:   same shape, fp16 — forward output (computed in FP32 from Q, K, V, rounded to fp16)
+  lse: [4, 8, 8192] fp32 — natural-log log-sum-exp of each row of S (from the forward pass)
 
-Outputs (fp16): dQ, dK, dV same shape as Q, K, V
+Outputs (fp16): dQ, dK, dV with the same shapes as Q, K, V.
 
 scale = 1/sqrt(D) = 0.062500
-Causal: position i can only attend to positions j <= i.
+
+Precision: matrix products must use fp16 (or higher-precision) operands with FP32
+accumulation; Dsum and the softmax recomputation must be done in FP32. Quantizing any
+operand to FP8, INT8 or any lower precision is not allowed.
+
+Correctness: dQ, dK and dV are compared element-wise with a reference
+implementation over 3 random input sets:
+  |out - ref| <= atol + rtol * |ref|,  atol = 0.005, rtol = 0.01
+NaN/Inf fail, and every output element must be written (output buffers are
+pre-filled with NaN).
 
 
 ## Function Signature

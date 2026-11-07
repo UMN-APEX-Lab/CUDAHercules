@@ -124,7 +124,7 @@ extern "C" void launch_flash_attn_fwd_split(
 
     FLASH_NAMESPACE::run_mha_fwd_splitkv_dispatch<cutlass::half_t, 32, false>(params, stream);
 
-    cudaStreamSynchronize(stream);
+    // No host-side sync: kernels and the workspace release stay stream-ordered.
     /* cudaFree(oaccum); removed — buffer cached across invocations */
     /* cudaFree(lseaccum); removed — buffer cached across invocations */
 }

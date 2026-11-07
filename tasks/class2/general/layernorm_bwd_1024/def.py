@@ -27,7 +27,7 @@ void launch_layernorm_backward(
 
 SCALAR_ARGS = {"rows": ROWS, "cols": COLS}
 
-TOLERANCES = {"atol": 1e-3, "rtol": 1e-3}
+TOLERANCES = {"atol": 0.003, "rtol": 0.0001}  # mirrored in task.yaml correctness.tolerances
 
 HAS_CUDA_REFERENCE = True
 REFERENCE_EXTRA_INCLUDES = ["reference_sources/layer_norm"]
@@ -43,9 +43,10 @@ def get_inputs():
 
 
 def get_outputs(inputs):
-    dx = torch.empty(ROWS, COLS, device='cuda', dtype=torch.float32)
-    dgamma = torch.empty(COLS, device='cuda', dtype=torch.float32)
-    dbeta = torch.empty(COLS, device='cuda', dtype=torch.float32)
+    # NaN-poisoned so that elements the kernel does not write fail the comparison.
+    dx = torch.full((ROWS, COLS), float('nan'), device='cuda', dtype=torch.float32)
+    dgamma = torch.full((COLS,), float('nan'), device='cuda', dtype=torch.float32)
+    dbeta = torch.full((COLS,), float('nan'), device='cuda', dtype=torch.float32)
     return [("dx", dx), ("dgamma", dgamma), ("dbeta", dbeta)]
 
 
@@ -71,9 +72,11 @@ def reference_fn(inputs):
 
 
 DESCRIPTION = """\
-Implement a CUDA kernel for LayerNorm backward pass.
+Implement a CUDA kernel for the LayerNorm backward pass (FP32 input and output).
 
-Given upstream gradient dz, saved input x, mean mu, reciprocal std rs, and weight gamma:
+Given upstream gradient dz [rows, cols], saved input x [rows, cols], saved mean mu [rows],
+saved reciprocal std rs [rows] (rs = 1/sqrt(var + 1e-5), biased variance) and weight
+gamma [cols]:
 
 Per-row (data gradient):
   x_hat[i,j] = (x[i,j] - mu[i]) * rs[i]
@@ -86,5 +89,16 @@ Per-column (weight gradients):
   dgamma[j] = sum_i(dz[i,j] * x_hat[i,j])
   dbeta[j] = sum_i(dz[i,j])
 
-Dimensions: rows=%d, cols=%d
+Dimensions: rows=%d, cols=%d. All tensors are contiguous row-major fp32.
+x, gamma and dz are i.i.d. standard normal; mu and rs are the statistics of x.
+Outputs: dx [rows, cols], dgamma [cols], dbeta [cols].
+
+Precision: all arithmetic must be FP32 (or higher). FP16/BF16/FP8 arithmetic or
+storing intermediates in a lower precision is not allowed.
+
+Correctness: dx, dgamma and dbeta are compared element-wise with a reference
+implementation over 3 random input sets:
+  |out - ref| <= atol + rtol * |ref|,  atol = 0.003, rtol = 0.0001
+NaN/Inf fail, and every output element must be written (output buffers are
+pre-filled with NaN).
 """ % (ROWS, COLS)

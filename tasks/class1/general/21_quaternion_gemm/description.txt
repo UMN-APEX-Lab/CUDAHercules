@@ -37,9 +37,12 @@ Where:
 - Multiplication between quaternion elements uses the Hamilton product
 - alpha and beta are real scalars applied component-wise to the quaternion result
 
-## Data Types
+## Data Types and Precision
 
-All data is `float` (FP32). Each quaternion element occupies 4 consecutive floats in order (x, y, z, w).
+All data is `float` (FP32). Each quaternion element occupies 4 consecutive floats in order
+(x, y, z, w). The products must be computed at FP32 precision (FP32 multiplies and FP32
+accumulation); lower-precision arithmetic (TF32, BF16, FP16, FP8 or INT8, including tensor-core
+paths that use them) is not allowed even if it passes the tolerance.
 
 ## Memory Layout
 
@@ -51,13 +54,38 @@ All data is `float` (FP32). Each quaternion element occupies 4 consecutive float
 
 ```bash
 make test                    # requires solution.h in task directory
-./test                       # default: runs small/medium/large sizes
-./test 1024 1024 1024        # custom single size: M N K
-./test 1024 1024 1024 1.0 0.0 20  # M N K alpha beta iterations
+./test                       # default: runs all benchmark sizes below
+./test 16384 2560 1280       # custom single size: M N K (in quaternions)
+./test 16384 2560 1280 1.0 0.0 20  # M N K alpha beta iterations
 ```
 
-Correctness is verified against a reference implementation at multiple problem sizes
-(small: 1024x1024x1024, medium: 4096x4096x4096, large: 8192x8192x8192).
-Performance is timed for both reference and your solution at each size.
+## Problem Sizes
+
+Quaternion-valued versions of the Qwen3-32B linear layers served on one GPU (real dimensions
+divided by 4: hidden 5120 -> 1280, fused QKV 10240 -> 2560, attention output 8192 -> 2048,
+FFN 25600 -> 6400); M = tokens, either a 16K-token prefill chunk or one decode step of 128
+concurrent sequences; sizes in quaternions:
+
+| label            | M     | N     | K    | layer                                  |
+|------------------|-------|-------|------|----------------------------------------|
+| decode_qkv       | 128   | 2560  | 1280 | fused QKV projection, decode           |
+| prefill_qkv      | 16384 | 2560  | 1280 | fused QKV projection, prefill          |
+| prefill_o_proj   | 16384 | 1280  | 2048 | attention output projection, prefill   |
+| prefill_mlp_up   | 16384 | 12800 | 1280 | fused gate+up projection, prefill      |
+| prefill_mlp_down | 16384 | 1280  | 6400 | down projection, prefill               |
+
+alpha = 1, beta = 0, lda = K, ldb = K, ldc = N. With beta = 0 the initial contents of C are
+arbitrary finite values that must not affect the result.
+
+## Correctness
+
+Inputs are random FP32 values in [-1, 1) that use the full 24-bit significand. Every component
+of C is compared with the exact (FP64-accumulated) result:
+- every component must be finite and satisfy |C - exact| <= 1.5e-6 * sqrt(4K) * RMS(exact);
+- the relative Frobenius error ||C - exact|| / ||exact|| must be <= 1.2e-7 * sqrt(4K).
+Components that are not written fail the check.
+
+Performance is timed for both the reference and your solution at each size; the task score is
+the geometric mean of the per-size speedups.
 
 CUTLASS headers are available on the include path.

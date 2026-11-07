@@ -165,7 +165,9 @@ private:
   CUTLASS_DEVICE
   void apply(Params const &params, SharedStorage &shared_storage) {
 
-    int threadblock_num = (params.args.extent.column() + ThreadblockShape::kM - 1) / ThreadblockShape::kM;
+    // One partial result per threadblock tile along the reduced (column) dimension, i.e. per kN
+    // columns (the CUTLASS example divided by kM, which is only correct for square tiles).
+    int threadblock_num = (params.args.extent.column() + ThreadblockShape::kN - 1) / ThreadblockShape::kN;
 
     int block_n = blockIdx.x * blockDim.x;
 
@@ -405,6 +407,8 @@ private:
 
   MatrixCoord                           thread_offset_;
 
+  int                                   tile_n_;   ///< tile index along N (partial statistics row)
+
 public:
 
   CUTLASS_DEVICE
@@ -422,7 +426,8 @@ public:
     extent_(problem_size0),
     elementwise_(params.elementwise),
     iterator_C_(params.params_C, params.ptr_C, problem_size0, thread_idx, threadblock_offset),
-    iterator_D_(params.params_D, params.ptr_D, problem_size0, thread_idx, threadblock_offset)
+    iterator_D_(params.params_D, params.ptr_D, problem_size0, thread_idx, threadblock_offset),
+    tile_n_(threadblock_offset.column() / ThreadblockShape::kN)
   {
     alpha_ = (params.elementwise.alpha_ptr ? *params.elementwise.alpha_ptr : params.elementwise.alpha);
     beta_ =  (params.elementwise.beta_ptr ? *params.elementwise.beta_ptr : params.elementwise.beta);
@@ -569,7 +574,9 @@ public:
     ConvertMeanOutput  convert_mean_output;
 
     bool is_write_thread = (thread_offset_.row() < extent_.row() && (threadIdx.x % kThreadsPerRow) == 0);
-    int row_offset = thread_offset_.row() + blockIdx.y * extent_.row();
+    // Partial statistics are indexed by the tile's position along N (the CUTLASS example used
+    // blockIdx.y, which is wrong under a threadblock swizzle).
+    int row_offset = thread_offset_.row() + tile_n_ * extent_.row();
 
     ElementVariance *curr_ptr_sum_square = params_.ptr_Variance + row_offset;
     ElementMean *curr_ptr_element_sum = params_.ptr_Mean + row_offset;
@@ -679,7 +686,8 @@ template <
   typename InstructionShape_,
   int Stages0,
   int Stages1,
-  bool IsShiftedVariance_ = false
+  bool IsShiftedVariance_ = false,
+  int SwizzleN_ = 1
 >
 class GemmLayernorm {
 public:
@@ -746,7 +754,8 @@ public:
   static int const kStages0 = Stages0;
   static int const kStages1 = Stages1;
 
-  using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
+  // Threadblock rasterization (CUTLASS example: 1; selectable per problem shape by the harness)
+  using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<SwizzleN_>;
 
   ///////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1007,9 +1016,20 @@ public:
 
     int gemm_smem_size = int(sizeof(typename GemmEpilogueFusion::SharedStorage));
 
+    cudaError_t result;
+    // Opt in to more than 48 KB of dynamic shared memory when the configuration needs it (the
+    // CUTLASS example omitted this, which limited the first GEMM to <= 48 KB configurations).
+    if (gemm_smem_size >= (48 << 10)) {
+      result = cudaFuncSetAttribute(cutlass::Kernel<GemmEpilogueFusion>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, gemm_smem_size);
+      if (result != cudaSuccess) {
+        return cutlass::Status::kErrorInternal;
+      }
+    }
+
     cutlass::Kernel<GemmEpilogueFusion><<<gemm_grid, gemm_block, gemm_smem_size, stream>>>(params_.gemm0);
 
-    cudaError_t result = cudaGetLastError();
+    result = cudaGetLastError();
 
     if (result != cudaSuccess) {
       return cutlass::Status::kErrorInternal;

@@ -30,8 +30,8 @@ execute:
 correctness:
   mode: tensor_compare
   tolerances:
-    atol: 0.001
-    rtol: 0.001
+    atol: 1.0e-09
+    rtol: 5.0e-07
 performance:
   enabled: true
   parser: {}
@@ -46,6 +46,12 @@ anti_cheat:
   - '#include\s*[<\"]cufft'
   - cufftExec
   - cufftPlan
+  - __half|__nv_bfloat|__nv_fp8|cuda_fp16\.h|cuda_bf16\.h|cuda_fp8\.h|\b__float2(?:half|bfloat)|wmma::precision::tf32|\.(?:tf32|f16|bf16|e4m3|e5m2)(?:x2)?\b
+  - (?m)^(?![ \t]*(?://|/?\*))(?:(?!//)[^\n])*?\b(?:float[1-4]?|cuFloatComplex|make_cuFloatComplex|make_float[1-4]|make_cuComplex|cuComplex(?!\.h))\b
+  - (?m)^(?![ \t]*(?://|/?\*))(?:(?!//)[^\n])*?(?<![\w.])(?:\d+\.\d*|\.\d+|\d+(?=e))(?:e[-+]?\d+)?f\b
+  - \b(?:__)?(?:sin|cos|sincos|sinpi|cospi|sincospi|tan|exp|exp2|exp10|log|log2|sqrt|rsqrt|fma|pow|fabs|fmin|fmax|floor|ceil|round|rint)f\s*\(
+  - \b__\w*float\w*\s*\(|\b__f(?:add|sub|mul|fma|div|rcp|sqrt)_r[nzud]\b|\b__fdividef\b|\b__saturatef\b|\.f32\b
+  - \bCUDART_\w+_F\b
   required_patterns:
   - __global__\s+void
   - <<<.*>>>

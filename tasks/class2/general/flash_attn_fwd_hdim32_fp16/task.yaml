@@ -29,8 +29,8 @@ execute:
 correctness:
   mode: tensor_compare
   tolerances:
-    atol: 0.05
-    rtol: 0.05
+    atol: 0.001
+    rtol: 0.005
 performance:
   enabled: true
   parser: {}
@@ -45,6 +45,15 @@ anti_cheat:
   - '#include\s*[<"]flash_attn'
   - '#include\s*[<"]flash_fwd'
   - '#include\s*[<"]flash_bwd'
+  # Precision floor: inputs/outputs are fp16/bf16 with FP32 accumulation. FP8/FP6/FP4/INT8
+  # quantization and FP16-accumulating MMA are below spec and blocked.
+  - '\b__nv_fp8\w*|\b__nv_fp6\w*|\b__nv_fp4\w*|\b__nv_cvt_\w*fp8\w*'
+  - '\bcutlass::(float_e4m3_t|float_e5m2_t|float_e2m1_t|float_e3m2_t|float_e2m3_t|float_ue8m0_t|float_ue4m3_t)\b'
+  - '\.e[2-5]m[1-3](x[24])?\b'
+  - '\.[su](4|8)\.[su](4|8)\b'
+  - '\b__dp4a\b|\b__dp2a_(lo|hi)\b'
+  - '\.f16\.f16\.f16\.f16\b'
+  - '\baccumulator\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*(half|__half)\b'
   required_patterns:
   - __global__\s+void
   - <<<.*>>>

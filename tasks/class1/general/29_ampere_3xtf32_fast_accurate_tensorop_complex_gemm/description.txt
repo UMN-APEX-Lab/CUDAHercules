@@ -31,9 +31,15 @@ Where:
 - C is M x N (row-major complex)
 - D is M x N (row-major complex)
 
-## Data Types
+## Data Types and Precision
 
-All matrices use `float` pairs for complex numbers. Each complex element occupies 2 consecutive floats: (real, imaginary).
+All matrices use `float` pairs for complex numbers. Each complex element occupies 2 consecutive
+floats: (real, imaginary).
+
+The result must have FP32-level accuracy: FP32 arithmetic, or an error-compensated tensor-core
+scheme with equivalent accuracy such as 3xTF32 (operands split into high and low TF32 parts).
+Single-pass TF32, FP16, BF16, FP8 or INT8 arithmetic is not allowed even if it passes the
+tolerance.
 
 ## Memory Layout
 
@@ -49,13 +55,34 @@ lda/ldb/ldc/ldd are in units of complex elements (not floats).
 
 ```bash
 make test                       # requires solution.h in task directory
-./test                          # default: runs small/medium/large sizes
-./test 1024 1024 1024           # custom single size: M N K
-./test 1024 1024 1024 1.0 0.0 0.0 0.0 20  # M N K alpha_re alpha_im beta_re beta_im iterations
+./test                          # default: runs all benchmark sizes below
+./test 16384 16384 512          # custom single size: M N K
+./test 16384 16384 512 1.0 0.0 0.0 0.0 20  # M N K alpha_re alpha_im beta_re beta_im iterations
 ```
 
-Correctness is verified against a reference implementation at multiple problem sizes
-(small: 1024x1024x1024, medium: 4096x4096x4096, large: 8192x8192x8192).
-Performance is timed for both reference and your solution at each size.
+## Problem Sizes
+
+Complex-valued signal-processing and scientific workloads that one GPU runs:
+
+| label              | M     | N      | K      | workload                                                  |
+|--------------------|-------|--------|--------|-----------------------------------------------------------|
+| mimo_beamform      | 512   | 131072 | 512    | massive-MIMO beamforming: 512 beams x 512 antennas x 128K samples |
+| lu_trailing_update | 16384 | 16384  | 512    | blocked complex LU trailing-matrix update (16K matrix, 512 panel) |
+| subspace_proj      | 16384 | 512    | 16384  | 16K x 16K complex operator applied to a 512-vector block (block Krylov) |
+| correlator         | 1024  | 1024   | 131072 | radio-astronomy correlator: 1024 inputs integrated over 128K samples |
+
+alpha = 1 + 0i, beta = 0, lda = M, ldb = ldc = ldd = N.
+
+## Correctness
+
+Inputs are random complex values whose real and imaginary parts are FP32 values in [-1, 1)
+using the full 24-bit significand. D is filled with NaN before your function runs, so elements
+that are not written fail. Every real and imaginary component of D is compared with the exact
+(FP64-accumulated) result:
+- every component must be finite and satisfy |D - exact| <= 1.5e-6 * sqrt(2K) * RMS(exact);
+- the relative Frobenius error ||D - exact|| / ||exact|| must be <= 1.2e-7 * sqrt(2K).
+
+Performance is timed for both the reference and your solution at each size; the task score is
+the geometric mean of the per-size speedups.
 
 CUTLASS headers are available on the include path.

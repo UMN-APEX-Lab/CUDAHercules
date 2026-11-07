@@ -30,32 +30,49 @@ Where:
 - B_b is K x N, starting at B + b * batch_stride_B
 - C_b is M x N, starting at C + b * batch_stride_C
 
-## Data Types
+## Data Types and Precision
 
-All matrices are `float` (FP32).
+All matrices and scalars are `float` (FP32). The products must be computed and accumulated in FP32
+arithmetic. Lower-precision arithmetic (TF32 tensor cores, including multi-pass TF32 splitting,
+FP16, BF16, FP8, INT8) is not allowed, even if it passes the tolerance.
 
 ## Memory Layout
 
 All matrices are **column-major**:
-- A: Element (i,k) at `A[i + k * lda]`.  lda >= M. batch_stride_A = lda * K.
+- A: Element (i,k) at `A[i + k * lda]`.  lda = M. batch_stride_A = lda * K.
 - B: Element (k,j) at `B[k + j * ldb]`.  ldb = K * batch_count. batch_stride_B = K.
   (All batches of B are interleaved along the leading dimension.)
-- C: Element (i,j) at `C[i + j * ldc]`.  ldc >= M. batch_stride_C = ldc * N.
+- C: Element (i,j) at `C[i + j * ldc]`.  ldc = M. batch_stride_C = ldc * N.
+
+## Problem Sizes
+
+alpha = 1, beta = 0 at every size; batched GEMMs of models that run on a single 96 GB GPU
+(batch = attention heads or MoE experts):
+
+| name                   | M    | N    | K    | batch | workload                                                        |
+|------------------------|------|------|------|-------|-----------------------------------------------------------------|
+| attn_scores_prefill    | 4096 | 8192 | 128  | 64    | Qwen3-32B Q*K^T per head (64 heads), 4K-query chunk x 8K keys   |
+| attn_pv_prefill        | 4096 | 128  | 8192 | 64    | Qwen3-32B P*V per head, same shapes                             |
+| attn_scores_decode_gqa | 8    | 6144 | 128  | 128   | Qwen3-32B decode: 16 seqs x 8 KV heads, 8 query heads per KV head, 6K context |
+| moe_experts            | 1024 | 1536 | 2048 | 128   | Qwen3-30B-A3B: 128 experts x 1024 tokens, 2048 -> 1536 (gate+up) |
+
+## Correctness
+
+Inputs (A, B and the initial C) are random FP32 values uniform in [-1, 1) using the full 24-bit
+mantissa. Every output element must be within 3e-5 * (|alpha| * sqrt(K) + |beta|) of an
+FP64-accumulated reference, which requires FP32-accurate arithmetic. Every element must be written
+and finite. The output is checked again after the timed runs.
 
 ## Build & Test
 
 ```bash
 make test                              # requires solution.h in task directory
-./test                                 # default: runs small/medium/large sizes
+./test                                 # default: runs all sizes listed above
 ./test 256 256 128 8                   # custom single size: M N K batch_count
-./test 256 256 128 8 1.0 0.0 20       # M N K batch_count alpha beta iterations
+./test 256 256 128 8 1.0 0.0 20        # M N K batch_count alpha beta iterations
 ```
 
-Correctness is verified against a reference implementation at multiple problem sizes:
-- small:   M=128,  N=128,  K=64,   batch=4
-- medium:  M=512,  N=512,  K=256,  batch=16
-- large:   M=2048, N=2048, K=1024, batch=4
-
-Performance is timed for both reference and your solution at each size.
+Performance is timed for both the reference and your solution at each size; the task speedup is
+the geometric mean of the per-size speedups.
 
 CUTLASS headers are available on the include path.
