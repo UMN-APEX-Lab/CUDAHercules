@@ -1,7 +1,10 @@
 /*
  * LayerNorm Backward — hidden_size=8192
+ * BF16 activations/gradients, FP32 weights, FP32 compute
  *
- * Source: flash-attention/csrc/layer_norm/ln_bwd_kernels.cuh
+ * Source: flash-attention/csrc/layer_norm/ln_bwd_kernels.cuh,
+ * instantiated as registered in ln_bwd_8192.cu for
+ * (wtype=fp32, itype=bf16, rtype=bf16, otype=bf16, ctype=fp32).
  * Kernel source code in reference_sources/.
  */
 
@@ -15,12 +18,12 @@ namespace layer_norm {
 }
 
 extern "C" void launch_layernorm_backward(
-    const float* dz,
-    const float* x,
+    const void* dz,
+    const void* x,
     const float* mu,
     const float* rs,
     const float* gamma,
-    float* dx,
+    void* dx,
     float* dgamma,
     float* dbeta,
     int rows,
@@ -32,9 +35,9 @@ extern "C" void launch_layernorm_backward(
     BwdParams params;
     params.rows = rows;
     params.cols = cols;
-    params.dz = const_cast<float*>(dz);
-    params.x = const_cast<float*>(x);
-    params.x0 = const_cast<float*>(x);
+    params.dz = const_cast<void*>(dz);
+    params.x = const_cast<void*>(x);
+    params.x0 = const_cast<void*>(x);
     params.mu = const_cast<float*>(mu);
     params.rs = const_cast<float*>(rs);
     params.gamma = const_cast<float*>(gamma);
@@ -78,25 +81,28 @@ extern "C" void launch_layernorm_backward(
     launch_params.stream = stream;
     launch_params.props = &prop;
 
-    launch_<float, float, float, float, float, uint32_t,
+    launch_<fp32, bf16, bf16, bf16, fp32, uint32_t,
             8192, 1, 1, 8, 16, 4
     >(launch_params, true);
 
-    int ctas_per_col = launch_params.params.ctas_per_col;
-    static float* dgamma_part = nullptr; static size_t dgamma_part_cached_size = 0;
-    static float* dbeta_part = nullptr; static size_t dbeta_part_cached_size = 0;
-    { size_t _need = ctas_per_col * 8192 * sizeof(float);
-        if (dgamma_part_cached_size < _need) { if (dgamma_part) cudaFree(dgamma_part); cudaMalloc(&dgamma_part, _need); dgamma_part_cached_size = _need; } }
-    { size_t _need = ctas_per_col * 8192 * sizeof(float);
-        if (dbeta_part_cached_size < _need) { if (dbeta_part) cudaFree(dbeta_part); cudaMalloc(&dbeta_part, _need); dbeta_part_cached_size = _need; } }
+    // FP32 per-CTA partial sums of dgamma/dbeta (reduced by the finalize kernel). The
+    // buffers are cached across calls, so a call does no cudaMalloc/cudaFree and no
+    // host synchronization (both kernels are stream-ordered).
+    const size_t part_bytes = static_cast<size_t>(launch_params.params.ctas_per_col) * cols * sizeof(float);
+    static void* dgamma_part = nullptr;
+    static void* dbeta_part = nullptr;
+    static size_t part_cached_bytes = 0;
+    if (part_cached_bytes < part_bytes) {
+        if (dgamma_part) cudaFree(dgamma_part);
+        if (dbeta_part) cudaFree(dbeta_part);
+        cudaMalloc(&dgamma_part, part_bytes);
+        cudaMalloc(&dbeta_part, part_bytes);
+        part_cached_bytes = part_bytes;
+    }
     launch_params.params.dgamma_part = dgamma_part;
     launch_params.params.dbeta_part = dbeta_part;
 
-    launch_<float, float, float, float, float, uint32_t,
+    launch_<fp32, bf16, bf16, bf16, fp32, uint32_t,
             8192, 1, 1, 8, 16, 4
     >(launch_params, false);
-
-    cudaStreamSynchronize(stream);
-    /* cudaFree(dgamma_part); removed — buffer cached across invocations */
-    /* cudaFree(dbeta_part); removed — buffer cached across invocations */
 }
