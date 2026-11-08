@@ -1,8 +1,9 @@
 # Hopper 性能 reference 检查与替换
 
 覆盖全部 **85 个 Hopper 任务**：Class 1 的 21 个、Class 2 的 60 个 FA3 和 4 个 TK。
-本轮替换弱 reference、补齐生产构建参数并刷新 H200 缓存。KDA agent 保持暂停；
-只重测已保存的 task 48 kernel，没有模型调用，也没有改写历史分数。
+首轮替换弱 reference、补齐生产构建参数并刷新 H200 缓存。后续 task 57 的
+HPC-Ops 替换和原始 KDA 延迟重计分见 [task 57 报告](TASK57_HPC_OPS_STUDY.md)；
+旧运行记录保留，continuation 中该任务更新为 0.923240490×。
 
 ## 共性问题和结果
 
@@ -28,6 +29,7 @@ router 和 grouped W8A16 中的性能空间。
 | 54 FP8 MLP | 4.2270 | 3.0082 | cuBLASLt，FP32 输出 |
 | 55 W8A16 prefill | 2.9058 | 1.8639 | 大 M 宽 tile CUTLASS |
 | 56 pointer-batched decode | 0.3877 | 0.2537 | cuBLAS batched / CUTLASS 选择 |
+| 57 grouped FP8 decode | 0.1013 | 0.0399 | Tencent HPC-Ops 三阶段 cp.async |
 | 63 prefetch 大 decode | 0.1752 | 0.0937 | N tile=128，完整 SiLU→GEMM |
 | 69 grouped W8A16 大 case | 2.4343 | 0.3837 | N tile 从 16 改为 128 |
 | TK FP8 decode | 0.1702 | 0.0312 | cuBLASLt，BF16 输出 |
@@ -46,7 +48,7 @@ router 和 grouped W8A16 中的性能空间。
 | 52 gather/scatter | 比较原融合与 gather→cuBLASLt→scatter；完整三阶段计时，完整输出交叉检查。 |
 | 55 mixed W8A16 | 小 M 原 tile，大 M 宽 tile；另比较每次反量化→cuBLASLt，反量化计入每次调用。 |
 | 56 pointer-batched | 比较 cuBLAS batched 和 CUTLASS，保留 device pointer-array 接口，完整输出交叉检查。 |
-| 57 grouped FP8 | cooperative/pingpong 对比，后者更慢，保留原 cooperative release kernel。 |
+| 57 grouped FP8 | 后续对比 17 套 HPC-Ops 配置，采用 64×64×128、三阶段 cp.async；CUTLASS 保留为完整输出 oracle 和对齐不支持时的 fallback。 |
 | 61 router | 比较 CUTLASS 融合与 cuBLASLt FP32 logits→vLLM top-k→scatter；修复离散数据、并列值及默认 alpha。 |
 | 62 sparse | 对比 cluster/宽 tile；宽 tile 导致 decode 明显退化，保留原稀疏配置。 |
 | 63 prefetch | 调整 N tile；SiLU predecessor 仍在两边每次完整调用中计时。 |

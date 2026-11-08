@@ -306,7 +306,7 @@
     {
       "task": "class1/hopper/57_hopper_grouped_gemm",
       "gpu": "NVIDIA H200 NVL",
-      "source_hash": "2dc2bd2d908299767bae68f513294cc9334d608491785c865a45bbb2b3b46541",
+      "source_hash": "9caafd2eec7aff0b235e80870bc60b56ca4bd041671891676b512d7119317a9a",
       "ref_compiled": true,
       "positive_compiled": true,
       "empty_compiled": true,
@@ -314,15 +314,15 @@
       "reference_cases": [
         {
           "name": "moe_decode: M=128, N=1536, K=2048, groups=16",
-          "ref_min_ms": 0.0975
+          "ref_min_ms": 0.0397
         },
         {
           "name": "moe_prefill: M=1024, N=1536, K=2048, groups=32",
-          "ref_min_ms": 0.5536
+          "ref_min_ms": 0.4441
         },
         {
           "name": "moe_large: M=2048, N=1536, K=2048, groups=16",
-          "ref_min_ms": 0.5052
+          "ref_min_ms": 0.3982
         }
       ],
       "positive_args": [

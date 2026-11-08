@@ -35,6 +35,14 @@
         "-DNDEBUG",
         "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED"
       ]
+    },
+    "task_updates": {
+      "class1/hopper/57_hopper_grouped_gemm": {
+        "recorded_at_utc": "2026-11-08T17:27:27.547985+00:00",
+        "previous_source_hash": "2dc2bd2d908299767bae68f513294cc9334d608491785c865a45bbb2b3b46541",
+        "source_hash": "9caafd2eec7aff0b235e80870bc60b56ca4bd041671891676b512d7119317a9a",
+        "reference_backend": "Tencent HPC-Ops cp.async 64x64x128 stages=3"
+      }
     }
   },
   "benchmarks": {
@@ -175,21 +183,25 @@
       ]
     },
     "class1/hopper/57_hopper_grouped_gemm": {
-      "source_hash": "2dc2bd2d908299767bae68f513294cc9334d608491785c865a45bbb2b3b46541",
+      "source_hash": "9caafd2eec7aff0b235e80870bc60b56ca4bd041671891676b512d7119317a9a",
       "per_size": [
         {
           "name": "moe_decode: M=128, N=1536, K=2048, groups=16",
-          "ref_min_ms": 0.0975
+          "ref_min_ms": 0.0399
         },
         {
           "name": "moe_prefill: M=1024, N=1536, K=2048, groups=32",
-          "ref_min_ms": 0.5536
+          "ref_min_ms": 0.4427
         },
         {
           "name": "moe_large: M=2048, N=1536, K=2048, groups=16",
-          "ref_min_ms": 0.5052
+          "ref_min_ms": 0.3994
         }
-      ]
+      ],
+      "reference_backend": "Tencent HPC-Ops cp.async 64x64x128 stages=3",
+      "upstream_commit": "2a2e26562433a8ba4b504858f1c938eb7612c901",
+      "recorded_at_utc": "2026-11-08T17:27:27.547985+00:00",
+      "timing_statistic": "median of three process minima; 20 cold-L2 CUDA-event trials per process"
     },
     "class1/hopper/61_hopper_gemm_with_topk_and_softmax": {
       "source_hash": "78e0fd9883cd95e2f16e619f3385e7e72a6a4c27c08c912ed4a5a0ee7e284775",

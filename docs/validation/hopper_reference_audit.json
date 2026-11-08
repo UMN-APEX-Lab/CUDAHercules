@@ -1904,5 +1904,148 @@
     ],
     "model_calls": 0,
     "agent_resumed": false
+  },
+  "follow_up_references": {
+    "class1/hopper/57_hopper_grouped_gemm": {
+      "reference_cache_entry": {
+        "source_hash": "9caafd2eec7aff0b235e80870bc60b56ca4bd041671891676b512d7119317a9a",
+        "per_size": [
+          {
+            "name": "moe_decode: M=128, N=1536, K=2048, groups=16",
+            "ref_min_ms": 0.0399
+          },
+          {
+            "name": "moe_prefill: M=1024, N=1536, K=2048, groups=32",
+            "ref_min_ms": 0.4427
+          },
+          {
+            "name": "moe_large: M=2048, N=1536, K=2048, groups=16",
+            "ref_min_ms": 0.3994
+          }
+        ],
+        "reference_backend": "Tencent HPC-Ops cp.async 64x64x128 stages=3",
+        "upstream_commit": "2a2e26562433a8ba4b504858f1c938eb7612c901",
+        "recorded_at_utc": "2026-11-08T17:27:27.547985+00:00",
+        "timing_statistic": "median of three process minima; 20 cold-L2 CUDA-event trials per process"
+      },
+      "integrated_reference_measurements": [
+        {
+          "repeat": 0,
+          "passed": true,
+          "cases": [
+            {
+              "name": "moe_decode: M=128, N=1536, K=2048, groups=16",
+              "ref_min_ms": 0.0404,
+              "hpc_backend": true
+            },
+            {
+              "name": "moe_prefill: M=1024, N=1536, K=2048, groups=32",
+              "ref_min_ms": 0.4427,
+              "hpc_backend": true
+            },
+            {
+              "name": "moe_large: M=2048, N=1536, K=2048, groups=16",
+              "ref_min_ms": 0.3994,
+              "hpc_backend": true
+            }
+          ]
+        },
+        {
+          "repeat": 1,
+          "passed": true,
+          "cases": [
+            {
+              "name": "moe_decode: M=128, N=1536, K=2048, groups=16",
+              "ref_min_ms": 0.0399,
+              "hpc_backend": true
+            },
+            {
+              "name": "moe_prefill: M=1024, N=1536, K=2048, groups=32",
+              "ref_min_ms": 0.4422,
+              "hpc_backend": true
+            },
+            {
+              "name": "moe_large: M=2048, N=1536, K=2048, groups=16",
+              "ref_min_ms": 0.3991,
+              "hpc_backend": true
+            }
+          ]
+        },
+        {
+          "repeat": 2,
+          "passed": true,
+          "cases": [
+            {
+              "name": "moe_decode: M=128, N=1536, K=2048, groups=16",
+              "ref_min_ms": 0.0398,
+              "hpc_backend": true
+            },
+            {
+              "name": "moe_prefill: M=1024, N=1536, K=2048, groups=32",
+              "ref_min_ms": 0.4427,
+              "hpc_backend": true
+            },
+            {
+              "name": "moe_large: M=2048, N=1536, K=2048, groups=16",
+              "ref_min_ms": 0.3998,
+              "hpc_backend": true
+            }
+          ]
+        }
+      ],
+      "validation": {
+        "task": "class1/hopper/57_hopper_grouped_gemm",
+        "gpu": "NVIDIA H200 NVL",
+        "source_hash": "9caafd2eec7aff0b235e80870bc60b56ca4bd041671891676b512d7119317a9a",
+        "ref_compiled": true,
+        "positive_compiled": true,
+        "empty_compiled": true,
+        "reference_passed": true,
+        "reference_cases": [
+          {
+            "name": "moe_decode: M=128, N=1536, K=2048, groups=16",
+            "ref_min_ms": 0.0397
+          },
+          {
+            "name": "moe_prefill: M=1024, N=1536, K=2048, groups=32",
+            "ref_min_ms": 0.4441
+          },
+          {
+            "name": "moe_large: M=2048, N=1536, K=2048, groups=16",
+            "ref_min_ms": 0.3982
+          }
+        ],
+        "positive_args": [
+          "--m=128",
+          "--n=256",
+          "--k=2048",
+          "--groups=8",
+          "--iterations=1"
+        ],
+        "positive_passed": true,
+        "empty_rejected": true,
+        "passed": true
+      },
+      "fallback_validation": {
+        "args": [
+          "--m=128",
+          "--n=48",
+          "--k=64",
+          "--groups=8",
+          "--iterations=2"
+        ],
+        "passed": true
+      },
+      "kda_previous_speedup": 1.448903172055167,
+      "kda_new_speedup": 0.9232404902545704,
+      "recorded_kernel_times_ms": [
+        0.0482,
+        0.4571,
+        0.4069
+      ],
+      "kernel_execution_performed": false,
+      "model_calls_performed": 0,
+      "evals_used": 3
+    }
   }
 }

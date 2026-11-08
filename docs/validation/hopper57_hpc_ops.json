@@ -1,0 +1,578 @@
+{
+  "configuration_results": [
+    {
+      "backend": "cp_async",
+      "config": 0,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0439,
+        0.4738,
+        0.4349
+      ],
+      "reference_median_ms": [
+        0.0964,
+        0.558,
+        0.5071
+      ],
+      "geomean_speedup": 1.4447253271275766
+    },
+    {
+      "backend": "cp_async",
+      "config": 1,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.043,
+        0.5864,
+        0.5319
+      ],
+      "reference_median_ms": [
+        0.0976,
+        0.5547,
+        0.5054
+      ],
+      "geomean_speedup": 1.2682852388268229
+    },
+    {
+      "backend": "cp_async",
+      "config": 2,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0433,
+        0.5122,
+        0.4708
+      ],
+      "reference_median_ms": [
+        0.0975,
+        0.5568,
+        0.5063
+      ],
+      "geomean_speedup": 1.3807528500745583
+    },
+    {
+      "backend": "cp_async",
+      "config": 3,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0545,
+        0.8325,
+        0.7864
+      ],
+      "reference_median_ms": [
+        0.0973,
+        0.5565,
+        0.5065
+      ],
+      "geomean_speedup": 0.9160328954219312
+    },
+    {
+      "backend": "cp_async",
+      "config": 4,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0401,
+        0.4435,
+        0.4011
+      ],
+      "reference_median_ms": [
+        0.0982,
+        0.5572,
+        0.5068
+      ],
+      "geomean_speedup": 1.5723751841482854
+    },
+    {
+      "backend": "cp_async",
+      "config": 5,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0417,
+        0.4706,
+        0.4205
+      ],
+      "reference_median_ms": [
+        0.0971,
+        0.5552,
+        0.5063
+      ],
+      "geomean_speedup": 1.4899586377184821
+    },
+    {
+      "backend": "cp_async",
+      "config": 6,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0552,
+        0.6918,
+        0.6111
+      ],
+      "reference_median_ms": [
+        0.0975,
+        0.5567,
+        0.5056
+      ],
+      "geomean_speedup": 1.0555212824089029
+    },
+    {
+      "backend": "cp_async",
+      "config": 7,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0468,
+        0.5423,
+        0.5035
+      ],
+      "reference_median_ms": [
+        0.0984,
+        0.5564,
+        0.506
+      ],
+      "geomean_speedup": 1.2942433277555518
+    },
+    {
+      "backend": "cp_async",
+      "config": 8,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0444,
+        0.5737,
+        0.5212
+      ],
+      "reference_median_ms": [
+        0.0979,
+        0.5562,
+        0.5069
+      ],
+      "geomean_speedup": 1.2763053219687046
+    },
+    {
+      "backend": "cp_async",
+      "config": 9,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0511,
+        0.5739,
+        0.5197
+      ],
+      "reference_median_ms": [
+        0.0974,
+        0.5573,
+        0.5076
+      ],
+      "geomean_speedup": 1.2182037270744295
+    },
+    {
+      "backend": "cp_async",
+      "config": 10,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0771,
+        0.9188,
+        0.8292
+      ],
+      "reference_median_ms": [
+        0.0968,
+        0.5567,
+        0.5074
+      ],
+      "geomean_speedup": 0.7750043280196558
+    },
+    {
+      "backend": "tma",
+      "config": 0,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0456,
+        0.5113,
+        0.4222
+      ],
+      "reference_median_ms": [
+        0.0975,
+        0.5542,
+        0.5076
+      ],
+      "geomean_speedup": 1.4071637176586005
+    },
+    {
+      "backend": "tma",
+      "config": 1,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0499,
+        0.6103,
+        0.5186
+      ],
+      "reference_median_ms": [
+        0.0983,
+        0.5549,
+        0.5045
+      ],
+      "geomean_speedup": 1.2033288480515116
+    },
+    {
+      "backend": "tma",
+      "config": 2,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0484,
+        0.549,
+        0.456
+      ],
+      "reference_median_ms": [
+        0.0972,
+        0.5526,
+        0.5054
+      ],
+      "geomean_speedup": 1.308508690736539
+    },
+    {
+      "backend": "tma",
+      "config": 3,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0461,
+        0.5172,
+        0.4273
+      ],
+      "reference_median_ms": [
+        0.0965,
+        0.5525,
+        0.5072
+      ],
+      "geomean_speedup": 1.3845718640712168
+    },
+    {
+      "backend": "tma",
+      "config": 4,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0462,
+        0.4791,
+        0.3924
+      ],
+      "reference_median_ms": [
+        0.0972,
+        0.5545,
+        0.5067
+      ],
+      "geomean_speedup": 1.4650097831383948
+    },
+    {
+      "backend": "tma",
+      "config": 5,
+      "repeat_count": 3,
+      "candidate_median_ms": [
+        0.0514,
+        0.5905,
+        0.4972
+      ],
+      "reference_median_ms": [
+        0.0974,
+        0.5548,
+        0.5056
+      ],
+      "geomean_speedup": 1.2187915780392236
+    }
+  ],
+  "best_single_configuration": {
+    "backend": "cp_async",
+    "config": 4,
+    "repeat_count": 3,
+    "candidate_median_ms": [
+      0.0401,
+      0.4435,
+      0.4011
+    ],
+    "reference_median_ms": [
+      0.0982,
+      0.5572,
+      0.5068
+    ],
+    "geomean_speedup": 1.5723751841482854
+  },
+  "kda_control_median_ms": [
+    0.0485,
+    0.4519,
+    0.4025
+  ],
+  "kda_vs_candidate_per_case": [
+    0.8268041237113402,
+    0.9814118167736224,
+    0.9965217391304347
+  ],
+  "kda_vs_candidate_geomean": 0.9316373642859945,
+  "formal_reference_replaced": true,
+  "diagnostic_validation": [
+    {
+      "name": "default_seed2021",
+      "args": [],
+      "seed": 2021,
+      "alpha": 1.0,
+      "passed": true,
+      "stderr": ""
+    },
+    {
+      "name": "default_seed2022",
+      "args": [],
+      "seed": 2022,
+      "alpha": 1.0,
+      "passed": true,
+      "stderr": ""
+    },
+    {
+      "name": "small_one_group",
+      "args": [
+        "--m=16",
+        "--n=128",
+        "--k=128",
+        "--groups=1",
+        "--iterations=3"
+      ],
+      "seed": 2101,
+      "alpha": 1.0,
+      "passed": true,
+      "stderr": ""
+    },
+    {
+      "name": "ragged_groups_alpha",
+      "args": [
+        "--m=320",
+        "--n=384",
+        "--k=512",
+        "--groups=9",
+        "--iterations=3"
+      ],
+      "seed": 2102,
+      "alpha": 0.37,
+      "passed": true,
+      "stderr": ""
+    },
+    {
+      "name": "zero_groups_negative_alpha",
+      "args": [
+        "--m=192",
+        "--n=256",
+        "--k=1024",
+        "--groups=7",
+        "--iterations=3"
+      ],
+      "seed": 2103,
+      "alpha": -0.75,
+      "passed": true,
+      "stderr": ""
+    }
+  ],
+  "status": "ADOPTED",
+  "measured_at_utc": "2026-11-08T16:45:50.690713+00:00",
+  "hardware": "NVIDIA H200 NVL, 580.178.04",
+  "task_id": "class1/hopper/57_hopper_grouped_gemm",
+  "task_source_hash": "9caafd2eec7aff0b235e80870bc60b56ca4bd041671891676b512d7119317a9a",
+  "upstream_commit": "2a2e26562433a8ba4b504858f1c938eb7612c901",
+  "all_experiments_passed": true,
+  "cp_async_provenance": {
+    "upstream": "https://github.com/Tencent/hpc-ops",
+    "commit": "2a2e26562433a8ba4b504858f1c938eb7612c901",
+    "backend": "cp_async",
+    "source": "src/group_gemm/sm90/cp_async/group_gemm_fp8.cu",
+    "config": "src/group_gemm/sm90/cp_async/config.h",
+    "canonical_task_unchanged": true,
+    "adapter_sha256": "3310e84e18dc43cac6779a6b514de9cc6310b9d3df682ddcd7d0c577a22d1f23",
+    "adaptations": [
+      "E5M2 x E4M3 WGMMA after operand swap, no input conversion",
+      "Device Ms/Ns/Ks and pointer/stride arrays replace contiguous grouped buffers",
+      "FP16 column-major epilogue replaces BF16 row-major epilogue",
+      "Keep upstream cp.async pipeline and per-K-tile FP32 accumulation promotion"
+    ],
+    "limitations": [
+      "Experiment requires K multiple of tile K and N multiple of 64, true for all default task-57 cases"
+    ],
+    "timing": "Identical cold-L2 CUDA-event policy, complete API calls, min over 20 trials; repeat whole process",
+    "upstream_source_sha256": {
+      "src/group_gemm/sm90/cp_async/group_gemm_fp8.cu": "068f5c5008207cce448ff0cbea12ea7132f0a2fd57f6c985cfee7895831fb828",
+      "src/group_gemm/sm90/cp_async/config.h": "ba1658480c4d046cbc10cccf5e34cde67c956749494eed5cc9d53d5b9f530f88",
+      "src/group_gemm/sm90/kernels.cuh": "a6d28dfadfb369db3efad883729b7c78e61c34429d0f6ba1df99bbf0d43e8939",
+      "src/group_gemm/sm90/config.h": "533135d1586737e3eec6d31673e1ca78d3cb4303a83ef81a3f44a1e7ba4b31f4"
+    },
+    "prepared_source_sha256": "26fddcf6398b60711307ccb6e9bc63b40c1a6ceb2967704e1f1c6ec095d07e16"
+  },
+  "tma_provenance": {
+    "upstream": "https://github.com/Tencent/hpc-ops",
+    "commit": "2a2e26562433a8ba4b504858f1c938eb7612c901",
+    "backend": "tma",
+    "source": "src/group_gemm/sm90/kernels.cuh",
+    "config": "src/group_gemm/sm90/cp_async/config.h",
+    "canonical_task_unchanged": true,
+    "adapter_sha256": "d1412bec1652042b778298a1dfaea0a7e354946ee29270dfd90c25f8be542210",
+    "adaptations": [
+      "E5M2 x E4M3 MMA after swap; FP16 output without BF16 rounding",
+      "Prepared contiguous input descriptors and buffers outside timing, as with the existing CUTLASS reference",
+      "Include descriptor update, GEMM and row-major-to-column-major transpose on EVERY measured call"
+    ],
+    "limitations": [
+      "Prepared contiguous grouped input buffers, uniform N/K; true for default task-57 inputs"
+    ],
+    "timing": "Identical cold-L2 CUDA-event policy, complete API calls, min over 20 trials; repeat whole process",
+    "upstream_source_sha256": {
+      "src/group_gemm/sm90/cp_async/group_gemm_fp8.cu": "068f5c5008207cce448ff0cbea12ea7132f0a2fd57f6c985cfee7895831fb828",
+      "src/group_gemm/sm90/cp_async/config.h": "ba1658480c4d046cbc10cccf5e34cde67c956749494eed5cc9d53d5b9f530f88",
+      "src/group_gemm/sm90/kernels.cuh": "a6d28dfadfb369db3efad883729b7c78e61c34429d0f6ba1df99bbf0d43e8939",
+      "src/group_gemm/sm90/config.h": "533135d1586737e3eec6d31673e1ca78d3cb4303a83ef81a3f44a1e7ba4b31f4"
+    },
+    "prepared_source_sha256": "d86745f68212ef31b38587cc1bb6a96610bf971b49ea845c8a21be5d62deadce"
+  },
+  "kda_control": {
+    "source_run": "results/kda/hopper_kda_opus5_tokens65536_20261108T064233Z",
+    "solution_sha256": "0054a0f7ba79b35c34d89ddd56056f226fce2ba35073d1a0a20e7ac6f5803716",
+    "original_reported_speedup": 1.448903172055167,
+    "repeats": 3
+  },
+  "kda_pause": {
+    "status": "PAUSED",
+    "reason": "User requested HPC-Ops reference benchmarking after current KDA task",
+    "paused_at_epoch": 1794156031.8887064,
+    "completed_boundary_task": "class1/hopper/67_hopper_fp8_warp_specialized_gemm_with_blockwise_scaling",
+    "active_tasks": [],
+    "completed_tasks": 13
+  },
+  "selection_task_source_hash": "2dc2bd2d908299767bae68f513294cc9334d608491785c865a45bbb2b3b46541",
+  "adoption": {
+    "reference_cache_entry": {
+      "source_hash": "9caafd2eec7aff0b235e80870bc60b56ca4bd041671891676b512d7119317a9a",
+      "per_size": [
+        {
+          "name": "moe_decode: M=128, N=1536, K=2048, groups=16",
+          "ref_min_ms": 0.0399
+        },
+        {
+          "name": "moe_prefill: M=1024, N=1536, K=2048, groups=32",
+          "ref_min_ms": 0.4427
+        },
+        {
+          "name": "moe_large: M=2048, N=1536, K=2048, groups=16",
+          "ref_min_ms": 0.3994
+        }
+      ],
+      "reference_backend": "Tencent HPC-Ops cp.async 64x64x128 stages=3",
+      "upstream_commit": "2a2e26562433a8ba4b504858f1c938eb7612c901",
+      "recorded_at_utc": "2026-11-08T17:27:27.547985+00:00",
+      "timing_statistic": "median of three process minima; 20 cold-L2 CUDA-event trials per process"
+    },
+    "integrated_reference_measurements": [
+      {
+        "repeat": 0,
+        "passed": true,
+        "cases": [
+          {
+            "name": "moe_decode: M=128, N=1536, K=2048, groups=16",
+            "ref_min_ms": 0.0404,
+            "hpc_backend": true
+          },
+          {
+            "name": "moe_prefill: M=1024, N=1536, K=2048, groups=32",
+            "ref_min_ms": 0.4427,
+            "hpc_backend": true
+          },
+          {
+            "name": "moe_large: M=2048, N=1536, K=2048, groups=16",
+            "ref_min_ms": 0.3994,
+            "hpc_backend": true
+          }
+        ]
+      },
+      {
+        "repeat": 1,
+        "passed": true,
+        "cases": [
+          {
+            "name": "moe_decode: M=128, N=1536, K=2048, groups=16",
+            "ref_min_ms": 0.0399,
+            "hpc_backend": true
+          },
+          {
+            "name": "moe_prefill: M=1024, N=1536, K=2048, groups=32",
+            "ref_min_ms": 0.4422,
+            "hpc_backend": true
+          },
+          {
+            "name": "moe_large: M=2048, N=1536, K=2048, groups=16",
+            "ref_min_ms": 0.3991,
+            "hpc_backend": true
+          }
+        ]
+      },
+      {
+        "repeat": 2,
+        "passed": true,
+        "cases": [
+          {
+            "name": "moe_decode: M=128, N=1536, K=2048, groups=16",
+            "ref_min_ms": 0.0398,
+            "hpc_backend": true
+          },
+          {
+            "name": "moe_prefill: M=1024, N=1536, K=2048, groups=32",
+            "ref_min_ms": 0.4427,
+            "hpc_backend": true
+          },
+          {
+            "name": "moe_large: M=2048, N=1536, K=2048, groups=16",
+            "ref_min_ms": 0.3998,
+            "hpc_backend": true
+          }
+        ]
+      }
+    ],
+    "validation": {
+      "task": "class1/hopper/57_hopper_grouped_gemm",
+      "gpu": "NVIDIA H200 NVL",
+      "source_hash": "9caafd2eec7aff0b235e80870bc60b56ca4bd041671891676b512d7119317a9a",
+      "ref_compiled": true,
+      "positive_compiled": true,
+      "empty_compiled": true,
+      "reference_passed": true,
+      "reference_cases": [
+        {
+          "name": "moe_decode: M=128, N=1536, K=2048, groups=16",
+          "ref_min_ms": 0.0397
+        },
+        {
+          "name": "moe_prefill: M=1024, N=1536, K=2048, groups=32",
+          "ref_min_ms": 0.4441
+        },
+        {
+          "name": "moe_large: M=2048, N=1536, K=2048, groups=16",
+          "ref_min_ms": 0.3982
+        }
+      ],
+      "positive_args": [
+        "--m=128",
+        "--n=256",
+        "--k=2048",
+        "--groups=8",
+        "--iterations=1"
+      ],
+      "positive_passed": true,
+      "empty_rejected": true,
+      "passed": true
+    },
+    "fallback_validation": {
+      "args": [
+        "--m=128",
+        "--n=48",
+        "--k=64",
+        "--groups=8",
+        "--iterations=2"
+      ],
+      "passed": true
+    },
+    "kda_previous_speedup": 1.448903172055167,
+    "kda_new_speedup": 0.9232404902545704,
+    "recorded_kernel_times_ms": [
+      0.0482,
+      0.4571,
+      0.4069
+    ],
+    "kernel_execution_performed": false,
+    "model_calls_performed": 0,
+    "evals_used": 3
+  }
+}

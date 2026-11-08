@@ -1,4 +1,5 @@
 #include "hopper_validation.cuh"
+#include "hpc_ops_reference.cuh"
 /***************************************************************************************************
  * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -716,8 +717,42 @@ int run(Options &options, bool host_problem_shapes_available = true)
   // Initialize CUTLASS kernel with arguments and workspace pointer
   CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
 
-  // Correctness / Warmup iteration
+  // Keep CUTLASS as a full-output oracle and fallback. The public HPC-Ops
+  // pipeline is the timed reference when its tile/alignment requirements hold.
+  std::vector<int> h_Ms(options.groups),h_Ns(options.groups),h_Ks(options.groups);
+  bool use_hpc = options.groups > 0;
+  const float hpc_alpha = alpha_host.empty() ? 1.0f : alpha_host[0];
+  for (int i=0;i<options.groups;++i) {
+    auto shape=options.problem_sizes_host[i];
+    h_Ms[i]=get<0>(shape);h_Ns[i]=get<1>(shape);h_Ks[i]=get<2>(shape);
+    use_hpc &= h_Ns[i]%64==0 && h_Ks[i]%128==0 &&
+               alpha_host[i]==hpc_alpha && beta_host[i]==0.0f;
+  }
+  cutlass::DeviceAllocation<int> hpc_Ms(options.groups),hpc_Ns(options.groups),hpc_Ks(options.groups);
+  if (use_hpc) {
+    hpc_Ms.copy_from_host(h_Ms.data());hpc_Ns.copy_from_host(h_Ns.data());hpc_Ks.copy_from_host(h_Ks.data());
+  }
+  auto reference = [&]() {
+    if (use_hpc) {
+      CUDA_CHECK(kh_run_hpc_grouped_gemm(options.groups,hpc_Ms.get(),hpc_Ns.get(),hpc_Ks.get(),hpc_alpha,
+        reinterpret_cast<const __nv_fp8_e4m3**>(ptr_A.get()),hpc_Ks.get(),
+        reinterpret_cast<const __nv_fp8_e5m2**>(ptr_B.get()),hpc_Ks.get(),
+        reinterpret_cast<__half**>(ptr_D.get()),hpc_Ms.get()));
+    } else {
+      CUTLASS_CHECK(gemm.run());
+    }
+  };
+  // Validate the new reference against the complete original CUTLASS output
+  // before using it for timing or validating submissions.
   CUTLASS_CHECK(gemm.run());
+  if (use_hpc) {
+    cutlass::DeviceAllocation<ElementC> expected(block_D.size());
+    CUDA_CHECK(cudaMemcpy(expected.get(),block_D.get(),block_D.size()*sizeof(ElementC),cudaMemcpyDeviceToDevice));
+    kh_poison(block_D.get(),block_D.size()*sizeof(ElementC));
+    reference();
+    kh_check_device(block_D.get(),expected.get(),block_D.size(),0.03,0.002,0.001);
+  }
+  fprintf(stdout,"Reference backend: %s\n",use_hpc ? "Tencent HPC-Ops cp.async 64x64x128 stages=3" : "CUTLASS fallback");
 
   // Check if output from CUTLASS kernel and reference kernel are equal or not
   // Native FP8 tensor-core accumulation is checked independently in fp64.
@@ -740,7 +775,7 @@ int run(Options &options, bool host_problem_shapes_available = true)
 
     // Warmup
     for (int i = 0; i < 3; i++) {
-      CUTLASS_CHECK(gemm.run());
+      reference();
     }
     cudaDeviceSynchronize();
 
@@ -749,7 +784,7 @@ int run(Options &options, bool host_problem_shapes_available = true)
     for (int iter = 0; iter < options.iterations; ++iter) {
       kh_cold_l2();
       cudaEventRecord(start);
-      CUTLASS_CHECK(gemm.run());
+      reference();
       cudaEventRecord(stop);
       cudaEventSynchronize(stop);
       float ms;
