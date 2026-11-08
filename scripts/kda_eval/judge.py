@@ -235,7 +235,9 @@ def main():
     if os.path.exists(args.socket):
         os.unlink(args.socket)
     server = _Server(args.socket, _Handler)
-    os.chmod(args.socket, 0o600)
+    # In the no-bwrap fallback (KDA_AGENT_USER set) the agent runs as another local user and
+    # must be able to connect; under bwrap the socket is only reachable through the bind mount.
+    os.chmod(args.socket, 0o666 if os.environ.get("KDA_AGENT_USER") else 0o600)
     server.judge = judge
     print(f"judge ready: {args.task_id}", flush=True)
     server.serve_forever()

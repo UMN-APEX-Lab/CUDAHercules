@@ -141,6 +141,15 @@ class Class1MakeBackend(Backend):
         env["CUTLASS_DIR"] = os.path.join(ref_sources, "cutlass")
         env["TK_DIR"] = os.path.join(ref_sources, "ThunderKittens")
         env["DEEPGEMM_DIR"] = os.path.join(ref_sources, "deep_gemm")
+        env["CUDNN_FE_DIR"] = os.path.join(ref_sources, "cudnn_frontend")
+        # cuDNN (used by reference builds such as 77_blackwell_fmha): honour an explicit
+        # CUDNN_DIR, else use the nvidia-cudnn pip package that torch already depends on.
+        if "CUDNN_DIR" not in env:
+            try:
+                import nvidia.cudnn as _cudnn
+                env["CUDNN_DIR"] = list(_cudnn.__path__)[0]
+            except Exception:
+                pass
         build_cmd = config.build.cmd
         build_cmd_args = shlex.split(build_cmd)
 

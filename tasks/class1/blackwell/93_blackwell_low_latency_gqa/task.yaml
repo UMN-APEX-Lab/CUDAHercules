@@ -3,7 +3,10 @@ task_id: class1/blackwell/93_blackwell_low_latency_gqa
 name: 93_blackwell_low_latency_gqa
 task_class: 1
 domain: ml
-tags: []
+tags:
+- attention
+- gqa
+- decode
 hardware:
   min_sm: 100
   tested_sms:
@@ -12,7 +15,7 @@ hardware:
 runner:
   backend: class1_make
   workdir: tasks/class1/blackwell/93_blackwell_low_latency_gqa
-  timeout_sec: 180
+  timeout_sec: 600
   env:
     KH_BENCHMARK: '20'
   solution_file: solution.h
@@ -37,11 +40,18 @@ performance:
   metric: speedup_ref_over_sol
 source:
   repo: NVIDIA/cutlass
-  files: []
-  commit: ''
+  files:
+  - examples/93_blackwell_low_latency_gqa
+  commit: b2f249acd20392beeb16f5e5a31f4f1a4e38b3bd
   license: BSD-3-Clause
 anti_cheat:
+  # Static check: only blatant cheating (wrapping the reference implementation). Calls to cuBLAS /
+  # cuDNN / CUTLASS kernel templates are blocked by the global rules; numeric precision is enforced by
+  # the run-time tolerance, not by patterns.
   blocked_patterns:
+  - '\bTGV\b|\bTGV::'
+  - '\b(gqa_host|gqa_device|tgv_gqa\w*|GQATester)\b'
+  - '#\s*include\s*[<\"][^>\"]*(tgv_gqa|common\.cuh|93_blackwell_low_latency_gqa)'
   required_patterns:
   - __global__\s+void
   - <<<.*>>>

@@ -1,205 +1,149 @@
 # Task: 84_blackwell_narrow_precision_sparse_gemm
 
 ## Target Hardware
-NVIDIA Blackwell GPU (SM100/SM120).
+NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a` and is skipped on other GPUs.
 
+Structured-sparse NVFP4 x dense NVFP4 -> BF16 block-scaled GEMM, compared against a CUTLASS-based reference.
 
-Blackwell SM100 Narrow Precision (NVFP4) Sparse GEMM test harness
-2:4 structured sparsity, FP4 data + scales, BF16 output
-Based on CUTLASS example 84_blackwell_narrow_precision_sparse_gemm
-The LLM must implement:
-  cudaError_t BlackwellNvfp4SparseBf16Gemm(int M, int N, int K, float alpha,
-      cutlass::float_e2m1_t const *A_compressed, int lda_comp,
-      float const *A_scales, int scale_lda,
-      uint16_t const *A_metadata,
-      cutlass::float_e2m1_t const *B, int ldb,
-      float const *B_scales, int scale_ldb,
-      float beta, __nv_bfloat16 *D, int ldd);
-A is 2:4 sparse compressed: A_compressed M x (K/2) in FP4 E2M1, one element per byte.
-A_metadata encodes which 2 of every 4 elements are non-zero.
-A_scales: [M, ceil(K/32)] row-major per-block scales.
-B is column-major [K, N] in FP4 E2M1, one element per byte.
-B_scales: [N, ceil(K/32)] row-major per-block scales.
-D is row-major [M, N] in BF16.
-Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
-         -I<cutlass>/include harness.cu solution.cu -o test
+## Function Signature
 
----
-## Test Harness (harness.cu)
-
-Your solution will be compiled and linked with this test harness.
-Study it to understand the exact function signature, data types, and verification logic.
+Implement the following function in `solution.h`:
 
 ```cuda
-/*
- * Blackwell SM100 Narrow Precision (NVFP4) Sparse GEMM test harness
- * 2:4 structured sparsity, FP4 data + scales, BF16 output
- * Based on CUTLASS example 84_blackwell_narrow_precision_sparse_gemm
- *
- * The LLM must implement:
- *   cudaError_t BlackwellNvfp4SparseBf16Gemm(int M, int N, int K, float alpha,
- *       cutlass::float_e2m1_t const *A_compressed, int lda_comp,
- *       float const *A_scales, int scale_lda,
- *       uint16_t const *A_metadata,
- *       cutlass::float_e2m1_t const *B, int ldb,
- *       float const *B_scales, int scale_ldb,
- *       float beta, __nv_bfloat16 *D, int ldd);
- *
- * A is 2:4 sparse compressed: A_compressed M x (K/2) in FP4 E2M1, one element per byte.
- * A_metadata encodes which 2 of every 4 elements are non-zero.
- * A_scales: [M, ceil(K/32)] row-major per-block scales.
- * B is column-major [K, N] in FP4 E2M1, one element per byte.
- * B_scales: [N, ceil(K/32)] row-major per-block scales.
- * D is row-major [M, N] in BF16.
- *
- * Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
- *          -I<cutlass>/include harness.cu solution.cu -o test
- */
-
-#include <cuda_bf16.h>
-#include <iostream>
-#include <vector>
+#pragma once
 #include <cstdint>
-#include <cmath>
-#include "cutlass/numeric_types.h"
-#include "../../include/kh_benchmark.h"
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
-#define CUDA_CHECK(status)                                              \
-  {                                                                     \
-    cudaError_t error = status;                                         \
-    if (error != cudaSuccess) {                                         \
-      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
-                << " at line: " << __LINE__ << std::endl;               \
-      exit(EXIT_FAILURE);                                               \
-    }                                                                   \
-  }
-
-static constexpr int kGroupSize = 32;
-
-extern cudaError_t BlackwellNvfp4SparseBf16Gemm(
-  int M, int N, int K, float alpha,
-  cutlass::float_e2m1_t const *A_compressed, int lda_comp,
-  float const *A_scales, int scale_lda,
-  uint16_t const *A_metadata,
-  cutlass::float_e2m1_t const *B, int ldb,
-  float const *B_scales, int scale_ldb,
-  float beta,
-  __nv_bfloat16 *D, int ldd);
-
-void reference_gemm(int M, int N, int K, float alpha,
-  std::vector<float> const &A, int lda,
-  std::vector<float> const &B, int ldb,
-  float beta, std::vector<float> &D, int ldd) {
-  for (int i = 0; i < M; ++i)
-    for (int j = 0; j < N; ++j) {
-      float acc = 0;
-      for (int k = 0; k < K; ++k) acc += A[i*lda+k] * B[k+j*ldb];
-      D[i*ldd+j] = alpha * acc + beta * D[i*ldd+j];
-    }
-}
-
-int main() {
-  int M = 128, N = 128, K = 256;
-  int ldb = K, ldd = N, lda_comp = K / 2;
-  float alpha = 1.0f, beta = 0.0f;
-  int k_groups = (K + kGroupSize - 1) / kGroupSize;
-  int K_comp = K / 2;
-
-  // Create dense matrix with 2:4 sparsity
-  std::vector<float> fA_dense(M * K);
-  for (int i = 0; i < M; ++i)
-    for (int k = 0; k < K; ++k) {
-      int pos = k % 4;
-      if (pos == 1 || pos == 3) fA_dense[i*K+k] = 0.0f;
-      else fA_dense[i*K+k] = float(((i*K+k) * 16807 % 6) - 3) * 0.5f;
-    }
-
-  // Compress to FP4 + metadata
-  std::vector<cutlass::float_e2m1_t> hA_comp(M * K_comp);
-  int meta_cols = K / 16; if (meta_cols == 0) meta_cols = 1;
-  std::vector<uint16_t> h_meta(M * meta_cols, 0);
-
-  std::vector<float> fA_ref(M * K, 0);
-  for (int i = 0; i < M; ++i) {
-    int ci = 0;
-    for (int kg = 0; kg < K; kg += 4) {
-      int idx0 = 0, idx1 = 2;
-      hA_comp[i*K_comp+ci]   = cutlass::float_e2m1_t(fA_dense[i*K+kg+idx0]);
-      hA_comp[i*K_comp+ci+1] = cutlass::float_e2m1_t(fA_dense[i*K+kg+idx1]);
-      fA_ref[i*K+kg+idx0] = float(hA_comp[i*K_comp+ci]);
-      fA_ref[i*K+kg+idx1] = float(hA_comp[i*K_comp+ci+1]);
-      ci += 2;
-      int group = kg / 4, meta_word = group / 4, meta_shift = (group % 4) * 4;
-      uint16_t bits = (uint16_t)((idx0 & 0x3) | ((idx1 & 0x3) << 2));
-      h_meta[i*meta_cols+meta_word] |= (bits << meta_shift);
-    }
-  }
-
-  // FP4 B
-  std::vector<cutlass::float_e2m1_t> hB(K * N);
-  std::vector<float> fB(K * N);
-  for (int i = 0; i < K * N; ++i) {
-    hB[i] = cutlass::float_e2m1_t(float((i * 48271 % 6) - 3) * 0.5f);
-    fB[i] = float(hB[i]);
-  }
-
-  std::vector<float> sA(M * k_groups, 1.0f), sB(N * k_groups, 1.0f);
-
-  cutlass::float_e2m1_t *dA_comp, *dB; uint16_t *dA_meta;
-  float *dsA, *dsB; __nv_bfloat16 *dD;
-  CUDA_CHECK(cudaMalloc(&dA_comp, M*K_comp*sizeof(cutlass::float_e2m1_t)));
-  CUDA_CHECK(cudaMalloc(&dA_meta, M*meta_cols*sizeof(uint16_t)));
-  CUDA_CHECK(cudaMalloc(&dsA, M*k_groups*sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&dB, K*N*sizeof(cutlass::float_e2m1_t)));
-  CUDA_CHECK(cudaMalloc(&dsB, N*k_groups*sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&dD, M*N*sizeof(__nv_bfloat16)));
-
-  CUDA_CHECK(cudaMemcpy(dA_comp, hA_comp.data(), M*K_comp*sizeof(cutlass::float_e2m1_t), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dA_meta, h_meta.data(), M*meta_cols*sizeof(uint16_t), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dsA, sA.data(), M*k_groups*sizeof(float), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dB, hB.data(), K*N*sizeof(cutlass::float_e2m1_t), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dsB, sB.data(), N*k_groups*sizeof(float), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemset(dD, 0, M*N*sizeof(__nv_bfloat16)));
-
-  cudaError_t r = BlackwellNvfp4SparseBf16Gemm(
-    M, N, K, alpha, dA_comp, lda_comp, dsA, k_groups, dA_meta, dB, ldb, dsB, k_groups, beta, dD, ldd);
-  if (r != cudaSuccess) {
-    std::cerr << "Sparse GEMM failed: " << cudaGetErrorString(r) << std::endl;
-    cudaFree(dA_comp); cudaFree(dA_meta); cudaFree(dsA); cudaFree(dB); cudaFree(dsB); cudaFree(dD);
-    return -1;
-  }
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  // Benchmark (triggered by KH_BENCHMARK=N env var)
-  {
-    int _kh_trials = kh_benchmark_trials();
-    if (_kh_trials > 0 && r == cudaSuccess) {
-      kh_benchmark([&]() { BlackwellNvfp4SparseBf16Gemm(
-    M, N, K, alpha, dA_comp, lda_comp, dsA, k_groups, dA_meta, dB, ldb, dsB, k_groups, beta, dD, ldd); }, _kh_trials);
-    }
-  }
-
-
-  std::vector<__nv_bfloat16> hD(M*N);
-  CUDA_CHECK(cudaMemcpy(hD.data(), dD, M*N*sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
-  cudaFree(dA_comp); cudaFree(dA_meta); cudaFree(dsA); cudaFree(dB); cudaFree(dsB); cudaFree(dD);
-
-  std::vector<float> fD(M*N), fRef(M*N, 0);
-  for (int i = 0; i < M*N; ++i) fD[i] = __bfloat162float(hD[i]);
-  reference_gemm(M, N, K, alpha, fA_ref, K, fB, ldb, beta, fRef, ldd);
-
-  float max_rel = 0; int mm = 0;
-  for (int i = 0; i < M*N; ++i) {
-    float d = std::fabs(fD[i]-fRef[i]), den = std::fmax(std::fabs(fRef[i]),1e-6f);
-    float rel = d/den; max_rel = std::fmax(max_rel, rel);
-    if (rel > 0.3f) mm++;
-  }
-  if (float(mm)/float(M*N) > 0.01f) {
-    std::cerr << "Results incorrect. Max relative diff: " << max_rel
-              << ", mismatch rate: " << float(mm)/float(M*N) << std::endl;
-    return -1;
-  }
-  std::cout << "Passed." << std::endl;
-  return 0;
-}
+cudaError_t BlackwellNvfp4SparseGemm(
+    int M, int N, int K,
+    float alpha,                       // product of the two per-tensor (global) FP32 scales
+    uint8_t const *A,   uint8_t const *E, uint8_t const *SFA,   // sparse operand: compressed values, metadata, scales
+    uint8_t const *B,   uint8_t const *SFB,                     // dense operand: values, scales
+    __nv_bfloat16 *D);
 ```
+
+## Operation
+
+A is an M x K weight matrix that is **2:4 structured sparse** and stored compressed (values + metadata); B is a dense
+K x N activation matrix. Both are NVFP4: FP4 E2M1 values with UE4M3 block scales (plus a per-tensor FP32 global scale
+folded into `alpha`).
+
+    D[m, n] = bf16( alpha * sum_k  (a[m,k] * sfa[m, k/32]) * (b[n,k] * sfb[n, k/32]) )
+
+`a[m,k]` is the logical (dense, K-wide) sparse matrix reconstructed from `A` + `E`; pruned elements are exactly zero.
+The solution receives **only** the compressed operands (A, E, SFA); it never sees the dense matrix.
+
+## Sparsity pattern (what "2:4" means for FP4 on Blackwell)
+
+The sparse FP4 tensor-core instruction prunes in units of **pairs** of adjacent K elements: pair `p` of a chunk covers
+`k = 8c + 2p` and `8c + 2p + 1`. In every aligned chunk of 8 consecutive K elements (`c = k / 8`, i.e. 4 pairs) exactly
+**2 of the 4 pairs are kept** (2:4 over pairs, which is 4:8 over elements); the other 2 pairs are zero. Per row, `A`
+therefore stores `K / 2` FP4 values.
+
+## Memory Layouts (exact)
+
+`K` is a multiple of 256 for every tested shape (the metadata tile covers 256 K elements). All pointers are device
+pointers, 256-byte aligned. Notation: `Mp = roundup(M, 128)`.
+
+**Compressed values `A`**: `uint8_t[M][K/4]` row-major (`lda = K/4` bytes). Byte `j = 2c + s` of row `m` is the `s`-th kept
+pair (`s = 0, 1`, in ascending pair position) of chunk `c`: LOW nibble = the pair's element with even `k`, HIGH nibble =
+the element with odd `k`. A nibble is an E2M1 code: bit 3 = sign, bits 2:0 = magnitude index into
+`{0, 0.5, 1, 1.5, 2, 3, 4, 6}` (code 8 is -0). All 16 codes occur in the test data.
+
+**Metadata `E`**: `uint8_t[(K/256) * Mp * 16]` bytes. For row `m` and 16-element group `g = k / 16` (two chunks of 8)
+the byte is at
+
+    offset_E(m, g) = (g / 16) * Mp * 16  +  (m / 128) * 2048  +  (m % 128) * 16  +  (g % 16)
+
+(tiles of 128 rows x 256 K elements = 128 x 16 bytes, row-major inside the tile, tiles ordered row-tile-fastest then along
+K; rows >= M inside the last row tile are padding and hold a valid dummy value). The byte holds two 4-bit codes: the LOW
+nibble belongs to chunk `2g`, the HIGH nibble to chunk `2g + 1`. A nibble `n` says which pairs of the chunk the two kept
+values of `A` are: `idx0 = n & 3` is the pair position (0..3) of kept pair `s = 0`, `idx1 = (n >> 2) & 3` that of kept pair
+`s = 1`, always `idx0 < idx1`; the only occurring nibbles are `0x4 0x8 0x9 0xC 0xD 0xE`. Hence
+
+    a[m, 8c + 2*idx_s + h] = decode( (A[m*K/4 + 2c + s] >> (4*h)) & 15 ),   s = 0,1,  h = 0,1;   all other a[m, .] of chunk c are 0.
+
+**Dense operand `B`**: `uint8_t[N][K/2]` (K-contiguous; equivalently column-major [K, N]); byte `j` of row `n` holds
+`k = 2j` (low nibble) and `2j + 1` (high nibble), same E2M1 coding.
+
+**Scale factors `SFA`, `SFB`**: one UE4M3 byte per (row, **32** logical K elements) -- the sparse NVFP4 MMA uses 32-element
+blocks for both operands (for `A` that is 16 stored values) -- i.e. scale column `c = k / 32`, `Kb = K / 32` columns.
+Decoded value of byte `b`: `(1 + (b & 7)/8) * 2^(((b >> 3) & 15) - 7)` for exponent field > 0, `(b & 7) / 512` for
+exponent field 0 (bit 7 is 0). Stored in the cuBLAS / CUTLASS "swizzled 128x4" layout: rows padded to a multiple of 128 and
+the scale columns to a multiple of 4 (`Kb_pad = roundup(Kb, 4)`); `roundup(rows, 128) * Kb_pad` bytes; the byte of
+(row `r`, column `c`) lives at
+
+    offset_SF(r, c) = ( (r / 128) * (Kb_pad / 4) + (c / 4) ) * 512  +  (r % 32) * 16  +  ((r / 32) % 4) * 4  +  (c % 4)
+
+Padding bytes are zero. `SFA` uses `rows = M`, `SFB` uses `rows = N`.
+
+**Output**: `D` is row-major [M, N] BF16 (`ldd = N`), i.e. feature-major (rows = output features, columns = tokens). It
+holds NaN on entry; every element must be written.
+
+Equivalently: prune a dense A to the pattern above, then for every chunk store the two kept pairs in position order and
+the 4-bit code `idx0 | idx1 << 2`.
+
+## Build & Test
+
+```bash
+make test                    # requires solution.h in the task directory
+./test                       # runs every benchmark shape below (plus two correctness-only cases)
+./test 8192 128 8192         # one custom shape: M N K  (K multiple of 256)
+```
+
+## Problem Sizes
+
+The linear layers of Llama-3.1-70B with 2:4-pruned NVFP4 weights on one B200 (hidden 8192, 64 query / 8 KV heads of
+dimension 128 -> fused QKV 10240, FFN 28672 -> fused gate+up 57344, vocabulary 128256). The weights are the sparse operand
+A (M = output features, K = input features); B holds the N tokens: one decode step of 128 sequences or an 8K-token prefill chunk.
+
+| label            | M      | N    | K     | layer                        |
+|------------------|--------|------|-------|------------------------------|
+| decode_mlp_up    | 57344  | 128  | 8192  | fused gate+up projection     |
+| decode_mlp_down  | 8192   | 128  | 28672 | FFN down projection          |
+| decode_lm_head   | 128256 | 128  | 8192  | LM head                      |
+| prefill_qkv      | 10240  | 8192 | 8192  | fused QKV projection         |
+| prefill_o_proj   | 8192   | 8192 | 8192  | attention output projection  |
+| prefill_mlp_up   | 57344  | 8192 | 8192  | fused gate+up projection     |
+| prefill_mlp_down | 8192   | 8192 | 28672 | FFN down projection          |
+
+Two extra correctness-only cases (not timed): (M=200, N=1152, K=1280) exercises padded metadata / scale rows, and
+(M=1152, N=16, K=2048) a tiny token count. `alpha = 0.00731`. Data: uniformly random FP4 codes, uniformly random valid
+metadata nibbles, scales log-uniform in [0.125, 4) rounded to UE4M3 (full 3-bit mantissas).
+
+## Data Types and Precision
+
+FP4 E2M1 values, UE4M3 scales, **FP32 accumulation**, BF16 output (round-to-nearest-even of the FP32 result times
+`alpha`). Rounding the dequantized operands to FP8, FP16 / BF16 accumulation, 16-element scale blocks, power-of-two scales
+etc. are not allowed even if they pass the tolerance.
+
+## Correctness
+
+The reference (which consumes exactly the buffers you receive) and your solution write to separate buffers that
+are pre-filled with NaN. After your function returns, **every** element of D is compared with the reference output:
+
+- every element must be finite (NaN / Inf fail, so unwritten elements fail);
+- `|D - ref| <= 1e-3 * RMS(ref) + 0.03125 * |ref|` for every element;
+- the relative Frobenius error `||D - ref|| / ||ref||` must be `<= 3e-4`.
+
+**Inputs change on every call.** Before every timed call of both the reference and your function, the harness
+regenerates the dense activation operand B and its scale factors SFB with a new random seed (outside the timed region);
+the 2:4-sparse weights A with their metadata E and scales SFA stay fixed. The final re-check runs on a fresh input for
+every case, with the reference recomputed and D re-poisoned. Outputs and any input-dependent intermediates must therefore
+be recomputed on every call; only data derived from the fixed operands may be cached.
+
+## Performance
+
+For each shape the harness times the reference and your function with CUDA events (L2 flushed before every trial,
+D re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The score
+is the geometric mean of the speedups over the seven shapes.
+
+Your function is timed as a whole call, including any host-side launch setup. One-time setup (e.g.
+`cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics.
+
+## Rules
+
+- Solutions must be your own kernels: no cuBLAS / cuDNN, and no CUTLASS device / kernel / collective GEMM templates.
+  CuTe and low-level building blocks (barriers, pipelines, layouts, `tcgen05` PTX) are allowed.
+- The shipped `solution.h` is a simple correct baseline that you may replace entirely.

@@ -1,14 +1,14 @@
 # Task: tk_bf16_gemm
 
 ## Target Hardware
-NVIDIA Blackwell GPU (SM100/SM120).
+NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a`.
 
-
-BF16 General Matrix Multiply on B200, matching ThunderKittens Blackwell performance.
+BF16 General Matrix Multiply with BF16 output (tcgen05 / UMMA tensor-core GEMM), compared against the
+ThunderKittens Blackwell BF16 GEMM.
 
 ## Function Signature
 
-Implement in solution.h:
+Implement the following function in `solution.h`:
 
 ```cuda
 #pragma once
@@ -22,26 +22,75 @@ void Bf16Gemm(__nv_bfloat16 *A, __nv_bfloat16 *B, __nv_bfloat16 *C, int M, int N
 
 C = A * B^T
 
-Where A is M×K, B is N×K (transposed), C is M×N. All row-major, BF16.
+A is M x K, B is N x K (the second operand is stored transposed), C is M x N. All matrices are row-major
+and contiguous: `A[i * K + k]`, `B[j * K + k]`, `C[i * N + j]`.
 
-**IMPORTANT**: B is stored as [N,K]. The GEMM computes C = A * B^T.
+## Data Types and Precision
 
-## Problem Sizes
+A, B and C are BF16. Products must be accumulated in FP32 and rounded to BF16 once, at the end.
+Lower-precision arithmetic (FP8 / FP6 / FP4 / INT8 inputs, FP16 or BF16 accumulation or BF16 partial sums,
+including tensor-core paths that use them) is not allowed even if it were to pass the tolerance.
 
-The benchmark runs multiple square problem sizes:
-- 1024x1024x1024
-- 2048x2048x2048
-- 4096x4096x4096
-- 8192x8192x8192
-- 16384x16384x16384
-
-Correctness and performance are checked at each size.
+All pointers are device pointers, 256-byte aligned. C holds NaN on entry: you must overwrite every element.
+M is a multiple of 256, N a multiple of 256 and K a multiple of 128 (all tested shapes satisfy this).
 
 ## Build & Test
 
 ```bash
-make test
-./test
+make test                    # requires solution.h in the task directory
+./test                       # runs every benchmark shape below
+./test 4096 4096 4096        # one custom shape: M N K (M multiple of 512, N of 256, K of 128)
 ```
 
-Requires B200 GPU (SM100a). ThunderKittens headers are on the include path.
+## Problem Sizes
+
+The linear layers of Llama-3-70B in BF16 on one B200 (hidden 8192, fused QKV 10240, FFN 28672 -> fused
+gate+up 57344). M is the number of tokens: a 256-token decode / speculative batch, or an 8K / 16K-token
+prefill chunk.
+
+| label                    | M     | N     | K     | layer                        |
+|--------------------------|-------|-------|-------|------------------------------|
+| decode_batch256_qkv      | 256   | 10240 | 8192  | fused QKV projection         |
+| decode_batch256_mlp_down | 256   | 8192  | 28672 | FFN down projection          |
+| prefill_qkv              | 8192  | 10240 | 8192  | fused QKV projection         |
+| prefill_o_proj           | 8192  | 8192  | 8192  | attention output projection  |
+| prefill_mlp_up           | 8192  | 57344 | 8192  | fused gate+up projection     |
+| prefill_mlp_down         | 8192  | 8192  | 28672 | FFN down projection          |
+| prefill16k_o_proj        | 16384 | 8192  | 8192  | output projection, 16K chunk |
+
+A and B hold uniform random BF16 values in [-1, 1) with full mantissas.
+
+## Correctness
+
+The reference and your solution write to separate buffers that are pre-filled with NaN. After your
+function returns, **every** element of C is compared with the reference output:
+
+- every element must be finite (NaN / Inf fail, so unwritten elements fail);
+- `|C - ref| <= 1e-3 * RMS(ref) + 1.6e-2 * |ref|` for every element (the second term allows two BF16
+  rounding steps), and the relative Frobenius error `||C - ref|| / ||ref||` must be `<= 1.5e-3`.
+
+**Inputs change on every call.** The activation matrix A is regenerated with a new random seed before
+every timed call of both the reference and your function (outside the timed region), so outputs and any
+input-dependent intermediate must be recomputed on every call; memoizing results does not work. After
+the timing loop the harness regenerates A once more, recomputes the reference, re-poisons the output and
+calls your function again; that final check on fresh inputs must pass too (it runs for every shape). The
+weights B stay fixed, and one-time preprocessing of B into a function-local static cache keyed on the
+pointers and the shape is allowed.
+
+## Performance
+
+For each shape the harness times the reference and your function with CUDA events (the L2 cache is
+flushed before every trial; C is re-poisoned outside the timed region) and reports `Ref time`,
+`Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean of the speedups
+over the seven shapes.
+
+Your function is timed as a whole call, including any host-side launch setup. One-time setup (e.g.
+`cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics. The shipped
+`solution.h` is a simple correct baseline that you may replace entirely.
+
+## Rules
+
+- Solutions must be your own kernels: no ThunderKittens (`kittens::` / its headers are rejected), no cuBLAS / cuDNN, and
+  no CUTLASS device / kernel / collective GEMM templates. CuTe and low-level building blocks (barriers, `tcgen05`
+  PTX, TMA) are allowed.
+- BF16 operands with FP32 accumulation only (see "Data Types and Precision").

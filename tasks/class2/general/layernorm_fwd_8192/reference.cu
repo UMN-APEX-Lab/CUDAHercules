@@ -1,7 +1,10 @@
 /*
  * LayerNorm Forward — hidden_size=8192
+ * BF16 input/output, FP32 weights, FP32 compute
  *
- * Source: flash-attention/csrc/layer_norm/ln_fwd_kernels.cuh
+ * Source: flash-attention/csrc/layer_norm/ln_fwd_kernels.cuh,
+ * instantiated as registered in ln_fwd_8192.cu for
+ * (wtype=fp32, itype=bf16, rtype=bf16, otype=bf16, ctype=fp32).
  * Kernel source code in reference_sources/.
  */
 
@@ -15,10 +18,10 @@ namespace layer_norm {
 }
 
 extern "C" void launch_layernorm_forward(
-    const float* x,
+    const void* x,
     const float* gamma,
     const float* beta,
-    float* z,
+    void* z,
     float* mu,
     float* rs,
     int rows,
@@ -31,8 +34,8 @@ extern "C" void launch_layernorm_forward(
     FwdParams params;
     params.rows = rows;
     params.cols = cols;
-    params.x0 = const_cast<float*>(x);
-    params.x = const_cast<float*>(x);
+    params.x0 = const_cast<void*>(x);
+    params.x = const_cast<void*>(x);  // not written: input_t == residual_t and no residual
     params.gamma = const_cast<float*>(gamma);
     params.beta = const_cast<float*>(beta);
     params.z = z;
@@ -67,11 +70,11 @@ extern "C" void launch_layernorm_forward(
     cudaGetDeviceProperties(&prop, device);
     launch_params.props = &prop;
 
-    launch_<float, float, float, float, float, uint32_t,
+    launch_<fp32, bf16, bf16, bf16, fp32, uint32_t,
             8192, 1, 1, 8, 16
     >(launch_params, true);
 
-    launch_<float, float, float, float, float, uint32_t,
+    launch_<fp32, bf16, bf16, bf16, fp32, uint32_t,
             8192, 1, 1, 8, 16
     >(launch_params, false);
 }

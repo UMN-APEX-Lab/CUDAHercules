@@ -4,20 +4,21 @@ name: deepgemm_mqa_logits
 task_class: 1
 domain: ml
 tags:
-  - attention
-  - mqa
-  - fp8
+- attention
+- mqa
+- fp8
+- mxfp8
 hardware:
   min_sm: 100
   tested_sms:
-    - 100
+  - 100
   required_features: []
 runner:
   backend: class1_make
   workdir: tasks/class1/blackwell/deepgemm_mqa_logits
-  timeout_sec: 300
+  timeout_sec: 600
   env:
-    KH_BENCHMARK: "20"
+    KH_BENCHMARK: '20'
   solution_file: solution.h
 build:
   cmd: make test
@@ -35,18 +36,24 @@ correctness:
 performance:
   enabled: true
   parser:
-    kernel_time_ms_regex: 'Kernel time:\s*([0-9.]+)\s*ms'
-    ref_time_ms_regex: 'Ref time:\s*([0-9.]+)\s*ms'
+    kernel_time_ms_regex: Kernel time:\s*([0-9.]+)\s*ms
+    ref_time_ms_regex: Ref time:\s*([0-9.]+)\s*ms
   metric: speedup_ref_over_sol
 source:
   repo: deepseek-ai/DeepGEMM
-  files: []
-  commit: ""
+  files:
+  - deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh
+  commit: 5081f8513af57e61696de4f4f04b0e707ffb503e
   license: MIT
 anti_cheat:
+  # Static check: only blatant cheating (wrapping the reference implementation). Calls to cuBLAS /
+  # cuDNN / CUTLASS kernel templates are blocked by the global rules; numeric precision is enforced by
+  # the run-time tolerance, not by patterns.
   blocked_patterns:
-    - '#include\s*[<"]deep_gemm'
-    - 'deep_gemm::'
+  - '#\s*include\s*[<\"][^>\"]*deep_gemm'
+  - '\bdeep_gemm\b|\bdeep_gemm::'
+  - '\bsm100_(paged_|sparse_)?mqa_logits\w*'
+  - '\bMQALogits\w*|\bSM100MQALogitsScheduler\b'
   required_patterns:
-    - '__global__\s+void'
-    - '<<<.*>>>'
+  - __global__\s+void
+  - <<<.*>>>

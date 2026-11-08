@@ -2,49 +2,63 @@
 
 ## Description
 
-Implement a CUDA kernel for the LayerNorm backward pass (FP32 input and output).
+Implement a CUDA kernel for the LayerNorm backward pass on BF16 activations and
+gradients (BF16 dz, x and dx; FP32 weights, statistics, weight gradients and compute).
 
-Given upstream gradient dz [rows, cols], saved input x [rows, cols], saved mean mu [rows],
-saved reciprocal std rs [rows] (rs = 1/sqrt(var + 1e-5), biased variance) and weight
-gamma [cols]:
+Scenario: LayerNorm backward in 70B-parameter LLM training with tensor parallelism
+(hidden size 8192; LayerNorm is not sharded and normalizes the full hidden vector of
+each token): 16384 tokens per GPU per step (e.g. 4 sequences x 4096 tokens).
 
-Per-row (data gradient):
-  x_hat[i,j] = (x[i,j] - mu[i]) * rs[i]
-  dz_gamma[i,j] = dz[i,j] * gamma[j]
-  ds[i] = sum_j(dz_gamma[i,j] * x_hat[i,j])
-  db[i] = sum_j(dz_gamma[i,j])
-  dx[i,j] = rs[i] * (dz_gamma[i,j] - (ds[i] * x_hat[i,j] + db[i]) / cols)
+Given the upstream gradient dz [rows, cols], the saved forward input x [rows, cols], its
+saved statistics mu [rows] and rs [rows] (rs = 1/sqrt(var + 1e-5), biased variance) and
+gamma [cols], with xf = float(x) and dzf = float(dz):
+  x_hat[i,j] = (xf[i,j] - mu[i]) * rs[i]
+  g[i,j]     = dzf[i,j] * gamma[j]
+  ds[i]      = sum_j g[i,j] * x_hat[i,j]
+  db[i]      = sum_j g[i,j]
+  dx[i,j]    = bf16( rs[i] * (g[i,j] - (ds[i] * x_hat[i,j] + db[i]) / cols) )
+  dgamma[j]  = sum_i dzf[i,j] * x_hat[i,j]
+  dbeta[j]   = sum_i dzf[i,j]
+where bf16() is the round-to-nearest-even conversion.
 
-Per-column (weight gradients):
-  dgamma[j] = sum_i(dz[i,j] * x_hat[i,j])
-  dbeta[j] = sum_i(dz[i,j])
+Dimensions: rows=16384, cols=8192. All tensors are contiguous and row-major:
+  dz, x, dx            bfloat16 (__nv_bfloat16), passed as void pointers
+  mu, rs, gamma        float32
+  dgamma, dbeta        float32
+Inputs: x[i, :] = bf16(s_i * N(0, 1)) with a per-row scale s_i = 10^U(-2, 1); mu and rs
+are the FP32 statistics of float(x) (so rs[i] ranges over ~0.1 .. 95); gamma is
+i.i.d. N(0, 1); dz = bf16(N(0, 1)).
+Outputs: dx [rows, cols] (bf16), dgamma [cols] (fp32), dbeta [cols] (fp32).
 
-Dimensions: rows=16384, cols=8192. All tensors are contiguous row-major fp32.
-x, gamma and dz are i.i.d. standard normal; mu and rs are the statistics of x.
-Outputs: dx [rows, cols], dgamma [cols], dbeta [cols].
+Precision: BF16 is only the storage format of the activations and gradients. All
+arithmetic (x_hat, products, the row sums ds/db, the dx formula, the column sums
+dgamma/dbeta) must be done in FP32 (or higher) on values converted from BF16, and
+each BF16 output must come from a single round-to-nearest-even conversion of its
+final FP32 value. FP16/BF16/FP8 arithmetic, tensor-core MMAs, or holding
+intermediates in a lower precision are not allowed, even if the result happens to
+pass the tolerance check.
 
-Precision: all arithmetic must be FP32 (or higher). FP16/BF16/FP8 arithmetic or
-storing intermediates in a lower precision is not allowed.
-
-Correctness: dx, dgamma and dbeta are compared element-wise with a reference
+Correctness: dx, dgamma and dbeta are compared element-wise (in FP32) with a reference
 implementation over 3 random input sets:
-  |out - ref| <= atol + rtol * |ref|,  atol = 0.003, rtol = 0.0001
-NaN/Inf fail, and every output element must be written (output buffers are
-pre-filled with NaN).
+  |out - ref| <= atol + rtol * |ref|,  atol = 0.001, rtol = 0.024
+rtol allows about 3 BF16 ulps of rounding difference; atol is small compared with the
+gradient magnitudes (|dx|, |dgamma| and |dbeta| reach ~1e3), so values that nearly
+cancel to zero must be accurate to FP32 level. NaN/Inf fail, and every output element
+must be written (output buffers are pre-filled with NaN).
 
 
 ## Function Signature
 
 ```c
 void launch_layernorm_backward(
-    const float* dz,      // [rows, cols] upstream gradient
-    const float* x,       // [rows, cols] saved input from forward
-    const float* mu,      // [rows] saved mean
-    const float* rs,      // [rows] saved reciprocal std
-    const float* gamma,   // [cols] scale weight
-    float* dx,            // [rows, cols] gradient w.r.t. input
-    float* dgamma,        // [cols] gradient w.r.t. gamma
-    float* dbeta,         // [cols] gradient w.r.t. beta
+    const void* dz,       // [rows, cols] bf16 upstream gradient
+    const void* x,        // [rows, cols] bf16 saved input from forward
+    const float* mu,      // [rows] fp32 saved mean
+    const float* rs,      // [rows] fp32 saved reciprocal std
+    const float* gamma,   // [cols] fp32 scale weight
+    void* dx,             // [rows, cols] bf16 gradient w.r.t. input
+    float* dgamma,        // [cols] fp32 gradient w.r.t. gamma
+    float* dbeta,         // [cols] fp32 gradient w.r.t. beta
     int rows,
     int cols,
     cudaStream_t stream

@@ -1,9 +1,8 @@
-# CUDA-Hercules released task set: 195 tasks
+# CUDA-Hercules released task set: 194 tasks
 
 class1/blackwell/70_blackwell_fp16_gemm
 class1/blackwell/70_blackwell_fp8_gemm
 class1/blackwell/72_blackwell_narrow_precision_gemm
-class1/blackwell/73_blackwell_gemm_preferred_cluster
 class1/blackwell/75_blackwell_grouped_gemm
 class1/blackwell/76_blackwell_conv
 class1/blackwell/77_blackwell_fmha

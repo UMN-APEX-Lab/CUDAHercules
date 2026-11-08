@@ -1,12 +1,15 @@
 /*
  * LayerNorm Parallel Residual Forward — hidden_size=4096
+ * BF16 activations, FP32 weights, FP32 compute
  *
- * Source: flash-attention/csrc/layer_norm/ln_parallel_residual_fwd_kernels.cuh
+ * Source: flash-attention/csrc/layer_norm/ln_parallel_residual_fwd_kernels.cuh,
+ * instantiated as registered in ln_parallel_fwd_4096.cu for
+ * (wtype=fp32, itype=bf16, rtype=bf16, otype=bf16, ctype=fp32).
  * Kernel source code in reference_sources/.
  *
  * Fused residual addition + layer normalization:
- *   x = x0 + residual
- *   z = LayerNorm(x, gamma, beta)
+ *   x = x0 + residual   (FP32 sum; stored as bf16)
+ *   z = LayerNorm(x, gamma, beta)   (statistics and z from the FP32 sum)
  */
 
 #include "ln_parallel_residual_fwd_kernels.cuh"
@@ -19,12 +22,12 @@ namespace layer_norm {
 }
 
 extern "C" void launch_layernorm_parallel_fwd(
-    const float* x0,
-    const float* residual,
+    const void* x0,
+    const void* residual,
     const float* gamma,
     const float* beta,
-    float* z,
-    float* x,
+    void* z,
+    void* x,
     float* mu,
     float* rs,
     int rows,
@@ -37,8 +40,8 @@ extern "C" void launch_layernorm_parallel_fwd(
     FwdParams params;
     params.rows = rows;
     params.cols = cols;
-    params.x0 = const_cast<float*>(x0);
-    params.residual = const_cast<float*>(residual);
+    params.x0 = const_cast<void*>(x0);
+    params.residual = const_cast<void*>(residual);
     params.x = x;
     params.gamma = const_cast<float*>(gamma);
     params.beta = const_cast<float*>(beta);
@@ -74,11 +77,11 @@ extern "C" void launch_layernorm_parallel_fwd(
     cudaGetDeviceProperties(&prop, device);
     launch_params.props = &prop;
 
-    launch_parallel_residual_<float, float, float, float, float, uint32_t,
+    launch_parallel_residual_<fp32, bf16, bf16, bf16, fp32, uint32_t,
             4096, 1, 1, 4, 16
     >(launch_params, true);
 
-    launch_parallel_residual_<float, float, float, float, float, uint32_t,
+    launch_parallel_residual_<fp32, bf16, bf16, bf16, fp32, uint32_t,
             4096, 1, 1, 4, 16
     >(launch_params, false);
 }

@@ -5,6 +5,9 @@ task_class: 1
 domain: ml
 tags:
 - attention
+- fmha
+- gqa
+- causal
 hardware:
   min_sm: 100
   tested_sms:
@@ -13,7 +16,7 @@ hardware:
 runner:
   backend: class1_make
   workdir: tasks/class1/blackwell/77_blackwell_fmha
-  timeout_sec: 180
+  timeout_sec: 600
   env:
     KH_BENCHMARK: '20'
   solution_file: solution.h
@@ -37,12 +40,18 @@ performance:
     ref_time_ms_regex: Ref time:\s*([0-9.]+)\s*ms
   metric: speedup_ref_over_sol
 source:
-  repo: NVIDIA/cutlass
-  files: []
-  commit: ''
-  license: BSD-3-Clause
+  repo: NVIDIA/cudnn-frontend
+  files:
+  - include/cudnn_frontend.h
+  commit: 819bb56f9e691629bbc25fc1f74e3ceca005512a
+  license: Apache-2.0
 anti_cheat:
+  # Static check: only blatant cheating (wrapping the reference implementation). Calls to cuBLAS /
+  # cuDNN / CUTLASS kernel templates are blocked by the global rules; numeric precision is enforced by
+  # the run-time tolerance, not by patterns.
   blocked_patterns:
+  - '\bcudnn_frontend\b'
+  - '\b(khcudnn_\w*|KhCudnnSdpa|ref_cudnn)\b'
   required_patterns:
   - __global__\s+void
   - <<<.*>>>

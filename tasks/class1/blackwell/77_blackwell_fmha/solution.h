@@ -1,90 +1,108 @@
 #pragma once
+// Reference-free "naive but not slow" FMHA for the harness: one warp per query row, FP32 math,
+// online softmax. Exact up to FP32 summation order, so it is also the comparator used to
+// calibrate the tolerances. It is slow (CUDA cores), but finishes the whole test in a few minutes.
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cmath>
+#include <stdint.h>
 
-// Naive FMHA: O = softmax(Q * K^T / sqrt(head_dim)) * V
-// Q: [batch, num_heads, seq_q, head_dim]
-// K: [batch, num_heads, seq_k, head_dim]
-// V: [batch, num_heads, seq_k, head_dim]
-// O: [batch, num_heads, seq_q, head_dim]
-__global__ void naive_fmha_kernel(
-    int batch, int num_heads, int seq_q, int seq_k, int head_dim,
-    __half const *Q, __half const *K, __half const *V, __half *O) {
+namespace naive_fmha {
 
-  int idx = threadIdx.x + blockIdx.x * blockDim.x;
-  int total = batch * num_heads * seq_q;
-  if (idx >= total) return;
-
-  int tmp = idx;
-  int q_pos = tmp % seq_q; tmp /= seq_q;
-  int h = tmp % num_heads; tmp /= num_heads;
-  int b = tmp;
-
-  int q_head_stride = seq_q * head_dim;
-  int k_head_stride = seq_k * head_dim;
-  int q_batch_stride = num_heads * q_head_stride;
-  int k_batch_stride = num_heads * k_head_stride;
-
-  int q_base = b * q_batch_stride + h * q_head_stride + q_pos * head_dim;
-  int k_base = b * k_batch_stride + h * k_head_stride;
-
-  float scale = 1.0f / sqrtf((float)head_dim);
-
-  // Compute S = Q[q_pos] * K^T, scaled
-  // Use register-based approach for small seq_k
-  float max_val = -1e30f;
-
-  // First pass: compute scores and find max
-  // We'll do this in two passes to avoid allocating dynamic memory
-  // Pass 1: find max
-  for (int j = 0; j < seq_k; ++j) {
-    float dot = 0.0f;
-    for (int d = 0; d < head_dim; ++d) {
-      dot += __half2float(Q[q_base + d]) * __half2float(K[k_base + j * head_dim + d]);
-    }
-    dot *= scale;
-    if (dot > max_val) max_val = dot;
-  }
-
-  // Pass 2: compute exp and sum
-  float sum_exp = 0.0f;
-  for (int j = 0; j < seq_k; ++j) {
-    float dot = 0.0f;
-    for (int d = 0; d < head_dim; ++d) {
-      dot += __half2float(Q[q_base + d]) * __half2float(K[k_base + j * head_dim + d]);
-    }
-    dot *= scale;
-    sum_exp += expf(dot - max_val);
-  }
-
-  float inv_sum = 1.0f / sum_exp;
-
-  // Pass 3: compute output O = softmax * V
-  for (int d = 0; d < head_dim; ++d) {
-    float acc = 0.0f;
-    for (int j = 0; j < seq_k; ++j) {
-      float dot = 0.0f;
-      for (int dd = 0; dd < head_dim; ++dd) {
-        dot += __half2float(Q[q_base + dd]) * __half2float(K[k_base + j * head_dim + dd]);
-      }
-      dot *= scale;
-      float attn = expf(dot - max_val) * inv_sum;
-      acc += attn * __half2float(V[k_base + j * head_dim + d]);
-    }
-    int o_idx = b * q_batch_stride + h * q_head_stride + q_pos * head_dim + d;
-    O[o_idx] = __float2half(acc);
-  }
+__device__ __forceinline__ float2 load2(__half const *p) {
+  return __half22float2(*reinterpret_cast<__half2 const *>(p));
+}
+__device__ __forceinline__ float2 load2(__nv_bfloat16 const *p) {
+  return __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const *>(p));
+}
+__device__ __forceinline__ void store2(__half *p, float a, float b) {
+  *reinterpret_cast<__half2 *>(p) = __floats2half2_rn(a, b);
+}
+__device__ __forceinline__ void store2(__nv_bfloat16 *p, float a, float b) {
+  *reinterpret_cast<__nv_bfloat162 *>(p) = __floats2bfloat162_rn(a, b);
 }
 
-cudaError_t BlackwellFmha(
-    int batch, int num_heads, int seq_q, int seq_k, int head_dim,
-    __half const *Q, __half const *K, __half const *V, __half *O) {
+// D = 32 * DPL: every lane owns DPL consecutive head-dim elements of its query row.
+template <typename T, int DPL>
+__global__ void fmha_kernel(int Hq, int Hkv, int Sq, int Sk, int causal, float scale,
+                            T const *Q, T const *K, T const *V, T *O, float *LSE) {
+  int lane = threadIdx.x & 31;
+  long long row = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  int q = int(row % Sq);
+  long long bh = row / Sq;
+  int h = int(bh % Hq);
+  int b = int(bh / Hq);
+  int hk = h / (Hq / Hkv);
+  constexpr int D = 32 * DPL;
 
-  int total = batch * num_heads * seq_q;
-  int threads = 256;
-  int blocks = (total + threads - 1) / threads;
-  naive_fmha_kernel<<<blocks, threads>>>(
-    batch, num_heads, seq_q, seq_k, head_dim, Q, K, V, O);
+  float qv[DPL], acc[DPL];
+  T const *qp = Q + (((long long)b * Sq + q) * Hq + h) * D + lane * DPL;
+#pragma unroll
+  for (int i = 0; i < DPL; i += 2) {
+    float2 f = load2(qp + i);
+    qv[i] = f.x; qv[i + 1] = f.y; acc[i] = 0.f; acc[i + 1] = 0.f;
+  }
+  float m = -INFINITY, l = 0.f;
+  int kend = causal ? min(Sk, q + 1) : Sk;
+  for (int j = 0; j < kend; ++j) {
+    long long off = (((long long)b * Sk + j) * Hkv + hk) * D + lane * DPL;
+    float s = 0.f;
+#pragma unroll
+    for (int i = 0; i < DPL; i += 2) {
+      float2 f = load2(K + off + i);
+      s += qv[i] * f.x + qv[i + 1] * f.y;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    s *= scale;
+    float mn = fmaxf(m, s);
+    float alpha = __expf(m - mn);
+    float p = __expf(s - mn);
+    l = l * alpha + p;
+#pragma unroll
+    for (int i = 0; i < DPL; i += 2) {
+      float2 f = load2(V + off + i);
+      acc[i] = acc[i] * alpha + p * f.x;
+      acc[i + 1] = acc[i + 1] * alpha + p * f.y;
+    }
+    m = mn;
+  }
+  float inv = 1.f / l;
+  T *op = O + (((long long)b * Sq + q) * Hq + h) * D + lane * DPL;
+#pragma unroll
+  for (int i = 0; i < DPL; i += 2) store2(op + i, acc[i] * inv, acc[i + 1] * inv);
+  if (lane == 0) LSE[(bh * Sq) + q] = m + logf(l);
+}
+
+template <typename T>
+cudaError_t launch(int B, int Hq, int Hkv, int Sq, int Sk, int D, bool causal,
+                   T const *Q, T const *K, T const *V, T *O, float *LSE) {
+  long long rows = (long long)B * Hq * Sq;
+  int warps = 4;
+  float scale = 1.0f / sqrtf((float)D);
+  dim3 grid((unsigned)((rows + warps - 1) / warps)), block(32 * warps);
+  if (D == 128) fmha_kernel<T, 4><<<grid, block>>>(Hq, Hkv, Sq, Sk, causal, scale, Q, K, V, O, LSE);
+  else if (D == 64) fmha_kernel<T, 2><<<grid, block>>>(Hq, Hkv, Sq, Sk, causal, scale, Q, K, V, O, LSE);
+  else return cudaErrorInvalidValue;
   return cudaGetLastError();
+}
+
+}  // namespace naive_fmha
+
+// Q, O: [batch, seq_q, num_q_heads, head_dim]; K, V: [batch, seq_k, num_kv_heads, head_dim];
+// LSE: [batch, num_q_heads, seq_q] (FP32, natural log). Query head h uses KV head h / (Hq / Hkv).
+cudaError_t BlackwellFmha(int batch, int num_q_heads, int num_kv_heads, int seq_q, int seq_k,
+                          int head_dim, bool causal, __half const *Q, __half const *K,
+                          __half const *V, __half *O, float *LSE) {
+  return naive_fmha::launch<__half>(batch, num_q_heads, num_kv_heads, seq_q, seq_k, head_dim,
+                                    causal, Q, K, V, O, LSE);
+}
+
+cudaError_t BlackwellFmha(int batch, int num_q_heads, int num_kv_heads, int seq_q, int seq_k,
+                          int head_dim, bool causal, __nv_bfloat16 const *Q,
+                          __nv_bfloat16 const *K, __nv_bfloat16 const *V, __nv_bfloat16 *O,
+                          float *LSE) {
+  return naive_fmha::launch<__nv_bfloat16>(batch, num_q_heads, num_kv_heads, seq_q, seq_k,
+                                           head_dim, causal, Q, K, V, O, LSE);
 }

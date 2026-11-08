@@ -31,7 +31,7 @@ python -c "import sys; sys.path.insert(0, 'src'); import cuda_hercules; print('O
 python -c "import sys; sys.path.insert(0, 'src'); from cuda_hercules.runner import discover_tasks; print(len(discover_tasks('.')))"
 ```
 
-The final command should print `195`.
+The final command should print `194`.
 
 ## Pinned Subsets
 
@@ -43,7 +43,7 @@ Use pinned subset files for comparable paper-style runs:
 | Class 1 Hopper | `tasks/class1/hopper/subset_21.txt` | 21 |
 | Class 2 general | `tasks/class2/general/subset_43.txt` | 43 |
 | Class 2 Hopper sampled subset | `tasks/class2/hopper/subset_28.txt` | 28 |
-| Full release | `tasks/release_task_set.txt` | 195 |
+| Full release | `tasks/release_task_set.txt` | 194 |
 
 The release also includes all 64 Class 2 Hopper tasks and all 12 Class 2 Blackwell tasks.
 

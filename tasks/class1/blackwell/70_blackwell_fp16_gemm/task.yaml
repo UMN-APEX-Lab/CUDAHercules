@@ -43,6 +43,9 @@ source:
   commit: ''
   license: BSD-3-Clause
 anti_cheat:
+  # Static check: only blatant cheating (wrapping the reference implementation). Calls to cuBLAS /
+  # cuDNN / CUTLASS kernel templates are blocked by the global rules; numeric precision is enforced by
+  # the run-time tolerance, not by patterns.
   blocked_patterns:
   required_patterns:
   - __global__\s+void

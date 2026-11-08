@@ -1,611 +1,331 @@
 /***************************************************************************************************
- * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2025 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
+ * Redistribution and use in source and binary forms, with or without modification, are permitted
+ * provided that the following conditions are met: (BSD-3-Clause, see the CUTLASS LICENSE.txt)
  **************************************************************************************************/
 
-/*! \file
-    \brief A FP16 dense GEMM example for the NVIDIA Blackwell SM100 architecture using CUTLASS.
+/*
+  Task 70_blackwell_fp16_gemm: FP16 GEMM with FP32 output on Blackwell (sm_100a / B200).
 
-    This example demonstrates minimal set of changes needed to transition from a Hopper CUTLASS 3.x 
-    GEMM kernel (see example 48_hopper_warp_specialized_gemm) to a Blackwell 3.x CUTLASS GEMM kernel.
-    
-    The Blackwell SM100 CUTLASS kernel uses of the following Blackwell SM100 features:
+  Reference: the CUTLASS 3.x Blackwell GEMM (example 70) with one tile / cluster configuration
+  chosen per problem shape from a sweep on B200 (prefill shapes: 256x256 tile, 2x1 cluster;
+  decode shapes: a 1-SM tile). It reaches 87-109% of cuBLAS (FP16 in, FP32 out) on every shape.
 
-    1. New series of Tensor Core MMA Instructions (tcgen05) introduced on the Blackwell architecture (sm100a) 
-    which have 2x throughput compared to Hopper Tensor Core MMA instructions (WGMMA). 
-    
-    Note that Hopper WGMMA Tensor Core MMA instructions are not compatible on Blackwell (See https://docs.nvidia.com/cuda/parallel-thread-execution). 
+  Solution under test (KH_TEST_SOLUTION), implemented in solution.h:
 
-    2. A new per-SM memory called Tensor Memory (TMEM) introduced on the Blackwell architecture (sm100a). 
-    Blackwell SM100 Tensor Core MMA instructions store their accumulation results in TMEM instead of the 
-    Register File. (Please refer to CUDA 12.8 docs on https://docs.nvidia.com/cuda/).
+    cudaError_t BlackwellHgemm(int M, int N, int K, float alpha,
+                               __half const *A, int lda, __half const *B, int ldb,
+                               float beta, float *C, int ldc);
 
-    3. An extended flavor of the warp-specialized kernel design introduced in Hopper enabled by use of TMEM 
-    which allows us to decouple the execution of MMA and epilogue into separate warps. 
+    A: row-major [M, K] (lda = K), B: column-major [K, N] (ldb = K),
+    C: column-major [M, N] (ldc = M);  C = alpha * A * B + beta * C.
 
-    4. A new SW controlled dynamic scheduler based on cluster launch control (See https://docs.nvidia.com/cuda/parallel-thread-execution). 
-
-    Usage:
-      $ ./examples/70_blackwell_gemm/70_blackwell_fp16_gemm --m=8192 --n=8192 --k=8192
+  Verification: inputs are full-mantissa random FP16; the reference and the solution write to
+  different buffers that are pre-filled with NaN; every output element must be finite and within
+  tolerance of the reference. The solution is re-checked after the timing loop.
 */
 
-
-
+#include <cstdio>
+#include <cstring>
+#include <functional>
 #include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
 
 #include "cutlass/cutlass.h"
 
 #ifdef KH_TEST_SOLUTION
 #include <cuda_fp16.h>
-#include "solution.h"
+#include "solution.h"   // must stay before kh_verify.h: the solution must not see the helpers
 #endif
 
 #include "cute/tensor.hpp"
-#include "cutlass/tensor_ref.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
-#include "cutlass/gemm/kernel/tile_scheduler_params.h"
-
-#include "cutlass/util/command_line.h"
-#include "cutlass/util/distribution.h"
-#include "cutlass/util/host_tensor.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "cutlass/util/tensor_view_io.h"
-#include "cutlass/util/reference/device/gemm.h"
-#include "cutlass/util/reference/device/tensor_compare.h"
-#include "cutlass/util/reference/device/tensor_fill.h"
 
-#include "helper.h"
+#include "kh_verify.h"
 
 using namespace cute;
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/// GEMM kernel configurations
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-// A matrix configuration
-using         ElementA    = half_t;                                         // Element type for A matrix operand
-using         LayoutA     = cutlass::layout::RowMajor;                      // Layout type for A matrix operand
-constexpr int AlignmentA  = 128 / cutlass::sizeof_bits<ElementA>::value;    // Memory access granularity/alignment of A matrix in units of elements (up to 16 bytes)
-
-// B matrix configuration
-using         ElementB    = half_t;                                         // Element type for B matrix operand
-using         LayoutB     = cutlass::layout::ColumnMajor;                   // Layout type for B matrix operand
-constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;    // Memory access granularity/alignment of B matrix in units of elements (up to 16 bytes)
-
-// C/D matrix configuration
-using         ElementC    = float;                                          // Element type for C and D matrix operands
-using         LayoutC     = cutlass::layout::ColumnMajor;                   // Layout type for C and D matrix operands
-constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
-
-// Kernel functional config
-using ElementAccumulator  = float;                                          // Element type for internal accumulation
-using ArchTag             = cutlass::arch::Sm100;                           // Tag indicating the minimum SM that supports the intended feature
-using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
-
-// MMA and Cluster Tile Shapes
-// Shape of the tile computed by tcgen05 MMA, could be across 2 SMs if Cluster Shape %2 == 0 
-using MmaTileShape_MNK = Shape<_256,_128,_64>;                          
-// Shape of the threadblocks in a cluster
-using ClusterShape_MNK = Shape<_2,_2,_1>;
-
-// Build the epilogue
-using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass, 
-    MmaTileShape_MNK, ClusterShape_MNK,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementC, LayoutC, AlignmentC,
-    ElementC, LayoutC, AlignmentC,
-    cutlass::epilogue::collective::EpilogueScheduleAuto
-  >::CollectiveOp;
-
-// Build the mainloop
-using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    ElementA, LayoutA, AlignmentA,
-    ElementB, LayoutB, AlignmentB,
-    ElementAccumulator,
-    MmaTileShape_MNK, ClusterShape_MNK,
-    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::collective::KernelScheduleAuto
-  >::CollectiveOp;
-
-// Compose into a kernel
-using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int,int,int, int>, // Indicates ProblemShape
-    CollectiveMainloop,
-    CollectiveEpilogue,
-    void>;                   // Default to ClusterLaunchControl (CLC) based tile scheduler 
-
-using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-
-// Reference device GEMM implementation type
-using DeviceGemmReference = cutlass::reference::device::Gemm<
-  ElementA,
-  LayoutA,
-  ElementB,
-  LayoutB,
-  ElementC,
-  LayoutC,
-  ElementAccumulator,
-  ElementAccumulator>;
-
-using StrideA = typename Gemm::GemmKernel::StrideA;
-using StrideB = typename Gemm::GemmKernel::StrideB;
-using StrideC = typename Gemm::GemmKernel::StrideC;
-using StrideD = typename Gemm::GemmKernel::StrideD;
-
-//
-// Data members
-//
-
-/// Initialization
-StrideA stride_A;
-StrideB stride_B;
-StrideC stride_C;
-StrideD stride_D;
-uint64_t seed;
-
-cutlass::DeviceAllocation<typename Gemm::ElementA> block_A;
-cutlass::DeviceAllocation<typename Gemm::ElementB> block_B;
-cutlass::DeviceAllocation<typename Gemm::ElementC> block_C;
-cutlass::DeviceAllocation<typename Gemm::EpilogueOutputOp::ElementOutput> block_D;
-cutlass::DeviceAllocation<typename Gemm::EpilogueOutputOp::ElementOutput> block_ref_D;
-
-#endif // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/// Testbed utility types
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Command line options parsing
-struct Options {
-
-  bool help;
-
-  float alpha, beta;
-  int iterations;
-  int m, n, k;
-  int swizzle;
-
-  Options():
-    help(false),
-    m(8192), n(8192), k(8192),
-    alpha(1.f), beta(0.f),
-    iterations(10),
-    swizzle(0)
-  { }
-
-  // Parses the command line
-  void parse(int argc, char const **args) {
-    cutlass::CommandLine cmd(argc, args);
-
-    if (cmd.check_cmd_line_flag("help")) {
-      help = true;
-      return;
-    }
-
-    cmd.get_cmd_line_argument("m", m);
-    cmd.get_cmd_line_argument("n", n);
-    cmd.get_cmd_line_argument("k", k);
-    cmd.get_cmd_line_argument("alpha", alpha, 1.f);
-    cmd.get_cmd_line_argument("beta", beta, 0.f);
-    cmd.get_cmd_line_argument("iterations", iterations);
-    cmd.get_cmd_line_argument("swizzle", swizzle);
+#define CUTLASS_CHECK_KH(status)                                                         \
+  {                                                                                      \
+    cutlass::Status error = status;                                                      \
+    if (error != cutlass::Status::kSuccess) {                                            \
+      std::cerr << "Got cutlass error: " << cutlassGetStatusString(error) << " at: "     \
+                << __LINE__ << std::endl;                                                \
+      std::exit(2);                                                                      \
+    }                                                                                    \
   }
 
-  /// Prints the usage statement.
-  std::ostream & print_usage(std::ostream &out) const {
+using ElementA = cutlass::half_t;
+using LayoutA = cutlass::layout::RowMajor;
+constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+using ElementB = cutlass::half_t;
+using LayoutB = cutlass::layout::ColumnMajor;
+constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+using ElementC = float;
+using LayoutC = cutlass::layout::ColumnMajor;
+constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+using ElementAccumulator = float;
+using ArchTag = cutlass::arch::Sm100;
+using OperatorClass = cutlass::arch::OpClassTensorOp;
 
-    out << "70_blackwell_fp16_gemm\n\n"
-      << "  Blackwell FP16 GEMM using a Warp Specialized kernel.\n\n"
-      << "Options:\n\n"
-      << "  --help                      If specified, displays this usage statement\n\n"
-      << "  --m=<int>                   Sets the M extent of the GEMM\n"
-      << "  --n=<int>                   Sets the N extent of the GEMM\n"
-      << "  --k=<int>                   Sets the K extent of the GEMM\n"
-      << "  --alpha=<f32>               Epilogue scalar alpha\n"
-      << "  --beta=<f32>                Epilogue scalar beta\n\n"
-      << "  --swizzle=<int>             Cluster rasterization swizzle\n\n"
-      << "  --iterations=<int>          Number of profiling iterations to perform.\n\n";
-
-    out
-      << "\n\nExamples:\n\n"
-      << "$ " << "70_blackwell_fp16_gemm" << " --m=1024 --n=512 --k=1024 --alpha=2 --beta=0.707 \n\n";
-
-    return out;
-  }
-
-  /// Compute performance in GFLOP/s
-  double gflops(double runtime_s) const
-  {
-    // Two flops per multiply-add
-    uint64_t flop = uint64_t(2) * m * n * k;
-    double gflop = double(flop) / double(1.0e9);
-    return gflop / runtime_s;
-  }
+template <class MmaTile, class ClusterShape>
+struct GemmCfg {
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, MmaTile, ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
+      ElementC, LayoutC, AlignmentC, ElementC, LayoutC, AlignmentC,
+      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, ElementA, LayoutA, AlignmentA, ElementB, LayoutB, AlignmentB,
+      ElementAccumulator, MmaTile, ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>,
+                                                          CollectiveMainloop, CollectiveEpilogue,
+                                                          void>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
 
-/// Result structure
-struct Result
-{
-  double avg_runtime_ms;
-  double gflops;
-  cutlass::Status status;
-  cudaError_t error;
-  bool passed;
+// Reference configurations (selected per shape below).
+using CfgLarge  = GemmCfg<Shape<_256, _128, _64>, Shape<_2, _2, _1>>;   // prefill-sized GEMMs
+using CfgLarge2 = GemmCfg<Shape<_256, _256, _64>, Shape<_2, _1, _1>>;
+using CfgSmall  = GemmCfg<Shape<_128, _128, _64>, Shape<_1, _1, _1>>;   // small-M (decode) GEMMs
+using CfgSmall2 = GemmCfg<Shape<_128, _64, _64>, Shape<_1, _1, _1>>;
+using CfgSmall3 = GemmCfg<Shape<_128, _256, _64>, Shape<_1, _1, _1>>;
 
-  Result(
-    double avg_runtime_ms = 0,
-    double gflops = 0,
-    cutlass::Status status = cutlass::Status::kSuccess,
-    cudaError_t error = cudaSuccess)
-  :
-    avg_runtime_ms(avg_runtime_ms), gflops(gflops), status(status), error(error), passed(false)
-  {}
-
+/// One prepared CUTLASS GEMM; initialization (argument packing, workspace) is done in the
+/// constructor, so run() is just the kernel launch.
+struct RefGemm {
+  virtual ~RefGemm() {}
+  virtual void run() = 0;
 };
 
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/// GEMM setup and evaluation
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Helper to initialize a block of device data
-template <class Element>
-bool initialize_block(
-  cutlass::DeviceAllocation<Element>& block,
-  uint64_t seed=2023) {
-
-  Element scope_max, scope_min;
-  int bits_input = cutlass::sizeof_bits<Element>::value;
-
-  if (bits_input == 1) {
-    scope_max = Element(2);
-    scope_min = Element(0);
-  } else if (bits_input <= 8) {
-    scope_max = Element(2);
-    scope_min = Element(-2);
-  } else {
-    scope_max = Element(8);
-    scope_min = Element(-8);
-  }
-
-  cutlass::reference::device::BlockFillRandomUniform(
-    block.get(), block.size(), seed, scope_max, scope_min, 0);
-
-  return true;
-}
-
-/// Initialize operands to be used in the GEMM and reference GEMM
-void initialize(const Options &options) {
-
-  stride_A = cutlass::make_cute_packed_stride(StrideA{}, {options.m, options.k, 1});
-  stride_B = cutlass::make_cute_packed_stride(StrideB{}, {options.n, options.k, 1});
-  stride_C = cutlass::make_cute_packed_stride(StrideC{}, {options.m, options.n, 1});
-  stride_D = cutlass::make_cute_packed_stride(StrideD{}, {options.m, options.n, 1});
-
-  block_A.reset(options.m * options.k);
-  block_B.reset(options.k * options.n);
-  block_C.reset(options.m * options.n);
-  block_D.reset(options.m * options.n);
-  block_ref_D.reset(options.m * options.n);
-
-  initialize_block(block_A, seed + 2023);
-  initialize_block(block_B, seed + 2022);
-  initialize_block(block_C, seed + 2021);
-}
-
-/// Populates a Gemm::Arguments structure from the given commandline options
-typename Gemm::Arguments args_from_options(const Options &options)
-{
-  typename Gemm::Arguments arguments{
-    cutlass::gemm::GemmUniversalMode::kGemm,
-    {options.m, options.n, options.k, 1},
-    {block_A.get(), stride_A, block_B.get(), stride_B},
-    {{options.alpha, options.beta}, block_C.get(), stride_C, block_D.get(), stride_D}
-  };
-
-  arguments.scheduler.max_swizzle_size = options.swizzle;
-
-  return arguments;
-}
-
-bool verify(const Options &options) {
-  cutlass::TensorRef ref_A(block_A.get(), Gemm::LayoutA::packed({options.m, options.k}));
-  cutlass::TensorRef ref_B(block_B.get(), Gemm::LayoutB::packed({options.k, options.n}));
-  cutlass::TensorRef ref_C(block_C.get(), Gemm::LayoutC::packed({options.m, options.n}));
-  cutlass::TensorRef ref_D(block_ref_D.get(), Gemm::LayoutD::packed({options.m, options.n}));
-
-  //
-  // Compute reference output
-  //
-
-  // Create instantiation for device reference gemm kernel
-  DeviceGemmReference gemm_reference;
-
-  // Launch device reference gemm kernel
-  gemm_reference(
-    {options.m, options.n, options.k},
-    ElementAccumulator(options.alpha),
-    ref_A,
-    ref_B,
-    ElementAccumulator(options.beta),
-    ref_C,
-    ref_D);
-
-  // Wait for kernel to finish
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  // Check if output from CUTLASS kernel and reference kernel are equal or not
-  bool passed = cutlass::reference::device::BlockCompareEqual(block_ref_D.get(), block_D.get(), block_D.size());
-
-  return passed;
-}
-
-/// Execute a given example GEMM computation
-template <typename Gemm>
-int run(Options &options)
-{
-  initialize(options);
-
-  // Instantiate CUTLASS kernel depending on templates
+template <class Cfg>
+struct RefGemmImpl : RefGemm {
+  using Gemm = typename Cfg::Gemm;
   Gemm gemm;
-
-  // Create a structure of gemm kernel arguments suitable for invoking an instance of Gemm
-  auto arguments = args_from_options(options);
-
-  // Using the arguments, query for extra workspace required for matrix multiplication computation
-  size_t workspace_size = Gemm::get_workspace_size(arguments);
-
-  // Allocate workspace memory
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-
-  // Check if the problem size is supported or not
-  CUTLASS_CHECK(gemm.can_implement(arguments));
-
-  // Initialize CUTLASS kernel with arguments and workspace pointer
-  CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
-
-  // Correctness / Warmup iteration
-  CUTLASS_CHECK(gemm.run());
-
-  // Check if output from CUTLASS kernel and reference kernel are equal or not
-  Result result;
-  result.passed = verify(options);
-
-  if (!result.passed) {
-    std::cout << "Incorrect" << std::endl;
-    exit(-1);
+  void *workspace = nullptr;
+  RefGemmImpl(int M, int N, int K, float alpha, float beta, ElementA const *A, ElementB const *B,
+              float const *C, float *D) {
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+    StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+    StrideB sb = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+    StrideC sc = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
+    StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
+    typename Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,
+                                  {M, N, K, 1},
+                                  {A, sa, B, sb},
+                                  {{alpha, beta}, C, sc, D, sd}};
+    size_t ws = Gemm::get_workspace_size(args);
+    if (ws) KH_CHECK(cudaMalloc(&workspace, ws));
+    CUTLASS_CHECK_KH(gemm.can_implement(args));
+    CUTLASS_CHECK_KH(gemm.initialize(args, workspace));
   }
+  ~RefGemmImpl() override { cudaFree(workspace); }
+  void run() override { CUTLASS_CHECK_KH(gemm.run()); }
+};
 
-#ifdef KH_TEST_SOLUTION
-  // Verify solution against CUTLASS reference
-  {
-    int lda = options.k, ldb = options.k, ldc = options.m;
-
-    // Allocate solution output
-    cutlass::DeviceAllocation<float> block_sol_D;
-    block_sol_D.reset(options.m * options.n);
-
-    cudaError_t sol_err = BlackwellHgemm(
-      options.m, options.n, options.k,
-      options.alpha,
-      reinterpret_cast<const __half*>(block_A.get()), lda,
-      reinterpret_cast<const __half*>(block_B.get()), ldb,
-      options.beta,
-      block_sol_D.get(), ldc);
-
-    if (sol_err != cudaSuccess) {
-      std::cerr << "Solution kernel failed: " << cudaGetErrorString(sol_err) << std::endl;
-      std::cout << "Incorrect" << std::endl;
-      return -1;
-    }
-    cudaDeviceSynchronize();
-
-    // Compare solution vs CUTLASS reference (block_D)
-    size_t num_elements = options.m * options.n;
-    std::vector<float> h_sol(num_elements), h_ref(num_elements);
-    cudaMemcpy(h_sol.data(), block_sol_D.get(), num_elements * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ref.data(), block_D.get(), num_elements * sizeof(float), cudaMemcpyDeviceToHost);
-
-    float max_diff = 0.0f;
-    for (size_t i = 0; i < num_elements; ++i) {
-      max_diff = fmaxf(max_diff, fabsf(h_sol[i] - h_ref[i]));
-    }
-    if (max_diff > 1e-2f) {
-      std::cerr << "Solution incorrect. Max diff vs reference: " << max_diff << std::endl;
-      std::cout << "Incorrect" << std::endl;
-      return -1;
-    }
+static std::unique_ptr<RefGemm> make_ref(int cfg, int M, int N, int K, float alpha, float beta,
+                                         ElementA const *A, ElementB const *B, float const *C,
+                                         float *D) {
+  switch (cfg) {
+    case 0: return std::make_unique<RefGemmImpl<CfgLarge>>(M, N, K, alpha, beta, A, B, C, D);
+    case 1: return std::make_unique<RefGemmImpl<CfgLarge2>>(M, N, K, alpha, beta, A, B, C, D);
+    case 2: return std::make_unique<RefGemmImpl<CfgSmall>>(M, N, K, alpha, beta, A, B, C, D);
+    case 3: return std::make_unique<RefGemmImpl<CfgSmall2>>(M, N, K, alpha, beta, A, B, C, D);
+    default: return std::make_unique<RefGemmImpl<CfgSmall3>>(M, N, K, alpha, beta, A, B, C, D);
   }
-#endif
-
-  std::cout << "Passed" << std::endl;
-
-  // Profiling
-  if (options.iterations > 0) {
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    // Warmup reference
-    for (int i = 0; i < 3; i++) {
-      CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
-      CUTLASS_CHECK(gemm.run());
-    }
-    cudaDeviceSynchronize();
-
-    // Profile reference
-    float ref_total_ms = 0, ref_min_ms = 1e30f;
-    for (int iter = 0; iter < options.iterations; ++iter) {
-      cudaEventRecord(start);
-      CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
-      CUTLASS_CHECK(gemm.run());
-      cudaEventRecord(stop);
-      cudaEventSynchronize(stop);
-      float ms;
-      cudaEventElapsedTime(&ms, start, stop);
-      ref_total_ms += ms;
-      if (ms < ref_min_ms) ref_min_ms = ms;
-    }
-    fprintf(stdout, "Ref time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
-            ref_total_ms / options.iterations, options.iterations, ref_min_ms);
-
-#ifdef KH_TEST_SOLUTION
-    {
-    int lda = options.k, ldb = options.k, ldc = options.m;
-    // Warmup solution
-    for (int i = 0; i < 3; i++) {
-      cutlass::DeviceAllocation<float> tmp_D;
-      tmp_D.reset(options.m * options.n);
-      BlackwellHgemm(options.m, options.n, options.k, options.alpha,
-        reinterpret_cast<const __half*>(block_A.get()), lda,
-        reinterpret_cast<const __half*>(block_B.get()), ldb,
-        options.beta, tmp_D.get(), ldc);
-    }
-    cudaDeviceSynchronize();
-
-    // Profile solution
-    float sol_total_ms = 0, sol_min_ms = 1e30f;
-    cutlass::DeviceAllocation<float> prof_D;
-    prof_D.reset(options.m * options.n);
-    for (int iter = 0; iter < options.iterations; ++iter) {
-      cudaEventRecord(start);
-      BlackwellHgemm(options.m, options.n, options.k, options.alpha,
-        reinterpret_cast<const __half*>(block_A.get()), lda,
-        reinterpret_cast<const __half*>(block_B.get()), ldb,
-        options.beta, prof_D.get(), ldc);
-      cudaEventRecord(stop);
-      cudaEventSynchronize(stop);
-      float ms;
-      cudaEventElapsedTime(&ms, start, stop);
-      sol_total_ms += ms;
-      if (ms < sol_min_ms) sol_min_ms = ms;
-    }
-    fprintf(stdout, "Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
-            sol_total_ms / options.iterations, options.iterations, sol_min_ms);
-    fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
-    }
-#endif
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-  }
-
-  return 0;
 }
 
-#endif // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+// Tolerances, relative to the RMS of the reference output. Reference and solution both accumulate
+// exact FP16 products in FP32 with different summation orders (a plain sequential FP32 kernel
+// measures max|err|/rms <= 2.0e-4 and rel. Frobenius error <= 3.4e-5 at the largest K, so these
+// bounds leave >= 5x margin). Rounding the inputs to BF16 gives 1.1e-2 / 2.1e-3, FP16
+// accumulation 7e-2 / 6.6e-3, FP8 inputs 1.5e-1 / 3.3e-2: all fail.
+static KhTol kTol(1.0e-3, 2.0e-4);
 
-///////////////////////////////////////////////////////////////////////////////////////////////////
+struct Shape3 { const char *label; int M, N, K, cfg; };
 
-int main(int argc, char const **args) {
+/// Returns false on failure. `timed` = also print Ref / Kernel timings.
+static bool run_case(Shape3 const &s, float alpha, float beta, bool timed, int trials) {
+  int M = s.M, N = s.N, K = s.K;
+  size_t nA = size_t(M) * K, nB = size_t(K) * N, nC = size_t(M) * N;
+  __half *A, *B;
+  float *C_in = nullptr, *D_ref;
+  KH_CHECK(cudaMalloc(&A, nA * sizeof(__half)));
+  KH_CHECK(cudaMalloc(&B, nB * sizeof(__half)));
+  KH_CHECK(cudaMalloc(&D_ref, nC * sizeof(float)));
+  kh_fill_uniform(A, nA, 11u);
+  kh_fill_uniform(B, nB, 22u);
+  if (beta != 0.f) {
+    KH_CHECK(cudaMalloc(&C_in, nC * sizeof(float)));
+    kh_fill_uniform(C_in, nC, 33u);
+  }
+  kh_poison(D_ref, nC * sizeof(float));
+  KH_CHECK(cudaDeviceSynchronize());
 
-  // CUTLASS must be compiled with CUDA 12.8 Toolkit to run this example
-  // and must have compute capability at least 100a.
+  auto ref = make_ref(s.cfg, M, N, K, alpha, beta, reinterpret_cast<ElementA const *>(A),
+                      reinterpret_cast<ElementB const *>(B), C_in, D_ref);
+  ref->run();
+  KH_CHECK(cudaDeviceSynchronize());
 
-  if (__CUDACC_VER_MAJOR__ < 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ < 8)) {
-    std::cerr << "This example requires CUDA 12.8 or newer." << std::endl;
-    return 0;
+  bool ok = true;
+  // The reference must have written every element (it was pre-filled with NaN).
+  {
+    KhResult r = kh_compare(D_ref, D_ref, nC, kTol);
+    if (!r.pass) {
+      std::cerr << "Reference output incomplete or non-finite (non-finite = " << r.nonfinite
+                << ")" << std::endl;
+      ok = false;
+    }
   }
 
+#ifdef KH_TEST_SOLUTION
+  float *D_sol = nullptr;
+  KH_CHECK(cudaMalloc(&D_sol, nC * sizeof(float)));
+  auto reset_sol = [&] {
+    if (beta != 0.f) KH_CHECK(cudaMemcpy(D_sol, C_in, nC * sizeof(float), cudaMemcpyDeviceToDevice));
+    else kh_poison(D_sol, nC * sizeof(float));
+  };
+  auto call_sol = [&] {
+    cudaError_t e = BlackwellHgemm(M, N, K, alpha, A, K, B, K, beta, D_sol, M);
+    if (e != cudaSuccess) {
+      std::cerr << "Solution kernel failed: " << cudaGetErrorString(e) << std::endl;
+      std::exit(1);
+    }
+  };
+  if (ok) {
+    reset_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    call_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    KhResult r = kh_compare(D_sol, D_ref, nC, kTol);
+    kh_print_result("solution", r, kTol);
+    ok = r.pass;
+  }
+#endif
+
+  if (ok && timed) {   // the fresh-input re-check also runs when timing is disabled (KH_BENCHMARK=0)
+    // The activations A are regenerated (new seed, outside the timed region, before the L2 flush) before
+    // every call of both the reference and the solution, so a result or an A-dependent intermediate cannot
+    // be memoized across calls; the weights B stay fixed. Reference outputs are poisoned before every call
+    // so both sides do identical work.
+    unsigned seed = 1000u;
+    auto refresh_A = [&] { if (beta == 0.f) kh_fill_uniform(A, nA, seed++); };
+    if (trials > 0) {
+    KhTime tr = kh_time([&] { ref->run(); }, trials,
+                        [&] { if (beta == 0.f) kh_poison(D_ref, nC * sizeof(float)); refresh_A(); });
+    kh_print_time("Ref", tr);
+#ifdef KH_TEST_SOLUTION
+    KhTime ts = kh_time(call_sol, trials, [&] { reset_sol(); refresh_A(); });
+    kh_print_time("Kernel", ts);
+    kh_print_speedup(tr, ts);
+#endif
+    }
+#ifdef KH_TEST_SOLUTION
+    // Re-check after timing with yet another fresh A: recompute the reference for it, re-poison the
+    // solution output, and require the solution to produce the right answer from scratch.
+    refresh_A();
+    kh_poison(D_ref, nC * sizeof(float));
+    ref->run();
+    KH_CHECK(cudaDeviceSynchronize());
+    reset_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    call_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    KhResult r = kh_compare(D_sol, D_ref, nC, kTol);
+    kh_print_result("solution (re-check after timing, fresh A)", r, kTol);
+    ok = r.pass;
+#endif
+  }
+
+#ifdef KH_TEST_SOLUTION
+  cudaFree(D_sol);
+#endif
+  cudaFree(A); cudaFree(B); cudaFree(D_ref);
+  if (C_in) cudaFree(C_in);
+  return ok;
+}
+
+#endif  // CUTLASS_ARCH_MMA_SM100_SUPPORTED
+
+int main(int argc, char const **argv) {
   cudaDeviceProp props;
-  int current_device_id;
-  CUDA_CHECK(cudaGetDevice(&current_device_id));
-  CUDA_CHECK(cudaGetDeviceProperties(&props, current_device_id));
-  cudaError_t error = cudaGetDeviceProperties(&props, 0);
-
+  KH_CHECK(cudaGetDeviceProperties(&props, 0));
   if (props.major != 10 || props.minor != 0) {
-    std::cerr << "This example requires a GPU with compute capability 100a)." << std::endl;
+    std::cerr << "This task requires a Blackwell sm_100 GPU (B200)." << std::endl;
     return 0;
   }
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  int trials = kh_trials();
+  bool const keep_going = std::getenv("KH_KEEP_GOING") != nullptr;   // development aid
+  bool failed = false;
 
-  //
-  // Parse options
-  //
-
-  Options options;
-  options.parse(argc, args);
-
-  if (options.help) {
-    options.print_usage(std::cout) << std::endl;
-    return 0;
-  }
-
-  struct TestConfig {
-    const char* label;
-    int m, n, k;
+  // Llama-3-70B linear layers on one B200 (hidden 8192, 64 q / 8 kv heads x 128 -> fused QKV
+  // 10240, FFN 28672 -> fused gate+up 57344, vocab 128256); M = tokens: an 8K-token prefill
+  // chunk or one decode step of 128 sequences.
+  std::vector<Shape3> shapes = {
+      {"decode_qkv",        128,  10240,  8192, 2},
+      {"decode_mlp_down",   128,   8192, 28672, 3},
+      {"decode_lm_head",    128, 128256,  8192, 2},
+      {"prefill_qkv",      8192,  10240,  8192, 1},
+      {"prefill_o_proj",   8192,   8192,  8192, 1},
+      {"prefill_mlp_up",   8192,  57344,  8192, 1},
+      {"prefill_mlp_down", 8192,   8192, 28672, 1},
   };
 
-  // Check if user explicitly passed size
-  bool explicit_size = false;
+#ifdef KH_SWEEP
+  // Development aid: time every reference configuration on every shape.
+  for (auto s : shapes) {
+    for (int cfg = 0; cfg < 5; ++cfg) {
+      s.cfg = cfg;
+      std::printf("\n=== %s cfg=%d: M=%d, N=%d, K=%d ===\n", s.label, cfg, s.M, s.N, s.K);
+      run_case(s, 1.f, 0.f, true, 10);
+    }
+  }
+  return 0;
+#endif
+
+  if (argc >= 4) {   // ./test M N K : single custom shape
+    Shape3 s{"custom", atoi(argv[1]), atoi(argv[2]), atoi(argv[3]), atoi(argv[1]) <= 512 ? 2 : 1};
+    std::printf("\n=== custom: M=%d, N=%d, K=%d ===\n", s.M, s.N, s.K);
+    if (!run_case(s, 1.f, 0.f, true, trials)) { std::cout << "Incorrect" << std::endl; return 1; }
+    std::cout << "Passed" << std::endl;
+    return 0;
+  }
+
+  // alpha / beta handling (correctness only): C = 0.75 * A*B + 0.5 * C
   {
-    cutlass::CommandLine cmd(argc, args);
-    explicit_size = cmd.check_cmd_line_flag("m") ||
-                    cmd.check_cmd_line_flag("n") ||
-                    cmd.check_cmd_line_flag("k");
+    Shape3 s{"alpha_beta", 384, 1280, 2048, 2};
+    // "---" header, not "===": the runner pairs each "=== name ===" block with timing lines.
+    std::printf("\n--- %s: M=%d, N=%d, K=%d (alpha=0.75, beta=0.5, correctness only) ---\n",
+                s.label, s.M, s.N, s.K);
+    if (!run_case(s, 0.75f, 0.5f, false, 0)) { std::cout << "Incorrect" << std::endl; if (!keep_going) return 1; failed = true; }
+    else std::cout << "Passed" << std::endl;
   }
 
-  std::vector<TestConfig> configs;
-  if (explicit_size) {
-    configs.push_back({"custom", options.m, options.n, options.k});
-  } else {
-    configs = {
-      {"small",   1024, 1024, 1024},
-      {"medium",  4096, 4096, 4096},
-      {"large",   8192, 8192, 8192},
-    };
+  for (auto const &s : shapes) {
+    std::printf("\n=== %s: M=%d, N=%d, K=%d ===\n", s.label, s.M, s.N, s.K);
+    if (!run_case(s, 1.f, 0.f, true, trials)) { std::cout << "Incorrect" << std::endl; if (!keep_going) return 1; failed = true; }
+    else std::cout << "Passed" << std::endl;
   }
-
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  for (const auto& cfg : configs) {
-    fprintf(stdout, "\n=== %s: M=%d, N=%d, K=%d ===\n", cfg.label, cfg.m, cfg.n, cfg.k);
-
-    options.m = cfg.m;
-    options.n = cfg.n;
-    options.k = cfg.k;
-
-    int ret = run<Gemm>(options);
-    if (ret != 0) return ret;
-  }
-#endif // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-
+  return failed ? 1 : 0;
+#endif
   return 0;
 }
-
-/////////////////////////////////////////////////////////////////////////////////////////////////

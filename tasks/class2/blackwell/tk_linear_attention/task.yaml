@@ -3,7 +3,10 @@ task_id: class2/blackwell/tk_linear_attention
 name: tk_linear_attention
 task_class: 2
 domain: ml
-tags: []
+tags:
+- linear-attention
+- bf16
+- thunderkittens
 hardware:
   min_sm: 100
   tested_sms:
@@ -12,7 +15,7 @@ hardware:
 runner:
   backend: class1_make
   workdir: tasks/class2/blackwell/tk_linear_attention
-  timeout_sec: 180
+  timeout_sec: 600
   env:
     KH_BENCHMARK: '20'
   solution_file: solution.h
@@ -41,6 +44,9 @@ source:
   commit: ''
   license: Apache-2.0
 anti_cheat:
+  # Static check: only blatant cheating (wrapping the reference implementation). Calls to cuBLAS /
+  # cuDNN / CUTLASS kernel templates are blocked by the global rules; numeric precision is enforced by
+  # the run-time tolerance, not by patterns.
   blocked_patterns:
   - '#include\s*[<\"]kittens'
   - 'kittens::'

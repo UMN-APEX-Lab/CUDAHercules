@@ -1,43 +1,97 @@
-FP8 Multi-Query Attention Scoring (from DeepGEMM / DeepSeek)
+# Task: deepgemm_mqa_logits
 
 ## Target Hardware
-NVIDIA Blackwell GPU (SM100/SM120).
+NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a` and is skipped on other GPUs.
 
+FP8 multi-query-attention scoring: the "lightning indexer" logits of DeepSeek-V3.2 (64 indexer heads of dimension 128 against a single shared key per token), compared against DeepGEMM's SM100 `fp8_fp4_mqa_logits` kernel.
 
-Custom attention scoring kernel for MQA layers. Computes:
-  logits[q, kv] = sum_h( relu(Q[q,h,:] @ K[kv,:]^T) * weights[q,h] ) * kv_scales[kv]
+This is NOT softmax attention: every (query, key) pair gets one scalar logit
 
-This is NOT standard softmax attention — it uses ReLU activation and
-per-head weight reduction to produce a scalar logit per (query, key) pair.
+    logits[i, j] = sum_h  w[i, h] * relu( dot_mx(Q[i, h, :], KV[ks[i] + j, :]) )          0 <= j < ke[i] - ks[i]
 
-Inputs:
-  q:        FP8 E4M3 tensor, shape (seq_len, num_heads, head_dim)
-  kv:       FP8 E4M3 tensor, shape (seq_len_kv, head_dim)
-  kv_scales: float32, shape (seq_len_kv) — per-token KV scale factors
-  weights:  float32, shape (seq_len, num_heads) — per-head attention weights
-  cu_seq_len_k_start: int32, shape (seq_len) — start of KV range per query
-  cu_seq_len_k_end:   int32, shape (seq_len) — end of KV range per query
-  num_heads: 64 (fixed)
-  head_dim:  128 (fixed)
+where `dot_mx` is the MXFP8 block-scaled dot product (E4M3 values, one UE8M0 scale per block of 32 head-dim elements):
 
-Outputs:
-  logits:   float32, shape (seq_len, seq_len_kv)
-            Positions outside [ks[q], ke[q]) are -inf.
+    dot_mx(q, k) = sum_{b=0..3}  2^(sfq[b] - 127) * 2^(sfk[b] - 127) * sum_{d in [32b, 32b+32)} q[d] * k[d]
 
-Test sizes:
-  (seq_len=1024, seq_len_kv=4096)
-  (seq_len=2048, seq_len_kv=4096)
-  (seq_len=2048, seq_len_kv=8192)
+## Function Signature
 
-Function signature for your solution (in solution.h):
-  void solution_mqa_logits(
-      const __nv_fp8_e4m3* q,        // [seq_len, num_heads, head_dim]
-      const __nv_fp8_e4m3* kv,       // [seq_len_kv, head_dim]
-      const float* kv_scales,         // [seq_len_kv]
-      const float* weights,           // [seq_len, num_heads]
-      const int* cu_seq_len_k_start,  // [seq_len]
-      const int* cu_seq_len_k_end,    // [seq_len]
-      float* logits,                  // [seq_len, seq_len_kv]
-      int seq_len, int seq_len_kv,
-      int num_heads, int head_dim,
-      cudaStream_t stream);
+Implement in `solution.h`:
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_fp8.h>
+#include <cuda_bf16.h>
+#include <stdint.h>
+
+cudaError_t solution_mqa_logits(
+    const __nv_fp8_e4m3 *q,        // [seq_len, num_heads, head_dim]
+    const uint32_t *q_sf,          // [seq_len, num_heads]      4 packed UE8M0 scales
+    const __nv_fp8_e4m3 *kv,       // [seq_len_kv, head_dim]
+    const uint32_t *kv_sf,         // [seq_len_kv]              4 packed UE8M0 scales
+    const __nv_bfloat16 *weights,  // [seq_len, num_heads], row stride weights_stride (elements)
+    int weights_stride,
+    const int *cu_seq_len_k_start, // [seq_len]
+    const int *cu_seq_len_k_end,   // [seq_len]
+    __nv_bfloat16 *logits,         // [seq_len, logits_stride], compressed (see below)
+    int logits_stride,
+    int seq_len, int seq_len_kv, int num_heads, int head_dim,
+    cudaStream_t stream);
+```
+
+`num_heads` = 64 and `head_dim` = 128 in all tests.
+
+## Data Layout
+
+- `q`: row-major `[seq_len, num_heads, head_dim]` E4M3, element (i, h, d) at `(i * num_heads + h) * head_dim + d`.
+- `q_sf`: `[seq_len, num_heads]` uint32. Byte b (bits 8b..8b+7, little endian) is the UE8M0 exponent of the scale of q[i, h, 32b .. 32b+31]: scale = 2^(byte - 127). Test values are in [124, 131] (scales 2^-3 .. 2^4).
+- `kv`: row-major `[seq_len_kv, head_dim]` E4M3 (one key head shared by all query heads); `kv_sf`: `[seq_len_kv]` uint32, same byte convention (the array is padded to a multiple of 4 entries).
+- `weights`: BF16 `[seq_len, num_heads]`, row stride `weights_stride` = 64 elements.
+- `cu_seq_len_k_start/end`: row i attends to the KV tokens `[ks[i], ke[i])`, `0 <= ks[i] <= ke[i] <= seq_len_kv`. An empty range is allowed.
+- `logits`: BF16, row stride `logits_stride` (a multiple of 512, at least the longest range), `align(seq_len, 2)` rows allocated. **Compressed layout**: `logits[i * logits_stride + j]` holds the logit of KV token `ks[i] + j`, for `0 <= j < ke[i] - ks[i]`.
+
+Only that region is defined and checked. Everything else in the buffer (the rest of each row, padding) is "don't care": it is NaN on entry and never looked at, so do not rely on it and do not spend time on it. All pointers are device pointers, 256-byte aligned.
+
+## Build & Test
+
+```bash
+make test        # requires solution.h in the task directory
+./test           # runs every case below
+./test S SKV pattern(0 causal tail | 1 context-parallel zigzag | 2 packed documents)    # one custom case (SKV a multiple of 128)
+```
+
+The shipped `solution.h` is a simple correct baseline; you may replace it entirely.
+
+## Problem Sizes
+
+DeepSeek-V3.2 prefill: a chunk of S query tokens scores the SKV cached key tokens. Q and KV values are uniform random in [-1, 1) rounded to E4M3, the scale-factor exponents are random in 124..131 (every byte), and the weights are uniform in [-1, 1) (BF16).
+
+| label                 | S    | SKV   | key ranges [ks, ke)                                                         | (q,kv) pairs |
+|-----------------------|------|-------|-----------------------------------------------------------------------------|--------------|
+| chunk4k_kv16k_causal  | 4096 | 16384 | ks = 0, ke = SKV - S + i + 1 (last S tokens of the sequence, causal)        | 58.7 M  |
+| chunk4k_kv32k_causal  | 4096 | 32768 | same                                                                        | 126 M   |
+| cp8k_kv32k_zigzag     | 8192 | 32768 | context-parallel zigzag layout (two chunks of S/2 out of a 4*S sequence)    | 134 M   |
+| chunk8k_kv64k_causal  | 8192 | 65536 | ks = 0, ke = SKV - S + i + 1                                                | 503 M   |
+| packed_docs_8k        | 8192 | 8192  | random documents of 600 - 3000 tokens packed in a row: ks = document start, ke = i + 1 (ks != 0) | 7.1 M |
+
+## Correctness
+
+The reference and your function read the same inputs and write to separate buffers that are pre-filled with NaN. After your function returns, **every** element of the defined region (see above) is compared with the reference:
+
+- every element must be finite (NaN / Inf fail, so unwritten elements fail);
+- `|x - ref| <= 0.4 * RMS(ref) + 0.03 * |ref|` for every element, and the relative Frobenius error `||x - ref|| / ||ref|| <= 1.5e-2` (RMS and norms over the defined region).
+
+The reference itself accumulates the 64 heads in BF16 arithmetic, so the tolerance is set relative to it.
+
+**The inputs change on every call.** Q, its MX scale factors `q_sf` and the weights are regenerated with a new seed before every timed call of the reference and of your function (outside the timed region); KV, `kv_sf`, `cu_seq_len_k_start/end` stay fixed. The first correctness check and the final re-check use their own seeds, and the final re-check runs on fresh inputs for every case, with the reference recomputed and your output re-poisoned. Outputs and input-dependent intermediates must therefore be recomputed on every call; caching results across calls produces wrong answers.
+
+## Performance
+
+For each case the harness times the reference and your function with CUDA events (the L2 cache is flushed before every trial; the output is re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean of the speedups over the five cases.
+
+Your function is timed as a whole call, including host-side launch setup. One-time setup (e.g. `cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics.
+
+## Rules
+
+- Solutions must be your own kernels: no cuBLAS / cuDNN, no CUTLASS device / kernel / collective templates, and in particular no use of DeepGEMM (`deep_gemm` headers / namespaces, its SM100 MQA-logits kernel and scheduler) -- including it is rejected. CuTe and low-level building blocks (barriers, pipelines, layouts, `tcgen05` PTX, TMA) are allowed.
+- Do not re-quantize Q / KV to narrower formats (FP4 / FP6 / INT8), and do not accumulate in FP16.

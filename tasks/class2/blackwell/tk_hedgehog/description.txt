@@ -1,17 +1,15 @@
 # Task: tk_hedgehog
 
 ## Target Hardware
-NVIDIA Blackwell GPU (SM100).
+NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a` and is skipped on other GPUs.
 
-
-Hedgehog Attention on B200, matching ThunderKittens performance.
-
-Hybrid attention combining sliding window (softmax) + linear attention with learned feature maps.
-D=128 (head dim), hardcoded.
+Hedgehog attention, forward pass: a block sliding-window softmax-style attention plus a causal linear
+attention over the older tokens with learned softmax feature maps, jointly normalised. Compared against a
+ThunderKittens-style tensor-core reference.
 
 ## Function Signature
 
-Implement in solution.h:
+Implement the following function in `solution.h`:
 
 ```cuda
 #pragma once
@@ -25,27 +23,95 @@ void HedgehogAttention(
     int B, int H, int N);
 ```
 
+Everything except O is an input (device pointers); O is the output you must fully write. The call is
+asynchronous (no `cudaDeviceSynchronize` needed); launch on the default stream.
+
 ## Operation
 
-For each position, combines:
-1. Sliding window attention: standard softmax attention on recent context (weighted by betas)
-2. Linear attention: uses learned feature maps Q_map/K_map with KV state (weighted by alphas)
+Head dimension 128 (q, k, v, o), feature maps of width 2 x 64 = 128, block size 64. N is a multiple of 64.
+For every batch b and head h (M_q = Q_map[h], M_k = K_map[h], both [128, 64]; alpha = alphas[h],
+beta = betas[h]; blk(n) = floor(n / 64)):
 
-Where:
-- Q, K, V: [B, H, N, 128] bf16
-- O: [B, H, N, 128] bf16 output
-- Q_map: [H, 128, 64] bf16 learned query feature map
-- K_map: [H, 128, 64] bf16 learned key feature map
-- alphas: [H] float, linear attention weight per head
-- betas: [H] float, sliding window weight per head
+    phi_q(n) = [softmax(Q[n] M_q), softmax(-Q[n] M_q)]      (128 values; softmax over the 64 columns)
+    phi_k(m) = [softmax(K[m] M_k), softmax(-K[m] M_k)]
+
+    window   W(n) = { m <= n : blk(m) >= blk(n) - 1 }       (current block, causal, and the whole previous block)
+    linear   L(n) = { m : blk(m) <= blk(n) - 2 }            (all older blocks)
+
+    w[n,m] = beta  * exp((Q[n].K[m] - max_{m' in W(n)} Q[n].K[m']) / sqrt(128))     for m in W(n)
+    w[n,m] = alpha * (phi_q(n) . phi_k(m))                                          for m in L(n)
+    O[n,:] = sum_m w[n,m] V[m,:] / sum_m w[n,m]
+
+(The max shifts only the window weights, not the linear ones; there is no epsilon and no clamping.)
+The linear part may equivalently be computed with running sums sum phi_k^T v (128 x 128) and
+sum phi_k (128) over the blocks that have left the window.
+
+## Data Types and Precision
+
+Q, K, V, O, Q_map, K_map are BF16; alphas, betas are FP32. Products must be accumulated in FP32; exp,
+softmax and the normalisation in FP32. Lower-precision arithmetic (FP8, FP6, FP4, INT8, FP16
+accumulation, including tensor-core paths that use them) is not allowed even if it were to pass the
+tolerance.
+
+## Memory Layout
+
+Q, K, V, O: `[B, H, N, 128]` row-major contiguous. Q_map, K_map: `[H, 128, 64]` (row = input feature,
+column = map output). alphas, betas: `[H]`. All pointers are device pointers, 256-byte aligned.
+O holds NaN on entry.
 
 ## Build & Test
 
 ```bash
-conda activate attn
-python gentests.py randn
-make test
-./test randn.txt
+make test        # builds ./test (needs solution.h in the task directory)
+./test           # all cases below
+./test B H N     # one custom shape (N multiple of 64), timed
 ```
 
-Requires B200 GPU (SM100a). ThunderKittens headers on include path.
+## Problem Sizes
+
+Llama-3-8B linearised with Hedgehog (32 heads of dimension 128), 4K-16K-token sequences.
+
+| label    | B | H  | N     |
+|----------|---|----|-------|
+| b8_n4k   | 8 | 32 | 4096  |
+| b8_n8k   | 8 | 32 | 8192  |
+| b4_n16k  | 4 | 32 | 16384 |
+
+Two small correctness-only cases run first and are not timed: (B,H,N) = (3,5,1344) and (2,8,128).
+
+## Inputs
+
+Generated on the device with full-mantissa uniform random values: Q, K in [-2, 2), V in [-1, 1),
+Q_map, K_map in [-0.25, 0.25), alphas[h] random in [0.5, 2), betas[h] random in [0.25, 1).
+
+**The inputs change on every call.** Q, K and V are regenerated with a new random seed before every
+timed call of both the reference and your function (outside the timed region), and once more before the
+final re-check, which runs for every case on fresh inputs. Q_map, K_map, alphas and betas are model
+weights and stay fixed across calls. Outputs and every input-dependent intermediate must therefore be
+recomputed on each call; a solution that caches or memoises its result fails the re-check.
+
+## Correctness
+
+The reference and your function write to separate buffers pre-filled with NaN. After your function
+returns, **every** element of O is compared with the reference output:
+
+- every element must be finite (NaN / Inf fail, so unwritten elements fail);
+- `|O - ref| <= 0.2 * RMS(ref) + 0.03 * |ref|` for every element;
+- the relative Frobenius error `||O - ref|| / ||ref||` must be `<= 8e-3`.
+
+## Performance
+
+The reference and your function are timed with CUDA events (3 warm-ups, `KH_BENCHMARK` trials, default
+20). Before every trial the inputs are regenerated, the L2 cache is flushed and O is re-poisoned, all
+outside the timed region. The harness reports `Speedup = ref_min / kernel_min` per case; the score is
+the geometric mean of the speedups over the 3 timed cases.
+
+Your function is timed as a whole call. One-time setup (e.g. `cudaFuncSetAttribute`, scratch
+allocation) may be cached in function-local statics. The shipped `solution.h` is a simple correct
+baseline that you may replace entirely.
+
+## Rules
+
+- Solutions must be your own kernels: no cuBLAS / cuDNN, no ThunderKittens (`kittens::`, headers) and
+  no use of the harness or reference code. CuTe / CUTLASS low-level building blocks, `mma` /
+  `tcgen05` PTX and TMA are allowed.

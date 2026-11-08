@@ -1,500 +1,435 @@
-/*
-    This kernel is a hedgehog modified for speed. It implements:
-    - Fused MLPs to produce the Q, K featurizations
-    - Fused block sliding window attention
-    - Block linear attention
-    - Normalization across both sliding window attention and linear attention components
-    - K, KV state writeouts
-*/
-#include "kittens.cuh"
-#include <tuple>
+// Task tk_hedgehog: Hedgehog attention (sliding window softmax + learned feature-map linear attention) on B200.
+//
+// Reference: ThunderKittens-style chunked kernel (64-token chunks, TMA double buffering, warp-level
+// tensor-core MMA so that it runs on sm_100a). Solution under test (KH_TEST_SOLUTION): solution.h
+//   void HedgehogAttention(Q, K, V, O, Q_map, K_map, alphas, betas, B, H, N)
+// Inputs are generated on the device; reference and solution write to different, NaN-poisoned
+// buffers; every output element is compared.
 
-#ifdef TORCH_COMPILE
-#define TK_COMPILE_HEDGEHOG
+#ifdef KH_TEST_SOLUTION
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include "solution.h"   // must stay before the reference code / kh_verify.h
 #endif
 
-static constexpr int NUM_WORKERS = (8);
-static constexpr int NUM_THREADS = (NUM_WORKERS*kittens::WARP_THREADS);
-static constexpr int NUM_WARPGROUPS = (NUM_WORKERS/kittens::WARPGROUP_WARPS);
+#include "kittens.cuh"
 
+// Reference kernel: Hedgehog attention (block sliding window softmax + learned-feature-map linear attention,
+// jointly normalised), ThunderKittens-style, warp-level tensor-core MMA so that it runs on sm_100a.
+// One CTA per (batch, head); 64-token chunks; 8 warps = 4 row slices x 2 output-column halves.
+namespace khref_hh {
 using namespace kittens;
 
-template<ducks::sv::all SV, ducks::st::all ST>
-__device__ inline void cumulative_add(SV &dst, const ST &src) {
-    // this is called along a warpgroup
-    static_assert(ST::cols <= 128);
-    static_assert(ST::cols == SV::length);
-    int lane = threadIdx.x % 128;
-    if(lane < ST::cols) {
-        float f = dst[lane];
-        // acc equal to the last row of dst
-        for (auto i = 0; i < ST::rows; i++) {
-            f += __bfloat162float(src[{i, lane}]);
-        }
-        dst[lane] = f;
-    }
-}
+constexpr int CHUNK = 64;
+constexpr int HD = 128;     // head dim (q, k, v, o)
+constexpr int NF = 64;      // feature-map width per sign (feature dim = 2 * NF = 128)
+constexpr int NWARPS = 8;
+constexpr int NTHREADS = NWARPS * 32;
 
-template<ducks::rt::all RT>
-__device__ inline void softmax_featuremap_inplace(RT &tile) {
-    col_vec<RT> max_vec, sum_vec;
-    warp::row_max(max_vec, tile);
-    warp::sub_row(tile, tile, max_vec); // now in range (-infty, 0) for numerical stability
-    warp::exp2(tile, tile);
-    warp::row_sum(sum_vec, tile);
-    warp::div_row(tile, tile, sum_vec);
-}
+using tile_t = st_bf<CHUNK, HD>;
+using map_t = st_bf<HD, NF>;
+using tile_gl = gl<bf16, -1, -1, -1, -1, tile_t>;
+using map_gl = gl<bf16, -1, -1, -1, -1, map_t>;
+using kv_t = st_bf<2 * NF, HD>;
 
-#define CHUNK_SIZE 64
-#define ATTN_D 128
-#define ATTN_F 128
-#define HALF_ATTN_F 64
-
-struct hedgehog_globals { 
-    // shapes    
-    using q_tile = st_bf<CHUNK_SIZE, ATTN_F>;
-    using k_tile = st_bf<CHUNK_SIZE, ATTN_F>;
-    using v_tile = st_bf<CHUNK_SIZE, ATTN_D>;
-    using o_tile = st_bf<CHUNK_SIZE, ATTN_D>;
-    using kv_state_tile = st_fl<ATTN_F, ATTN_D>;
-    using k_state_vec = sv_fl<ATTN_D>;
-    using qk_map_tile = st_bf<ATTN_D, HALF_ATTN_F>;
-
-    // global layouts
-    using q_gl = gl<bf16,  -1, -1, -1, -1, q_tile>;
-    using k_gl = gl<bf16,  -1, -1, -1, -1, k_tile>;
-    using v_gl = gl<bf16,  -1, -1, -1, -1, v_tile>;
-    using qmap_gl = gl<bf16,  -1, -1, -1, -1, qk_map_tile>;
-    using kmap_gl = gl<bf16,  -1, -1, -1, -1, qk_map_tile>;
-    using k_state_gl = gl<float, -1, -1, -1, -1, k_state_vec>;
-    using kv_state_gl = gl<float, -1, -1, -1, -1, kv_state_tile>;
-    using o_gl = gl<bf16,  -1, -1, -1, -1, o_tile>;
-
-    // pointers
-    q_gl q;
-    k_gl k;
-    v_gl v;
-    qmap_gl qmap;
-    kmap_gl kmap;
-    k_state_gl k_state;
-    kv_state_gl kv_state;
-    o_gl o;
-
-    float *alphas; 
-    float *betas;
+struct globals {
+  tile_gl q, k, v, o;
+  map_gl qmap, kmap;
+  const float *alphas, *betas;   // [H]
+  int n;
 };
 
+constexpr size_t SMEM_BYTES = (2 + 3 + 3 + 1) * sizeof(tile_t) + 2 * sizeof(map_t) + sizeof(kv_t) + 1024 * 2 + 1024;
 
-// should be launched with a grid of size (HEADS, BATCH) and blocks of 256 threads.
-__global__ __launch_bounds__(NUM_THREADS, 1)
-void hedgehog_linear_attention_smd (
-    const __grid_constant__ hedgehog_globals g, int N
-)  { // alpha is for linear component, beta is for sliding window component. Array, per head.
+template <ducks::rt::all RT>
+__device__ __forceinline__ void softmax_rows(RT &t) {   // rows are already scaled by log2(e)
+  typename RT::col_vec mx, sm;
+  warp::row_max(mx, t);
+  warp::sub_row(t, t, mx);
+  warp::exp2(t, t);
+  warp::row_sum(sm, t);
+  warp::div_row(t, t, sm);
+}
 
-    extern __shared__ int __shm[]; // this is the CUDA shared memory
-    tma_swizzle_allocator al((int*)&__shm[0]);
+__global__ __launch_bounds__(NTHREADS, 1) void hh_kernel(const __grid_constant__ globals g) {
+  extern __shared__ alignment_dummy __shm[];
+  tma_swizzle_allocator al((int *)&__shm[0]);
+  tile_t(&q_s)[2] = al.allocate<tile_t, 2>();
+  tile_t(&k_s)[3] = al.allocate<tile_t, 3>();
+  tile_t(&v_s)[3] = al.allocate<tile_t, 3>();
+  tile_t &phik_s = al.allocate<tile_t>();          // featurised previous K block (64 tokens x 128 features)
+  map_t &qmap_s = al.allocate<map_t>();
+  map_t &kmap_s = al.allocate<map_t>();
+  kv_t &kv_s = al.allocate<kv_t>();                // KV state, bf16 copy (128 features x 128 v)
+  __shared__ float ksum_s[2 * NF];                 // sum of phi(k) over the linear region (fp32)
+  __shared__ semaphore bar;
 
-    const int batch = blockIdx.y;
-    const int head  = blockIdx.x;
-    // const int batch_head_id = batch*gridDim.x + head;
+  const int batch = blockIdx.y, head = blockIdx.x;
+  const int w = warpid();
+  const int rr = w & 3, c = w >> 2;
+  const float alpha = g.alphas[head], beta = g.betas[head];
+  const int nblk = g.n / CHUNK;
+  constexpr float SCALE = 0.08838834764831845f * 1.4426950408889634f;   // 1/sqrt(128) * log2(e)
+  constexpr float LOG2E = 1.4426950408889634f;
 
-    float alpha = g.alphas[head];
-    float beta  = g.betas [head];
+  if (threadIdx.x == 0) {
+    init_semaphore(bar, 0, 1);
+    tma::expect_bytes(bar, 3 * sizeof(tile_t) + 2 * sizeof(map_t));
+    tma::load_async(qmap_s, g.qmap, {0, head, 0, 0}, bar);
+    tma::load_async(kmap_s, g.kmap, {0, head, 0, 0}, bar);
+    tma::load_async(q_s[0], g.q, {batch, head, 0, 0}, bar);
+    tma::load_async(k_s[0], g.k, {batch, head, 0, 0}, bar);
+    tma::load_async(v_s[0], g.v, {batch, head, 0, 0}, bar);
+  }
+  for (int i = threadIdx.x; i < 2 * NF * HD; i += NTHREADS) kv_s.data[i] = __float2bfloat16(0.f);
+  if (threadIdx.x < 2 * NF) ksum_s[threadIdx.x] = 0.f;
+  rt_fl<16, 32> kv[4];   // KV state rows [16w, 16w+16): feature rows x 128 value columns
+#pragma unroll
+  for (int j = 0; j < 4; j++) warp::zero(kv[j]);
+  __syncthreads();
 
-    // smem
-    using q_tile = st_bf<CHUNK_SIZE, ATTN_F>;
-    using k_tile = st_bf<CHUNK_SIZE, ATTN_F>;
-    using v_tile = st_bf<CHUNK_SIZE, ATTN_D>;
-    using o_tile = st_bf<CHUNK_SIZE, ATTN_D>;
-    using kv_state_tile = st_fl<ATTN_F, ATTN_D>;
-    using k_state_vec = sv_fl<ATTN_D>;
-    using qk_map_tile = st_bf<ATTN_D, HALF_ATTN_F>;
-    q_tile (&q_smem)[2] = al.allocate<q_tile, 2>(); // 32k, (tic/toc)*16k
-    k_tile (&k_smem)[3] = al.allocate<k_tile, 3>(); // 48k, (3-ring)*(64x128)
-    v_tile (&v_smem)[3] = al.allocate<v_tile, 3>(); // 48k, (3-ring)*(64x128)
-    o_tile (&o_smem)    = al.allocate<o_tile>   (); // 16k
-    qk_map_tile (&qf_map) = al.allocate<qk_map_tile>(); // 16k, for fusing featuremap computation
-    qk_map_tile (&kf_map) = al.allocate<qk_map_tile>(); // 16k, for fusing featuremap computation
-
-    // norm stuff
-    st_bf<CHUNK_SIZE, ATTN_F> (&kv_smem)[2] = al.allocate<st_bf<CHUNK_SIZE, ATTN_F>, 2>(); // 32k, 64x128 featurized 
-    row_vec<st_fl<CHUNK_SIZE,4*16>> (&cumsum_k_smem)[2] = al.allocate<row_vec<st_fl<CHUNK_SIZE,4*16>>, 2>(); // smol
-    col_vec<st_fl<CHUNK_SIZE,4*16>> (&norm_exchange)[2] = al.allocate<col_vec<st_fl<CHUNK_SIZE,4*16>>, 2>(); // smol
-    st_bf<CHUNK_SIZE, 4*16> (*k_scratch_smem)     = reinterpret_cast<st_bf<CHUNK_SIZE, 4*16>*>(&kv_smem[0].data[0]);
-
-    int warpid = kittens::warpid();
-    int warpgroupid = warpid/4;
-    int blocks = N / (q_tile::rows);
-
-    int tic = 0, toc = 1;
-    int ring_id = 0;
-
-    __shared__ semaphore qkv_semaphore;
-    if (warpid == 0 && laneid() == 0) {
-        init_semaphore(qkv_semaphore, 0, 1);
-        tma::expect_bytes(qkv_semaphore, 
-            size_bytes<typeof(q_smem[0])> + 
-            size_bytes<typeof(k_smem[0])> + 
-            size_bytes<typeof(v_smem[0])> +
-            // we need qk maps to be loaded on this first iter, too.
-            size_bytes<typeof(qf_map)> +
-            size_bytes<typeof(kf_map)>
-        );
-        // first thing we need to do is load the QK map
-        tma::load_async(qf_map, g.qmap, {0, head, 0, 0}, qkv_semaphore); // load the right head
-        tma::load_async(kf_map, g.kmap, {0, head, 0, 0}, qkv_semaphore);
-        // now we also load the first data we need
-        tma::load_async(q_smem[tic],  g.q,      {batch, head, 0, 0}, qkv_semaphore);
-        tma::load_async(k_smem[ring_id+1], g.k, {batch, head, 0, 0}, qkv_semaphore);
-        tma::load_async(v_smem[ring_id+1], g.v, {batch, head, 0, 0}, qkv_semaphore);
+  int tic = 0, cur = 0;   // cur = ring slot of K/V block `blk`
+  for (int blk = 0; blk < nblk; blk++, tic ^= 1, cur = (cur == 2 ? 0 : cur + 1)) {
+    const int prv = (cur == 0 ? 2 : cur - 1);
+    wait(bar, tic);
+    if (threadIdx.x == 0 && blk + 1 < nblk) {
+      tma::expect_bytes(bar, 3 * sizeof(tile_t));
+      tma::load_async(q_s[tic ^ 1], g.q, {batch, head, blk + 1, 0}, bar);
+      tma::load_async(k_s[(cur + 1) % 3], g.k, {batch, head, blk + 1, 0}, bar);
+      tma::load_async(v_s[(cur + 1) % 3], g.v, {batch, head, blk + 1, 0}, bar);
     }
 
-    rt_fl<1*16, 8*16> local_kv; // this is going to be split across the two warpgroups involved.
-
-    warp::zero(local_kv);
-    warpgroup::zero(v_smem[ring_id]);
-    warpgroup::zero(cumsum_k_smem[warpgroupid]);
-
-    __syncthreads();
-
-    for (int block = 0; block < blocks; block++, tic^=1, toc^=1, ring_id=(ring_id+1)%3) {
-
-        wait(qkv_semaphore, tic);  // ding! memory arrived
-        __syncthreads();
-
-        if (warpid == 0 && laneid() == 0 && block < blocks-1) {
-            tma::expect_bytes(qkv_semaphore,
-                size_bytes<typeof(q_smem[0])> + 
-                size_bytes<typeof(k_smem[0])> + 
-                size_bytes<typeof(v_smem[0])>
-            );
-            tma::load_async(q_smem[toc],           g.q, {batch, head, block+1, 0}, qkv_semaphore); 
-            tma::load_async(k_smem[(ring_id+2)%3], g.k, {batch, head, block+1, 0}, qkv_semaphore); 
-            tma::load_async(v_smem[(ring_id+2)%3], g.v, {batch, head, block+1, 0}, qkv_semaphore);
-        }
-        __syncthreads();
-
-        // ----- let's do sliding window first -----
-        // only warps 0-4 need to be involved in this
-
-        rt_fl<1*16, 8*16> sliding_o;
-        rt_fl<1*16, 4*16>::col_vec sliding_norm_vec;
-        warp::zero(sliding_o);
-        warp::zero(sliding_norm_vec);
-        if(warpgroupid == 0) {
-
-            // ******* sliding window attn ******* // 
-            rt_fl<1*16, 4*16> att_block[2];
-            rt_bf<1*16, 4*16> att_block_bf[2];
-            rt_fl<1*16, 4*16>::col_vec max_vec;
-
-            warp::neg_infty(max_vec); // zero registers for the Q chunk
-
-            for(int subtile = 0; subtile < 2; subtile++) {
-                if (block + subtile >= 1) { // ensure tile has been loaded by now.
-                    warpgroup::mm_ABt(att_block[subtile], q_smem[tic], k_smem[(ring_id+subtile)%3]);
-                    warpgroup::mma_async_wait();
-                }
-                else {
-                    warp::neg_infty(att_block[subtile]); // initial blocks must be zero
-                }
-            }
-            // make last block causal
-            #pragma unroll
-            for(int j = 0; j < 4; j++) {
-                auto &attn_subtile = reinterpret_cast<rt_fl<1*16,1*16>&>(att_block[1].tiles[0][j]);
-                if (j>warpid) warp::neg_infty(attn_subtile);
-                else if (j==warpid) warp::make_causal(attn_subtile, attn_subtile, kittens::base_types::constants<float>::neg_infty());
-            }
-            // now do the softmax. first we subtract max for numerical stability. then exp.
-            #pragma unroll
-            for(int subtile = 0; subtile < 2; subtile++) {
-                warp::mul(att_block[subtile], att_block[subtile], 0.08838834764 * 1.44269504089); // temperature adjustment, with lg(e) so we can use exp2
-                warp::row_max(max_vec, att_block[subtile], max_vec); // accumulate onto the max_vec
-            }
-            #pragma unroll
-            for(int subtile = 0; subtile < 2; subtile++) {
-                warp::sub_row(att_block[subtile], att_block[subtile], max_vec);
-                warp::exp2(att_block[subtile], att_block[subtile]);
-                warp::mul(att_block[subtile], att_block[subtile], beta);
-            }
-            // now we sum so that we can divide (normalize) later
-            #pragma unroll
-            for(int subtile = 0; subtile < 2; subtile++) {
-                warp::row_sum(sliding_norm_vec, att_block[subtile], sliding_norm_vec); // incorporates beta
-                warp::copy(att_block_bf[subtile], att_block[subtile]); // cast to bf16 for next matmul
-            }
-            for(int subtile = 0; subtile < 2; subtile++) {
-                warpgroup::mma_AB(sliding_o, att_block_bf[subtile], v_smem[(ring_id+subtile)%3]);
-            }
-            warpgroup::mma_async_wait();
-        }
-        __syncthreads();
-
-        rt_fl<1*16, 8*16> linear_o; // this is partitioned across the two warpgroups.
-        rt_fl<1*16, 4*16>::col_vec linear_norm_vec;
-        warp::zero(linear_norm_vec);
-        if(block == 0) {
-            warp::zero(linear_o);
-        }
-        else { // if not in at least the second block, no need for linear attention.
-            // ******* linear attn ******** // 
-
-            // matmul to generate linear_q before softmax
-            rt_fl<1*16, 4*16> linear_q;
-            rt_bf<1*16, 4*16> linear_q_bf;
-
-            warpgroup::mm_AB(linear_q, q_smem[tic], qf_map); // reset
-            warpgroup::mma_async_wait(); // q is now projected
-            if(warpgroupid) warp::mul(linear_q, linear_q, -1.44269504089f);
-            else            warp::mul(linear_q, linear_q,  1.44269504089f);
-            // now we need to run q through a local softmax to featurize
-            softmax_featuremap_inplace(linear_q);
-            warp::mul(linear_q, linear_q, alpha);
-            warp::copy(linear_q_bf, linear_q); // now to bf16
-
-            // copy the local KV cache into shared memory to shared memory and do matmul
-            warpgroup::store(kv_smem[warpgroupid], local_kv);
-            __syncthreads(); // this should probably be a cooperative group of just the 4 warps
-            warpgroup::mm_AB(linear_o, linear_q_bf, kv_smem[warpgroupid]);
-            warpgroup::mma_async_wait();
-
-            // next we need to go figure out the norm.
-            // first we load sum(k) from smem to registers.
-            row_vec<rt_bf<1*16,4*16>> cumsum_k_reg;
-            warp::load(cumsum_k_reg, cumsum_k_smem[warpgroupid]);
-            // now we can project this up into a register tile
-            // we're broadcasting along the column axis (filling all rows with the same value)
-            rt_bf<1*16,4*16> cumsum_k_reg_tile;
-            warp::broadcast_col(cumsum_k_reg_tile, cumsum_k_reg);
-            // next we matmul! this gives us a tile.
-            rt_fl<1*16,1*16> norm_tile;
-            warp::zero(norm_tile);
-            warp::mma_ABt(norm_tile, linear_q_bf, cumsum_k_reg_tile, norm_tile);
-            warp::row_max(linear_norm_vec, norm_tile); // technically any column slice would work but this is EZ
-            // ^ note this incorporates alpha since it was premultiplied onto linear_q!
-            
-            // now accumulate KV onto the matmul for the future.
-            rt_fl<1*16, 4*16> linear_k;
-
-            // matmul to generate linear_k before softmax
-            warpgroup::mm_AB(linear_k, k_smem[ring_id], kf_map); // reset
-            warpgroup::mma_async_wait(); // k is now projected
-            if(warpgroupid) warp::mul(linear_k, linear_k, -1.44269504089f);
-            else            warp::mul(linear_k, linear_k,  1.44269504089f);
-            // now we need to run q through a local softmax to featurize
-            softmax_featuremap_inplace(linear_k);
-
-            // copy the local K into shared memory & do matmul
-            warpgroup::store(k_scratch_smem[warpgroupid], linear_k); // screw it, this is now just a scratchpad.
-            __syncthreads();
-            cumulative_add(cumsum_k_smem[warpgroupid], k_scratch_smem[warpgroupid]);
-            warpgroup::mma_AtB(local_kv, k_scratch_smem[warpgroupid], v_smem[ring_id]);
-            warpgroup::mma_async_wait();
-        }
-        tma::store_async_wait();
-
-        // next step is to sum two norm vecs
-        if(warpgroupid == 1) {
-            warpgroup::store(o_smem, linear_o);
-            warpgroup::store(norm_exchange[0], linear_norm_vec);
-        }
-        else {
-            warp::add(sliding_norm_vec, sliding_norm_vec, linear_norm_vec);
-            warp::add(sliding_o, sliding_o, linear_o);
-        }
-        __syncthreads();
-        if(warpgroupid == 0) {
-            warpgroup::load(linear_o, o_smem);
-            warpgroup::load(linear_norm_vec, norm_exchange[0]);
-            warp::add(sliding_o, sliding_o, linear_o);
-            warp::add(sliding_norm_vec, sliding_norm_vec, linear_norm_vec);
-            warp::div_row(sliding_o, sliding_o, sliding_norm_vec); // this half is now normalized
-            warpgroup::store(o_smem, sliding_o);
-        }
-        __syncthreads();
-
-        if(warpid == 0 && laneid() == 0) {
-            tma::store_async(g.o, o_smem, {batch, head, block, 0});
-        }
+    // ---------------- sliding window (previous + current 64-token block, causal) ----------------
+    rt_fl<16, 64> S0, S1;
+    rt_fl<16, 64>::col_vec mx, den;
+    warp::zero(S1);
+#pragma unroll
+    for (int kk = 0; kk < HD / 32; kk++) {
+      rt_bf<16, 32> a;
+      rt_bf<64, 32> b;
+      warp::load(a, q_s[tic].template subtile<16, 32>({rr, kk}));
+      warp::load(b, k_s[cur].template subtile<64, 32>({0, kk}));
+      warp::mma_ABt(S1, a, b, S1);
     }
-    tma::store_async_wait();
+    if (blk >= 1) {
+      warp::zero(S0);
+#pragma unroll
+      for (int kk = 0; kk < HD / 32; kk++) {
+        rt_bf<16, 32> a;
+        rt_bf<64, 32> b;
+        warp::load(a, q_s[tic].template subtile<16, 32>({rr, kk}));
+        warp::load(b, k_s[prv].template subtile<64, 32>({0, kk}));
+        warp::mma_ABt(S0, a, b, S0);
+      }
+    } else {
+      warp::neg_infty(S0);
+    }
+    {
+      const int row0 = rr * 16;
+      warp::apply(S1, S1, [&](int row, int col, float val) { return col <= row0 + row ? val * SCALE : -INFINITY; });
+    }
+    warp::mul(S0, S0, SCALE);
+    warp::row_max(mx, S1);
+    warp::row_max(mx, S0, mx);
+    warp::sub_row(S0, S0, mx);
+    warp::sub_row(S1, S1, mx);
+    warp::exp2(S0, S0);
+    warp::exp2(S1, S1);
+    warp::mul(S0, S0, beta);
+    warp::mul(S1, S1, beta);
+    warp::row_sum(den, S1);
+    warp::row_sum(den, S0, den);
 
-    // Finally we want to write out the kv state and the k state
-    // reinterpret k state as a vector of length 128, to save a tma call
-    k_state_vec (&k_state_smem) = *reinterpret_cast<k_state_vec*>(&cumsum_k_smem[0].data[0]);
-    // store out kv state into smem.
-    kv_state_tile (&kv_state_smem) = reinterpret_cast<kv_state_tile&>(q_smem[0].data[0]); // we can overwrite early stuff, it's fine
-    // Each warpgroup stores its 64x128 portion of the KV state
-    auto kv_subtile = kv_state_smem.template subtile<64, 128>({warpgroupid, 0});
-    warpgroup::store(kv_subtile, local_kv);
-    __syncthreads();
-    // write out kv state
-    if(warpid == 0){
-        tma::store_async(g.kv_state, kv_state_smem, {batch, head, 0, 0});
-        tma::store_async(g.k_state, k_state_smem, {batch, head, 0, 0});
-        tma::store_commit_group();
+    rt_fl<16, 64> O;
+    warp::zero(O);
+    {
+      rt_bf<16, 64> P;
+      rt_bf<64, 64, ducks::rt_layout::col> vb;
+      warp::copy(P, S1);
+      warp::load(vb, v_s[cur].template subtile<64, 64>({0, c}));
+      warp::mma_AB(O, P, vb, O);
+      if (blk >= 1) {
+        warp::copy(P, S0);
+        warp::load(vb, v_s[prv].template subtile<64, 64>({0, c}));
+        warp::mma_AB(O, P, vb, O);
+      }
+    }
+
+    // ---------------- linear attention over blocks <= blk-2 with the learned feature map ----------------
+    if (blk >= 1) {
+      rt_fl<16, 64> z;
+      warp::zero(z);
+#pragma unroll
+      for (int kk = 0; kk < HD / 32; kk++) {
+        rt_bf<16, 32> a;
+        rt_bf<32, 64, ducks::rt_layout::col> b;
+        warp::load(a, q_s[tic].template subtile<16, 32>({rr, kk}));
+        warp::load(b, qmap_s.template subtile<32, 64>({kk, 0}));
+        warp::mma_AB(z, a, b, z);
+      }
+#pragma unroll
+      for (int sgn = 0; sgn < 2; sgn++) {   // sgn 0: softmax(z) features, sgn 1: softmax(-z) features
+        rt_fl<16, 64> phi;
+        warp::mul(phi, z, sgn == 0 ? LOG2E : -LOG2E);
+        softmax_rows(phi);
+        warp::mul(phi, phi, alpha);
+        // normaliser: den += phi . ksum (FP32)
+        {
+          rt_fl<16, 64> t;
+          warp::apply(t, phi, [&](int row, int col, float val) { return val * ksum_s[sgn * NF + col]; });
+          warp::row_sum(den, t, den);
+        }
+        rt_bf<16, 64> L;
+        warp::copy(L, phi);
+        rt_bf<64, 64, ducks::rt_layout::col> b;
+        warp::load(b, kv_s.template subtile<64, 64>({sgn, c}));
+        warp::mma_AB(O, L, b, O);
+      }
+    }
+    warp::div_row(O, O, den);
+    {
+      // direct store of the register tile (rows rr*16.., columns c*64..)
+      auto og = g.o;
+      warp::store(og, O, {batch, head, blk * 4 + rr, c});   // coordinates in units of the 16 x 64 register tile
+    }
+
+    // ---------------- featurise the previous K block and fold it into the state ----------------
+    if (blk >= 1) {
+      rt_fl<16, 64> z;
+      warp::zero(z);
+#pragma unroll
+      for (int kk = 0; kk < HD / 32; kk++) {
+        rt_bf<16, 32> a;
+        rt_bf<32, 64, ducks::rt_layout::col> b;
+        warp::load(a, k_s[prv].template subtile<16, 32>({rr, kk}));
+        warp::load(b, kmap_s.template subtile<32, 64>({kk, 0}));
+        warp::mma_AB(z, a, b, z);
+      }
+      warp::mul(z, z, c == 0 ? LOG2E : -LOG2E);
+      softmax_rows(z);
+      { auto sub = phik_s.template subtile<16, 64>({rr, c}); warp::store(sub, z); }
+    }
+    __syncthreads();   // phi(K) complete; everyone is done reading kv_s / ksum_s
+    if (blk >= 1) {
+      if (threadIdx.x < 2 * NF) {
+        float s = 0.f;
+#pragma unroll 8
+        for (int m = 0; m < CHUNK; m++) s += __bfloat162float(phik_s[{m, int(threadIdx.x)}]);
+        ksum_s[threadIdx.x] += s;
+      }
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        rt_bf<64, 16, ducks::rt_layout::col> a;
+        rt_bf<64, 32, ducks::rt_layout::col> b;
+        warp::load(a, phik_s.template subtile<64, 16>({0, w}));
+        warp::load(b, v_s[prv].template subtile<64, 32>({0, j}));
+        warp::mma_AtB(kv[j], a, b, kv[j]);
+      }
+#pragma unroll
+      for (int j = 0; j < 4; j++) { auto sub = kv_s.template subtile<16, 32>({w, j}); warp::store(sub, kv[j]); }
     }
     __syncthreads();
-    tma::store_async_wait();
+  }
 }
 
-hedgehog_globals hedgehog_init(
-    bf16 *d_q, bf16 *d_k, bf16 *d_v, bf16 *d_o,
-    bf16 *d_qmap, bf16 *d_kmap,
-    float *d_k_state, float *d_kv_state,
-    float *d_alphas, float *d_betas,
-    int ATTN_B, int ATTN_H, int ATTN_N
-) {
-    // global pointers. 
-    using q_tile = st_bf<CHUNK_SIZE, ATTN_F>;
-    using k_tile = st_bf<CHUNK_SIZE, ATTN_F>;
-    using v_tile = st_bf<CHUNK_SIZE, ATTN_D>;
-    using o_tile = st_bf<CHUNK_SIZE, ATTN_D>;
-    using kv_state_tile = st_fl<ATTN_F, ATTN_D>;
-    using k_state_vec = sv_fl<ATTN_D>;
-    using qk_map_tile = st_bf<ATTN_D, HALF_ATTN_F>;
-    
-    using q_global = gl<bf16, -1, -1, -1, -1, q_tile>;
-    using k_global = gl<bf16, -1, -1, -1, -1, k_tile>;
-    using v_global = gl<bf16, -1, -1, -1, -1, v_tile>;
-    using o_global = gl<bf16, -1, -1, -1, -1, o_tile>;
-    using kv_state_global = gl<float, -1, -1, -1, -1, kv_state_tile>;
-    using k_state_global = gl<float, -1, -1, -1, -1, k_state_vec>;
-    using qmap_global = gl<bf16, -1, -1, -1, -1, qk_map_tile>;
-    using kmap_global = gl<bf16, -1, -1, -1, -1, qk_map_tile>;
-    
-    using globals = hedgehog_globals;
-    q_global q_arg{d_q, ATTN_B, ATTN_H, ATTN_N, ATTN_F};
-    k_global k_arg{d_k, ATTN_B, ATTN_H, ATTN_N, ATTN_F};
-    v_global v_arg{d_v, ATTN_B, ATTN_H, ATTN_N, ATTN_D};
-    o_global o_arg{d_o, ATTN_B, ATTN_H, ATTN_N, ATTN_D};
-    qmap_global qmap_arg{d_qmap, 1, ATTN_H, ATTN_F, HALF_ATTN_F};
-    kmap_global kmap_arg{d_kmap, 1, ATTN_H, ATTN_F, HALF_ATTN_F};
-    kv_state_global kv_state_arg{d_kv_state, ATTN_B, ATTN_H, ATTN_F, ATTN_D};
-    k_state_global k_state_arg{d_k_state, ATTN_B, ATTN_H, 1, ATTN_D};
-
-    globals g{
-        q_arg, k_arg, v_arg, 
-        qmap_arg, kmap_arg,
-        k_state_arg, kv_state_arg,
-        o_arg, d_alphas, d_betas
-    };
-    return g;
+inline globals make_globals(bf16 *q, bf16 *k, bf16 *v, bf16 *o, bf16 *qmap, bf16 *kmap,
+                            const float *alphas, const float *betas, int B, int H, int N) {
+  size_t b_ = B, h_ = H, n_ = N, d_ = HD, one = 1, nf = NF;
+  tile_gl qg{q, b_, h_, n_, d_}, kg{k, b_, h_, n_, d_}, vg{v, b_, h_, n_, d_}, og{o, b_, h_, n_, d_};
+  map_gl qm{qmap, one, h_, d_, nf}, km{kmap, one, h_, d_, nf};
+  return globals{qg, kg, vg, og, qm, km, alphas, betas, N};
 }
 
-#ifdef TK_COMPILE_HEDGEHOG
-#include "pyutils/torchutils.cuh"
-#include <ATen/Functions.h>
-#include <iostream>
-void dispatch_hedgehog( 
-    bf16 *d_q, bf16 *d_k, bf16 *d_v, bf16 *d_o,
-    bf16 *d_qmap, bf16 *d_kmap,
-    float *d_k_state, float *d_kv_state,
-    float *d_alphas, float *d_betas,
-    int ATTN_B, int ATTN_H, int ATTN_N
-){
-    hedgehog_globals g = hedgehog_init(
-        d_q, d_k, d_v, d_o,
-        d_qmap, d_kmap,
-        d_k_state, d_kv_state,
-        d_alphas, d_betas,
-        ATTN_B, ATTN_H, ATTN_N
-    );
+inline void launch(globals const &g, int B, int H, cudaStream_t s = 0) {
+  static bool init = false;
+  if (!init) {
+    cudaFuncSetAttribute(hh_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM_BYTES);
+    init = true;
+  }
+  hh_kernel<<<dim3(H, B), NTHREADS, SMEM_BYTES, s>>>(g);
+}
+}  // namespace khref_hh
 
-    // launch
-    unsigned long mem_size = kittens::MAX_SHARED_MEMORY - 1024;
-    cudaFuncSetAttribute(
-        hedgehog_linear_attention_smd,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        mem_size
-    );
-    dim3 grid(ATTN_H, ATTN_B);
-    hedgehog_linear_attention_smd<<<grid,NUM_THREADS,mem_size>>>(g, ATTN_N);
-    CHECK_CUDA_ERROR(cudaGetLastError());
+
+#include "kh_verify.h"
+#include <cstdio>
+#include <string>
+#include <vector>
+
+namespace {
+using namespace khref_hh;
+
+// Tolerances: |x - ref| <= max_rms * RMS(ref) + rel * |ref| for every element, and rel. Frobenius
+// error <= fro. Measured with the shipped FP32 token-by-token kernel on all sizes: max|err|/rms
+// <= 0.17 (heavy-tailed outputs: the error scales with |ref|, hence the rel term), fro = 2.7e-3
+// (the reference deviates 2.3e-3 .. 2.6e-3 from an independent FP32 PyTorch computation).
+// Bad variants (fro on the timed sizes): linear state rounded to BF16 1.0e-2 .. 2.0e-2 (grows
+// with N); Q rounded to FP8 2.5e-2; no alpha 0.14; no beta 0.15-0.18; no negative features 0.2;
+// linear region includes the previous block 0.2; unnormalised features 0.5; alpha/beta swapped
+// 0.65; window = current block only 0.8; no max shift 1.7-2.3; no linear part 2.6-5.4; scale 1
+// instead of 1/sqrt(128) 1.7; no final normalisation 33-120; half of the outputs unwritten / empty:
+// non-finite.
+KhTol kTol(0.2, 8.0e-3, 0.03);
+
+struct Case { const char *label; int B, H, N; };
+
+void dump(const char *dir, const char *name, const void *dptr, size_t bytes) {
+  std::vector<char> h(bytes);
+  KH_CHECK(cudaMemcpy(h.data(), dptr, bytes, cudaMemcpyDeviceToHost));
+  std::string path = std::string(dir) + "/" + name;
+  FILE *f = std::fopen(path.c_str(), "wb");
+  std::fwrite(h.data(), 1, bytes, f);
+  std::fclose(f);
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> hedgehog(
-    const at::Tensor q, 
-    const at::Tensor k,
-    const at::Tensor v,
-    const at::Tensor qmap,
-    const at::Tensor kmap,
-    const at::Tensor d_alphas,
-    const at::Tensor d_betas
-) {
-    CHECK_INPUT(q);
-    CHECK_INPUT(k);
-    CHECK_INPUT(v);
-    CHECK_INPUT(qmap);
-    CHECK_INPUT(kmap);
-    CHECK_INPUT(d_alphas);
-    CHECK_INPUT(d_betas);
+bool run_case(Case const &c, bool timed, int trials) {
+  const int B = c.B, H = c.H, N = c.N;
+  const size_t n_el = size_t(B) * H * N * HD, n_map = size_t(H) * HD * NF;
+  bf16 *q, *k, *v, *o_ref, *qmap, *kmap;
+  float *alphas, *betas;
+  KH_CHECK(cudaMalloc(&q, n_el * 2)); KH_CHECK(cudaMalloc(&k, n_el * 2));
+  KH_CHECK(cudaMalloc(&v, n_el * 2)); KH_CHECK(cudaMalloc(&o_ref, n_el * 2));
+  KH_CHECK(cudaMalloc(&qmap, n_map * 2)); KH_CHECK(cudaMalloc(&kmap, n_map * 2));
+  KH_CHECK(cudaMalloc(&alphas, H * 4)); KH_CHECK(cudaMalloc(&betas, H * 4));
+  // Q, K, V are regenerated with a new seed before every timed call and before the final re-check
+  // (the feature maps, alphas and betas are model weights and stay fixed).
+  unsigned seq = 1;
+  auto refresh = [&](unsigned seed) {
+    kh_fill_uniform(q, n_el, 11u + 7919u * seed, 2.0f);
+    kh_fill_uniform(k, n_el, 22u + 7919u * seed, 2.0f);
+    kh_fill_uniform(v, n_el, 33u + 7919u * seed, 1.0f);
+  };
+  refresh(seq);
+  kh_fill_uniform(qmap, n_map, 44u, 0.25f);
+  kh_fill_uniform(kmap, n_map, 55u, 0.25f);
+  {
+    std::vector<float> ha(H), hb(H);
+    for (int h = 0; h < H; h++) { ha[h] = kh_uniform_pos(h, 66u, 0.5f, 2.0f); hb[h] = kh_uniform_pos(h, 77u, 0.25f, 1.0f); }
+    KH_CHECK(cudaMemcpy(alphas, ha.data(), H * 4, cudaMemcpyHostToDevice));
+    KH_CHECK(cudaMemcpy(betas, hb.data(), H * 4, cudaMemcpyHostToDevice));
+  }
+  kh_poison(o_ref, n_el * 2);
+  KH_CHECK(cudaDeviceSynchronize());
 
-    int B = q.size(0);
-    int H = q.size(1);
-    int N = q.size(2);
-    int DV = v.size(3);
-    int FD = qmap.size(1);
+  globals g = make_globals(q, k, v, o_ref, qmap, kmap, alphas, betas, B, H, N);
+  auto run_ref = [&] { launch(g, B, H); };
+  run_ref();
+  KH_CHECK(cudaGetLastError());
+  KH_CHECK(cudaDeviceSynchronize());
 
-    // checks
-    TORCH_CHECK(k.size(0) == B, "k batch?");
-    TORCH_CHECK(k.size(1) == H, "k heads?");
-    TORCH_CHECK(k.size(2) == N, "k length?");
+  bool ok = true;
+  {
+    KhResult r = kh_compare(o_ref, o_ref, n_el, kTol);
+    if (!r.pass) { std::fprintf(stderr, "Reference output incomplete or non-finite (non-finite = %llu)\n", r.nonfinite); ok = false; }
+  }
+  if (const char *dir = std::getenv("KH_DUMP_DIR")) {
+    dump(dir, "q.bin", q, n_el * 2); dump(dir, "k.bin", k, n_el * 2); dump(dir, "v.bin", v, n_el * 2);
+    dump(dir, "qmap.bin", qmap, n_map * 2); dump(dir, "kmap.bin", kmap, n_map * 2);
+    dump(dir, "alphas.bin", alphas, H * 4); dump(dir, "betas.bin", betas, H * 4);
+    dump(dir, "o_ref.bin", o_ref, n_el * 2);
+  }
 
-    TORCH_CHECK(v.size(0) == B, "v batch?");
-    TORCH_CHECK(v.size(1) == H, "v heads?");
-    TORCH_CHECK(v.size(2) == N, "v length?");
-
-    TORCH_CHECK(qmap.size(0) == H, "qmap heads?");
-    TORCH_CHECK(qmap.size(1) == FD, "qmap length?");
-    TORCH_CHECK(qmap.size(2) == 64, "qmap length?");
-
-    TORCH_CHECK(kmap.size(0) == H, "kmap heads?");
-    TORCH_CHECK(kmap.size(1) == FD, "kmap length?");
-    TORCH_CHECK(kmap.size(2) == 64, "kmap length?");
-
-    TORCH_CHECK(d_alphas.size(0) == H, "alphas heads?");
-    TORCH_CHECK(d_betas.size(0) == H, "betas heads?");
-
-    // allocate outputs
-    at::Tensor out = at::empty({B, H, N, DV}, v.options());
-    at::Tensor kv_state = at::empty({B, H, FD, DV}, at::dtype(at::ScalarType::Float).device(v.device()));
-    at::Tensor k_state = at::empty({B, H, 1, DV}, at::dtype(at::ScalarType::Float).device(v.device()));
-
-    // convert to bf16
-    c10::BFloat16 *q_bf16 = q.data_ptr<c10::BFloat16>();
-    c10::BFloat16 *k_bf16 = k.data_ptr<c10::BFloat16>();
-    c10::BFloat16 *v_bf16 = v.data_ptr<c10::BFloat16>();
-    c10::BFloat16 *qmap_bf16 = qmap.data_ptr<c10::BFloat16>();
-    c10::BFloat16 *kmap_bf16 = kmap.data_ptr<c10::BFloat16>();
-    float *d_alphas_float = d_alphas.data_ptr<float>(); // alpha and beta are already float32
-    float *d_betas_float = d_betas.data_ptr<float>();
-    // alpha and beta are already float32
-    
-    bf16 *d_q = reinterpret_cast<bf16*>(q_bf16);
-    bf16 *d_k = reinterpret_cast<bf16*>(k_bf16);
-    bf16 *d_v = reinterpret_cast<bf16*>(v_bf16);
-    bf16 *d_qmap = reinterpret_cast<bf16*>(qmap_bf16);
-    bf16 *d_kmap = reinterpret_cast<bf16*>(kmap_bf16);
-    bf16 *d_o = reinterpret_cast<bf16*>(out.data_ptr<c10::BFloat16>());
-    float *d_k_state = k_state.data_ptr<float>();
-    float *d_kv_state = kv_state.data_ptr<float>();
-
-    dispatch_hedgehog(
-        d_q, d_k, d_v, d_o, 
-        d_qmap, d_kmap,
-        d_k_state, d_kv_state,
-        d_alphas_float, d_betas_float,
-        B, H, N
-    );
-
-    CHECK_CUDA_ERROR(cudaGetLastError());
-    return std::make_tuple(out, kv_state, k_state);
-}
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("hedgehog", hedgehog, "Hedgehog forward. Takes tensors (q, k, v, q_map, k_map, alphas, betas). q, k, v are bf16 (B,H,N,64), q_map and k_map are bf16 (H,E,64,64), alphas and betas are fp32 (H,E). Returns (B,H,N,64) in bf16.");
-}
-#else
-#include "harness.impl"
+#ifdef KH_TEST_SOLUTION
+  bf16 *o_sol;
+  KH_CHECK(cudaMalloc(&o_sol, n_el * 2));
+  auto reset_sol = [&] { kh_poison(o_sol, n_el * 2); };
+  auto call_sol = [&] {
+    HedgehogAttention(reinterpret_cast<__nv_bfloat16 *>(q), reinterpret_cast<__nv_bfloat16 *>(k),
+                      reinterpret_cast<__nv_bfloat16 *>(v), reinterpret_cast<__nv_bfloat16 *>(o_sol),
+                      reinterpret_cast<__nv_bfloat16 *>(qmap), reinterpret_cast<__nv_bfloat16 *>(kmap),
+                      alphas, betas, B, H, N);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "Solution kernel failed: %s\n", cudaGetErrorString(e)); std::exit(1); }
+  };
+  if (ok) {
+    reset_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    call_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    KhResult r = kh_compare(o_sol, o_ref, n_el, kTol);
+    kh_print_result("solution", r, kTol);
+    ok = r.pass;
+#ifdef KH_TOL_SCAN   // development aid: how many elements would fail at other (max_rms, rel) settings
+    for (double m : {0.01, 0.02, 0.03, 0.05, 0.1}) for (double rl : {0.0, 0.005, 0.01, 0.02, 0.04, 0.08}) {
+      KhResult rs = kh_compare(o_sol, o_ref, n_el, KhTol(m, 1.0, rl));
+      std::printf("SCAN max_rms=%.3f rel=%.3f nbad=%llu max_err_rel=%.4e fro=%.4e\n", m, rl, rs.nbad, rs.max_err_rel, rs.fro_rel);
+    }
 #endif
+  }
+#endif
+  if (ok && timed && trials > 0) {
+    KhTime tr = kh_time(run_ref, trials, [&] { refresh(++seq); kh_poison(o_ref, n_el * 2); });
+    kh_print_time("Ref", tr);
+#ifdef KH_TEST_SOLUTION
+    KhTime ts = kh_time(call_sol, trials, [&] { refresh(++seq); reset_sol(); });
+    kh_print_time("Kernel", ts);
+    kh_print_speedup(tr, ts);
+#endif
+  }
+#ifdef KH_TEST_SOLUTION
+  // Final re-check, unconditionally (also without timing): fresh inputs, reference recomputed for them,
+  // freshly poisoned solution output. A solution that memoises its output fails here.
+  if (ok) {
+    refresh(++seq);   // fresh inputs: recompute the reference, then run the solution on them
+    run_ref();
+    KH_CHECK(cudaDeviceSynchronize());
+    reset_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    call_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    KhResult rr = kh_compare(o_sol, o_ref, n_el, kTol);
+    kh_print_result("solution (re-check, fresh inputs)", rr, kTol);
+    ok = rr.pass;
+  }
+#endif
+#ifdef KH_TEST_SOLUTION
+  cudaFree(o_sol);
+#endif
+  cudaFree(q); cudaFree(k); cudaFree(v); cudaFree(o_ref); cudaFree(qmap); cudaFree(kmap);
+  cudaFree(alphas); cudaFree(betas);
+  return ok;
+}
+}  // namespace
+
+int main(int argc, char **argv) {
+  cudaDeviceProp props;
+  KH_CHECK(cudaGetDeviceProperties(&props, 0));
+  if (props.major != 10 || props.minor != 0) {
+    std::fprintf(stderr, "This task requires a Blackwell sm_100 GPU (B200).\n");
+    return 0;
+  }
+  const int trials = kh_trials();
+  const bool keep_going = std::getenv("KH_KEEP_GOING") != nullptr;
+  bool failed = false;
+
+  if (argc >= 4) {   // ./test B H N : single custom shape
+    Case c{"custom", std::atoi(argv[1]), std::atoi(argv[2]), std::atoi(argv[3])};
+    std::printf("\n=== custom: B=%d, H=%d, N=%d, D=%d ===\n", c.B, c.H, c.N, HD);
+    if (!run_case(c, true, trials)) { std::printf("Incorrect\n"); return 1; }
+    std::printf("Passed\n");
+    return 0;
+  }
+  std::vector<Case> cases = {
+      {"b8_n4k", 8, 32, 4096},
+      {"b8_n8k", 8, 32, 8192},
+      {"b4_n16k", 4, 32, 16384},
+  };
+
+  // Correctness-only cases (odd batch / head counts, short sequences); not timed.
+  std::vector<Case> small = {
+      {"odd_shape", 3, 5, 1344},
+      {"short_seq", 2, 8, 128},
+  };
+  for (auto const &c : small) {
+    std::printf("\n--- %s: B=%d, H=%d, N=%d, D=128 (correctness only) ---\n", c.label, c.B, c.H, c.N);
+    if (!run_case(c, false, 0)) { std::printf("Incorrect\n"); if (!keep_going) return 1; failed = true; }
+    else std::printf("Passed\n");
+  }
+
+  for (auto const &c : cases) {
+    std::printf("\n=== %s: B=%d, H=%d, N=%d, D=%d ===\n", c.label, c.B, c.H, c.N, HD);
+    if (!run_case(c, true, trials)) { std::printf("Incorrect\n"); if (!keep_going) return 1; failed = true; }
+    else std::printf("Passed\n");
+  }
+  return failed ? 1 : 0;
+}
