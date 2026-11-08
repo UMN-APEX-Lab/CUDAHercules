@@ -35,7 +35,7 @@ For every group g:  `D_g = A_g * B_g`   (A_g is M_g x K_g, B_g is K_g x N_g, D_g
 - `M_g` is arbitrary and may be **0** (an expert that received no token): nothing is read or written
   for such a group. `N_g` and `K_g` are multiples of 64 and may differ between groups (one test mixes
   two layer shapes in one launch).
-- Group sizes are not equal and are not multiples of any tile size. Do not assume them.
+- Group sizes are not equal and are not multiples of any tile size; empty groups exist.
 
 ## Data Types and Precision
 
@@ -63,7 +63,7 @@ make test                    # requires solution.h in the task directory
 ./test decode                # only the scenarios whose label contains "decode"
 ```
 
-`make ref` builds the CUTLASS reference alone.
+The shipped `solution.h` is a simple correct baseline; you may replace it entirely.
 
 ## Problem Sizes
 
@@ -96,37 +96,21 @@ group) is compared with the reference, per layer (for `overlap_mixed_nk` per lay
   last-bit difference in the BF16 rounding is accepted);
 - the relative Frobenius error `||D - ref|| / ||ref||` must be `<= 5e-4`.
 
-The Frobenius bound is about 5x above the error of a plain FP32-accumulating kernel (9.7e-5) and about
-10x below the error of a kernel that accumulates in FP16 (4.7e-3 .. 7.0e-3); inputs rounded to FP8 give
-3.4e-2 or more, a skipped 64-wide K block 0.18 or more. Solutions that assume equal group sizes, drop
-the ragged last tile of a group, mishandle empty groups (for example by compacting them away and
-misindexing the weights), or use the wrong N / K for a group fail. The check is repeated once more
-after the timing loop, from freshly poisoned buffers.
-
-**The token matrix changes on every call.** As in deployment, the A operands (token rows) are regenerated with
-a new random seed outside the timed region before every timed call of the reference and of your function, and
-the post-timing re-check uses yet another fresh input (the reference output is recomputed for it). Outputs
-and any input-dependent intermediate must therefore be recomputed on every call; a solution that caches its
-result between calls fails the re-check. The expert weights (B) and the group tables stay fixed.
+**The token matrix changes on every call.** The A operands (token rows) are regenerated with a new random
+seed outside the timed region before every timed call of the reference and of your function, and the final
+re-check, which runs on fresh inputs for every case, recomputes the reference for them. Outputs and any
+input-dependent intermediate must therefore be recomputed on every call. The expert weights (B) and the
+group tables stay fixed.
 
 ## Performance
 
-For each scenario the harness times the CUTLASS reference and your function with CUDA events (the L2
-cache is flushed before every trial; the outputs are re-poisoned outside the timed region) and reports
-`Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean of
-the speedups over the seven scenarios.
-
-The reference is the CUTLASS pointer-array grouped GEMM with a tile / cluster configuration chosen per
-scenario from a sweep on B200 (2-SM 256x256 tiles for the large prefill chunks, a 1-SM 128x256 tile for
-the 2K chunks, 2-SM "swap-AB" tiles for the mixed launch, 1-SM 128x32 swap-AB tiles for decode). Its
-group tables are built once outside the timed region. It reaches 99-130% of `torch._grouped_mm` (the
-vendor grouped-GEMM yardstick) on every scenario (99-101% on the two 8K-token prefill scenarios, 121-130%
-on the others); the 8K prefill scenarios run at about 1.1-1.3 PFLOP/s and the decode scenarios are bound
-by weight traffic (4.8-5.8 TB/s of the minimum DRAM traffic).
+For each scenario the harness times the reference and your function with CUDA events (the L2 cache is
+flushed before every trial; the outputs are re-poisoned outside the timed region). The score is the
+geometric mean of the per-scenario speedups `ref_min / kernel_min` over the seven scenarios.
 
 Your function is timed as a whole call, including any host-side launch setup and any copy of the group
-tables. One-time setup (e.g. `cudaFuncSetAttribute`, tensor-map creation) may be cached in
-function-local statics.
+tables; the reference's group tables are prepared outside the timed region. One-time setup (e.g.
+`cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics.
 
 ## Rules
 

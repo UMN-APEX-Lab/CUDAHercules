@@ -1,7 +1,7 @@
 # Task: tk_bf16_gemm
 
 ## Target Hardware
-NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a`; on any other GPU the test exits with an error (it never reports a pass without running).
+NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a`.
 
 BF16 General Matrix Multiply with BF16 output (tcgen05 / UMMA tensor-core GEMM), compared against the
 ThunderKittens Blackwell BF16 GEMM.
@@ -42,13 +42,11 @@ make test                    # requires solution.h in the task directory
 ./test 4096 4096 4096        # one custom shape: M N K (M multiple of 512, N of 256, K of 128)
 ```
 
-`make ref` builds the ThunderKittens reference alone.
-
 ## Problem Sizes
 
 The linear layers of Llama-3-70B in BF16 on one B200 (hidden 8192, fused QKV 10240, FFN 28672 -> fused
-gate+up 57344). M is the number of tokens. The reference kernel works on 256-row tiles, so the smallest
-batch is 256 tokens (a large decode / speculative batch); the others are 8K / 16K-token prefill chunks.
+gate+up 57344). M is the number of tokens: a 256-token decode / speculative batch, or an 8K / 16K-token
+prefill chunk.
 
 | label                    | M     | N     | K     | layer                        |
 |--------------------------|-------|-------|-------|------------------------------|
@@ -64,42 +62,31 @@ A and B hold uniform random BF16 values in [-1, 1) with full mantissas.
 
 ## Correctness
 
-The ThunderKittens reference and your solution write to separate buffers that are pre-filled with NaN. After
-your function returns, **every** element of C is compared with the reference output:
+The reference and your solution write to separate buffers that are pre-filled with NaN. After your
+function returns, **every** element of C is compared with the reference output:
 
 - every element must be finite (NaN / Inf fail, so unwritten elements fail);
 - `|C - ref| <= 1e-3 * RMS(ref) + 1.6e-2 * |ref|` for every element (the second term allows two BF16
   rounding steps), and the relative Frobenius error `||C - ref|| / ||ref||` must be `<= 1.5e-3`.
 
-A sequential FP32-accumulating kernel measures a relative Frobenius error of 2e-4 .. 4e-4 against the reference
-(BF16 rounding flips caused by different summation orders); the bound is 3.7x above that. Rounding the partial
-sums to BF16 every 512 elements of K (2.6e-3), FP16 accumulation (1.3e-2 .. 2.5e-2), FP8 inputs (3.4e-2) or
-skipping a K block (>= 6.7e-2) all fail. The check is repeated once more after the timing loop, from a freshly
-poisoned C.
-
-**Inputs change on every call.** The activation matrix A is regenerated with a new random seed before every timed call of both the
-reference and your function (outside the timed region, before the L2 flush), so outputs and any
-input-dependent intermediate must be recomputed on every call; memoizing results does not work. After the timing loop
-the harness regenerates the input once more, recomputes the reference for it, re-poisons the output and calls your
-function again; that second check must pass too. The second operand B (the weights) stays fixed, and one-time
-preprocessing of B (and its scales) into a function-local static cache keyed on the pointers and the shape is allowed, as
-is other one-time setup (see "Performance").
+**Inputs change on every call.** The activation matrix A is regenerated with a new random seed before
+every timed call of both the reference and your function (outside the timed region), so outputs and any
+input-dependent intermediate must be recomputed on every call; memoizing results does not work. After
+the timing loop the harness regenerates A once more, recomputes the reference, re-poisons the output and
+calls your function again; that final check on fresh inputs must pass too (it runs for every shape). The
+weights B stay fixed, and one-time preprocessing of B into a function-local static cache keyed on the
+pointers and the shape is allowed.
 
 ## Performance
 
-For each shape the harness times the ThunderKittens reference and your function with CUDA events (the L2 cache is
-flushed before every trial; C is re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and
-`Speedup = ref_min / kernel_min` (minimum over the same number of trials for both). The score is the geometric mean
-of the speedups over the seven shapes. The reference's tensor maps (TMA descriptors) are built once outside the
-timed region; it launches one persistent 2-CTA-cluster kernel per call.
-
-The reference uses a template configuration chosen per shape from a sweep on B200 (e.g. 256x256x64 tiles with
-supergroup 8 for the 8K prefill GEMMs, 1.6-1.8 PFLOPs). It reaches 80-112% of cuBLAS BF16 (`torch.matmul`, same shapes,
-L2 flushed) on every shape: 103-112% on the prefill shapes and the 256 x 28672 FFN, 80% on the 256 x 10240 x 8192 shape
-(cuBLAS splits K there, the reference does not).
+For each shape the harness times the reference and your function with CUDA events (the L2 cache is
+flushed before every trial; C is re-poisoned outside the timed region) and reports `Ref time`,
+`Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean of the speedups
+over the seven shapes.
 
 Your function is timed as a whole call, including any host-side launch setup. One-time setup (e.g.
-`cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics.
+`cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics. The shipped
+`solution.h` is a simple correct baseline that you may replace entirely.
 
 ## Rules
 

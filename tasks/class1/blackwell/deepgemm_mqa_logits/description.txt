@@ -1,9 +1,9 @@
 # Task: deepgemm_mqa_logits
 
 ## Target Hardware
-NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a` and is skipped on other GPUs. The reference kernel is compiled for the 148 SMs of a B200.
+NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a` and is skipped on other GPUs.
 
-FP8 multi-query-attention scoring: the "lightning indexer" logits of DeepSeek-V3.2 (64 indexer heads of dimension 128 against a single shared key per token), compared against DeepGEMM's SM100 `fp8_fp4_mqa_logits` kernel (tcgen05 block-scaled UMMA, DeepSeek, MIT license).
+FP8 multi-query-attention scoring: the "lightning indexer" logits of DeepSeek-V3.2 (64 indexer heads of dimension 128 against a single shared key per token), compared against DeepGEMM's SM100 `fp8_fp4_mqa_logits` kernel.
 
 This is NOT softmax attention: every (query, key) pair gets one scalar logit
 
@@ -60,11 +60,11 @@ make test        # requires solution.h in the task directory
 ./test S SKV pattern(0 causal tail | 1 context-parallel zigzag | 2 packed documents)    # one custom case (SKV a multiple of 128)
 ```
 
-`make ref` builds the DeepGEMM reference alone.
+The shipped `solution.h` is a simple correct baseline; you may replace it entirely.
 
 ## Problem Sizes
 
-DeepSeek-V3.2 prefill: a chunk of S query tokens scores the SKV cached key tokens. Q, KV, weights and scales are full-entropy random (all 256 E4M3 codes except NaN, exponents 124..131, weights uniform in [-1, 1)).
+DeepSeek-V3.2 prefill: a chunk of S query tokens scores the SKV cached key tokens. Q and KV values are uniform random in [-1, 1) rounded to E4M3, the scale-factor exponents are random in 124..131 (every byte), and the weights are uniform in [-1, 1) (BF16).
 
 | label                 | S    | SKV   | key ranges [ks, ke)                                                         | (q,kv) pairs |
 |-----------------------|------|-------|-----------------------------------------------------------------------------|--------------|
@@ -76,22 +76,22 @@ DeepSeek-V3.2 prefill: a chunk of S query tokens scores the SKV cached key token
 
 ## Correctness
 
-The DeepGEMM reference and your function read the same inputs and write to separate buffers that are pre-filled with NaN. After your function returns, **every** element of the defined region (see above) is compared with the reference:
+The reference and your function read the same inputs and write to separate buffers that are pre-filled with NaN. After your function returns, **every** element of the defined region (see above) is compared with the reference:
 
 - every element must be finite (NaN / Inf fail, so unwritten elements fail);
 - `|x - ref| <= 0.4 * RMS(ref) + 0.03 * |ref|` for every element, and the relative Frobenius error `||x - ref|| / ||ref|| <= 1.5e-2` (RMS and norms over the defined region).
 
-Calibration (measured on B200): the DeepGEMM kernel reduces the 64 heads in BF16 arithmetic and stores BF16, so it is itself 4.7e-3 (Frobenius) away from an exact FP64 evaluation of the same quantized inputs; an exact FP32 implementation differs from it by 5.0e-3 (max element error 0.12 RMS), so the bounds are 3x above a correct kernel. They are far below the error of the wrong variants we tried: Q or KV rounded to FP4 (0.25), one head of 64 skipped (0.125), scale factors ignored (0.9), a wrong UE8M0 bias (0.75), ReLU missing or applied after the weights (1.0), weights ignored (6), ks ignored or off by one (> 1 / NaN), a tile or half of the columns unwritten (NaN). The check is repeated once more at the end on freshly regenerated inputs (new seed): the reference output is recomputed for them, your output is re-poisoned, and your function must produce the right answer for the new inputs.
+The reference itself accumulates the 64 heads in BF16 arithmetic, so the tolerance is set relative to it.
+
+**The inputs change on every call.** Q, its MX scale factors `q_sf` and the weights are regenerated with a new seed before every timed call of the reference and of your function (outside the timed region); KV, `kv_sf`, `cu_seq_len_k_start/end` stay fixed. The first correctness check and the final re-check use their own seeds, and the final re-check runs on fresh inputs for every case, with the reference recomputed and your output re-poisoned. Outputs and input-dependent intermediates must therefore be recomputed on every call; caching results across calls produces wrong answers.
 
 ## Performance
 
-For each case the harness times the DeepGEMM reference and your function with CUDA events (the L2 cache is flushed before every trial; the output is re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean of the speedups over the five cases. The reference is launched with DeepGEMM's own host parameters (tensor maps and function attributes built once outside the timed region; the persistent grid-stride schedule, which was faster than the scheduling-metadata variant in every case including the metadata kernel). It reaches 2.6 - 2.9 PFLOPS of FP8 tensor-core work (1.1 PFLOPS on the small packed-docs case) against the 4.5 PFLOPS dense FP8 peak.
-
-**The inputs change on every call.** Before every timed call of the reference and of your function (outside the timed region) the harness regenerates Q, its MX scale factors `q_sf` and the weights (KV, the key cache, stays fixed) with a new seed; the first correctness check and the final re-check use their own seeds as well. Outputs and input-dependent intermediates must therefore be recomputed on every call; caching or memoising results across calls produces wrong answers and fails the final check.
+For each case the harness times the reference and your function with CUDA events (the L2 cache is flushed before every trial; the output is re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean of the speedups over the five cases.
 
 Your function is timed as a whole call, including host-side launch setup. One-time setup (e.g. `cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics.
 
 ## Rules
 
 - Solutions must be your own kernels: no cuBLAS / cuDNN, no CUTLASS device / kernel / collective templates, and in particular no use of DeepGEMM (`deep_gemm` headers / namespaces, its SM100 MQA-logits kernel and scheduler) -- including it is rejected. CuTe and low-level building blocks (barriers, pipelines, layouts, `tcgen05` PTX, TMA) are allowed.
-- Do not re-quantize Q / KV to narrower formats (FP4 / FP6 / INT8). FP16 accumulation PTX is rejected (it cannot be distinguished from the reference's own BF16 reduction error by the tolerance).
+- Do not re-quantize Q / KV to narrower formats (FP4 / FP6 / INT8), and do not accumulate in FP16.

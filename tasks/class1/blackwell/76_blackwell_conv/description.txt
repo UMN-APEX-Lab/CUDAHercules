@@ -3,10 +3,10 @@
 ## Target Hardware
 NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a` and is skipped on other GPUs.
 
-3D convolution forward pass (fprop) in FP16 with FP32 accumulation (implicit GEMM with `tcgen05` / UMMA
-tensor cores), compared against the CUTLASS 3.x Blackwell implicit-GEMM convolution (example 76).
-The layers are real 3D layers (temporal extent T > 1, temporal padding and stride) of a causal video VAE,
-plus the 3x3 layers of ResNet-50 at batch 256 (2D convolutions, D = T = 1).
+3D convolution forward pass (fprop) in FP16 with FP32 accumulation, compared against the CUTLASS 3.x
+Blackwell implicit-GEMM convolution (example 76). The layers are 3D layers of a causal video VAE
+(temporal extent T > 1, temporal padding and stride), plus 3x3 layers of ResNet-50 at batch 256
+(2D convolutions, D = T = 1).
 
 ## Function Signature
 
@@ -60,13 +60,13 @@ make test                    # requires solution.h in the task directory
 ./test tstride               # only the layers whose label contains "tstride"
 ```
 
-`make ref` builds the CUTLASS reference alone.
+The shipped `solution.h` is a simple correct baseline; you may replace it entirely.
 
 ## Problem Sizes
 
 Video VAE (Wan2.1 / HunyuanVideo style causal VAE, batch 1, a chunk of D frames, 3x3x3 convolutions with
 padding 1; decoder widths 384 / 384 / 192 / 96 at 1x, 2x, 4x, 8x the latent resolution of a 480x832 clip,
-and encoder-side down-sampling layers), and ResNet-50 at batch 256 (3x3 layers of stages 2-4, D = T = 1):
+and encoder-side down-sampling layers), and ResNet-50 at batch 256 (3x3 layers of stages 3-5, D = T = 1):
 
 | label                          | N   | D  | H   | W   | C   | K   | T,R,S | pad (d,h,w) | stride (d,h,w) | output NZPQK       | GFLOP | layer                                   |
 |--------------------------------|-----|----|-----|-----|-----|-----|-------|-------------|----------------|--------------------|------:|-----------------------------------------|
@@ -76,10 +76,10 @@ and encoder-side down-sampling layers), and ResNet-50 at batch 256 (3x3 layers o
 | vae_3x3x3_t5_480x832_c96       | 1   | 5  | 480 | 832 | 96  | 96  | 3,3,3 | 1,1,1       | 1,1,1          | 1x5x480x832x96     | 994   | decoder, 8x                             |
 | vae_3x1x1_tstride2_c384        | 1   | 17 | 120 | 208 | 384 | 384 | 3,1,1 | 0,0,0       | 2,1,1          | 1x8x120x208x384    | 177   | encoder temporal down-sampling          |
 | vae_3x3x3_s122_c192            | 1   | 9  | 240 | 416 | 192 | 192 | 3,3,3 | 1,1,1       | 1,2,2          | 1x9x120x208x192    | 447   | encoder spatial down-sampling           |
-| resnet50_b256_3x3_28x28_c128   | 256 | 1  | 28  | 28  | 128 | 128 | 1,3,3 | 0,1,1       | 1,1,1          | 256x1x28x28x128    | 59    | ResNet-50 stage 2, 3x3                  |
-| resnet50_b256_3x3_s2_c128      | 256 | 1  | 56  | 56  | 128 | 128 | 1,3,3 | 0,1,1       | 1,2,2          | 256x1x28x28x128    | 59    | ResNet-50 stage 2 first block, stride 2 |
-| resnet50_b256_3x3_14x14_c256   | 256 | 1  | 14  | 14  | 256 | 256 | 1,3,3 | 0,1,1       | 1,1,1          | 256x1x14x14x256    | 59    | ResNet-50 stage 3, 3x3                  |
-| resnet50_b256_3x3_7x7_c512     | 256 | 1  | 7   | 7   | 512 | 512 | 1,3,3 | 0,1,1       | 1,1,1          | 256x1x7x7x512      | 59    | ResNet-50 stage 4, 3x3                  |
+| resnet50_b256_3x3_28x28_c128   | 256 | 1  | 28  | 28  | 128 | 128 | 1,3,3 | 0,1,1       | 1,1,1          | 256x1x28x28x128    | 59    | ResNet-50 stage 3, 3x3                  |
+| resnet50_b256_3x3_s2_c128      | 256 | 1  | 56  | 56  | 128 | 128 | 1,3,3 | 0,1,1       | 1,2,2          | 256x1x28x28x128    | 59    | ResNet-50 stage 3 first block, stride 2 |
+| resnet50_b256_3x3_14x14_c256   | 256 | 1  | 14  | 14  | 256 | 256 | 1,3,3 | 0,1,1       | 1,1,1          | 256x1x14x14x256    | 59    | ResNet-50 stage 4, 3x3                  |
+| resnet50_b256_3x3_7x7_c512     | 256 | 1  | 7   | 7   | 512 | 512 | 1,3,3 | 0,1,1       | 1,1,1          | 256x1x7x7x512      | 59    | ResNet-50 stage 5, 3x3                  |
 
 Inputs are uniform random FP16 values in [-1, 1) with full mantissas; filter values are uniform in
 [-0.1, 0.1).
@@ -94,30 +94,16 @@ After your function returns, **every** output element is compared with the refer
   last-bit difference in the FP16 rounding is accepted);
 - the relative Frobenius error `||out - ref|| / ||ref||` must be `<= 4e-4`.
 
-The Frobenius bound is about 4.7x above the error of a plain FP32-accumulating kernel (8.6e-5, which is
-pure FP16 output rounding) and about 5.7x below the error of a kernel that rounds the inputs to BF16
-(2.3e-3); FP16 accumulation gives 3.5e-3 .. 1.4e-2, FP8 inputs 3.6e-2. Solutions that ignore the temporal
-extent or the temporal padding / stride, use the wrong spatial padding / stride, replicate instead of
-zero-padding, flip the filter, or skip part of the reduction fail on the layers they affect. The check is
-repeated once more after the timing loop, from a freshly poisoned output.
-
-**The input tensor changes on every call.** As in deployment, the input activations are regenerated with a new
-random seed outside the timed region before every timed call of the reference and of your function, and the
-post-timing re-check uses yet another fresh input (the reference output is recomputed for it). The output
-and any input-dependent intermediate must therefore be recomputed on every call; a solution that caches its
-result between calls fails the re-check. The filters stay fixed.
+**The input tensor changes on every call.** The input activations are regenerated with a new random seed
+outside the timed region before every timed call of the reference and of your function, and the final
+re-check, which runs on fresh inputs for every layer, recomputes the reference for them. The output and any
+input-dependent intermediate must therefore be recomputed on every call. The filters stay fixed.
 
 ## Performance
 
-For each layer the harness times the CUTLASS reference and your function with CUDA events (the L2 cache
-is flushed before every trial; the output is re-poisoned outside the timed region) and reports
-`Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean of the
-speedups over the ten layers.
-
-The reference is the CUTLASS sm_100 implicit-GEMM convolution (TMA im2col loads, UMMA) with a tile /
-cluster configuration chosen per layer from a sweep of 11 configurations on B200 (2-SM 256x128 or 256x256
-tiles with 2x1 clusters, a 4x1 cluster for the 8x decoder layer). It reaches 90-113% of cuDNN
-(torch `conv3d`, channels-last-3d, FP16) on every layer (about 1.2-1.7 PFLOP/s).
+For each layer the harness times the reference and your function with CUDA events (the L2 cache is
+flushed before every trial; the output is re-poisoned outside the timed region). The score is the
+geometric mean of the per-layer speedups `ref_min / kernel_min` over the ten layers.
 
 Your function is timed as a whole call, including any host-side launch setup. One-time setup (e.g.
 `cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics.

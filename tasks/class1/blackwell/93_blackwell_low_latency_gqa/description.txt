@@ -3,7 +3,7 @@
 ## Target Hardware
 NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a` and is skipped on other GPUs.
 
-Decode-phase grouped-query attention (one query token per sequence) over a long KV cache, with per-sequence cache lengths, attention sinks and an optional sliding window, compared against the CUTLASS "TGV" low-latency GQA kernel (CUTLASS example 93: split-KV flash decoding inside a thread-block cluster, tcgen05 UMMA + TMEM, BF16 in / BF16 out).
+Decode-phase grouped-query attention (one query token per sequence) over a long KV cache, with per-sequence cache lengths, attention sinks and an optional sliding window, compared against a CUTLASS decode kernel (CUTLASS example 93, "TGV" low-latency GQA).
 
 ## Function Signature
 
@@ -34,7 +34,7 @@ i.e. softmax over the cached scores plus one extra "sink" logit that has no valu
 
 ## Data Types and Precision
 
-Q, K, V, O are BF16, sinks is FP32. Both products must be accumulated in FP32 and the softmax computed in FP32 (the probabilities may be rounded to BF16 before the P V product, as the CUTLASS kernel does). Lower-precision arithmetic (FP8, FP6, FP4, INT8 operands, FP16 / BF16 accumulation, including tensor-core paths that use them) is not allowed even if it passed the tolerance.
+Q, K, V, O are BF16, sinks is FP32. Both products must be accumulated in FP32 and the softmax computed in FP32 (the probabilities may be rounded to BF16 before the P V product). Lower-precision arithmetic (FP8, FP6, FP4, INT8 operands, FP16 / BF16 accumulation, including tensor-core paths that use them) is not allowed even if it passed the tolerance.
 
 ## Memory Layout (all row-major, contiguous, 256-byte aligned device pointers)
 
@@ -54,7 +54,7 @@ make test        # requires solution.h in the task directory
 ./test B kvH qH L dH window var_len sinks    # one custom case, e.g. ./test 4 8 64 4099 64 128 1 1
 ```
 
-`make ref` builds the CUTLASS reference alone.
+The shipped `solution.h` is a simple correct baseline; you may replace it entirely.
 
 ## Problem Sizes
 
@@ -70,22 +70,20 @@ gpt-oss-120b decode: 64 query heads, 8 KV heads, head_dim 64, attention sinks; i
 | b64_ctx32k_window128      | 64    | 32768       | 64       | 128    | yes   | varlen  | 17 MB |
 | llama70b_b16_ctx8k_hd128  | 16    | 8192        | 128      | -      | no    | varlen  | 399 MB |
 
-Inputs are full-mantissa uniform random BF16 values: K, V in [-1, 1), Q in [-8, 8) so that the attention distribution is peaked (logit standard deviation about 2.7). Sink logits are drawn around the typical log-sum-exp of the scores (log(length) + 3.6, +-2.5), so the sink carries 7% - 92% of the softmax mass and ignoring it is visible. Ignoring seq_lens, the window, the sinks, a skipped KV block or a wrong head mapping changes the output a lot.
+Inputs are full-mantissa uniform random BF16 values: K, V in [-1, 1), Q in [-8, 8) (attention logit standard deviation about 2.7). Sink logits are drawn around the typical log-sum-exp of the scores: log(length) + 3.56 (log(0.75 * L) + 3.56 for varlen), plus a uniform offset in [-2.5, 2.5).
 
 ## Correctness
 
-The CUTLASS reference and your function read the same inputs and write to separate buffers that are pre-filled with NaN. After your function returns, **every** element of O is compared with the reference output:
+The reference and your function read the same inputs and write to separate buffers that are pre-filled with NaN. After your function returns, **every** element of O is compared with the reference output:
 
 - every element must be finite (NaN / Inf fail, so unwritten elements fail);
 - `|O - ref| <= 6e-2 * RMS(ref) + 2.4e-2 * |ref|` for every element, and the relative Frobenius error `||O - ref|| / ||ref||` must be `<= 6e-3`.
 
-Calibration (measured on B200): an exact FP32 kernel with BF16 output differs from the reference by a Frobenius error of 0.9e-3 - 1.7e-3 (the CUTLASS kernel itself is 1.7e-3 away from an independent FP64 computation, i.e. pure BF16 output rounding), so the bound is 3.5x above a correct kernel. Deliberately wrong variants are far above it: P or V rounded to FP8 (up to 1.6e-2 / 2.4e-2), K/Q in FP8 (7e-2), BF16 PV accumulation (up to 2.7e-2), denominator off by 1% (1e-2), scale off by 0.5% (1.4e-2 - 4.2e-2), a skipped KV block (up to 0.18), ignored seq_lens (>100), ignored window (4), window off by one key (4e-2 - 8e-2), ignored or mis-scaled sinks (0.2 - 26), wrong GQA head mapping (1.3), unwritten outputs. The check is repeated once more at the end on freshly regenerated inputs (new seed): the reference output is recomputed for them, your output is re-poisoned, and your function must produce the right answer for the new inputs.
+**The inputs change on every call.** Q and the newest KV-cache entry of every sequence (position seq_lens[b]-1: decode appends one K/V entry per step) are regenerated with a new seed before every timed call of the reference and of your function (outside the timed region); the rest of the KV cache, seq_lens and sinks stay fixed. The first correctness check and the final re-check use their own seeds, and the final re-check runs on fresh inputs for every case, with the reference recomputed and your output re-poisoned. Outputs and input-dependent intermediates must therefore be recomputed on every call; caching results across calls produces wrong answers.
 
 ## Performance
 
-For each case the harness times the CUTLASS reference and your function with CUDA events (the L2 cache is flushed before every trial; O is re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean of the speedups over the seven cases. The reference configuration (split-KV factor, reduction CTAs, pipeline depth) is chosen per case from a sweep; its host-side descriptor construction is captured once in a CUDA graph outside the timed region, so only the launch is timed. It reads the KV cache at 4.2 - 6.6 TB/s, at or above a plain vectorised read kernel over the same bytes (4.4 / 5.0 / 4.9 / 6.3 / 6.7 TB/s for 268 MB / 392 MB / 399 MB / 1.6 GB / 3.2 GB) and 2.5x faster than FlashInfer's single-sequence decode kernel on b1_ctx128k (161 us vs 64 us).
-
-**The inputs change on every call.** Before every timed call of the reference and of your function (outside the timed region) the harness regenerates Q and the newest KV-cache entry of every sequence (position seq_lens[b]-1: decode appends one K/V entry per step; the rest of the cache stays fixed) with a new seed; the first correctness check and the final re-check use their own seeds as well. Outputs and input-dependent intermediates must therefore be recomputed on every call; caching or memoising results across calls produces wrong answers and fails the final check.
+For each case the harness times the reference and your function with CUDA events (the L2 cache is flushed before every trial; O is re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean of the speedups over the seven cases.
 
 Your function is timed as a whole call, including host-side launch setup. One-time setup (e.g. `cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics. Decode kernels are launch-latency sensitive: keep the host path short.
 

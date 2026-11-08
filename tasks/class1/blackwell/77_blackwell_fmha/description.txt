@@ -3,7 +3,7 @@
 ## Target Hardware
 NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a` and is skipped on other GPUs.
 
-Fused multi-head attention forward pass (prefill) with grouped-query attention (GQA), optional causal mask, and a log-sum-exp (LSE) output, compared against cuDNN's scaled-dot-product attention (the attention kernel that PyTorch SDPA, TensorRT-LLM and vLLM call on Blackwell), driven through the cudnn-frontend graph API.
+Fused multi-head attention forward pass (prefill) with grouped-query attention (GQA), optional causal mask, and a log-sum-exp (LSE) output, compared against cuDNN's scaled-dot-product attention.
 
 ## Function Signature
 
@@ -38,6 +38,8 @@ For every batch b and query head h, with kv(h) = h / (num_q_heads / num_kv_heads
     O[b, i, h, :]  = sum_j P[i, j] * V[b, j, kv(h), :]
     LSE[b, h, i]   = log(sum_j exp(S[i, j]))                         (natural log, FP32)
 
+The causal mask is aligned to the top-left (key j is visible to query i iff j <= i).
+
 ## Data Types and Precision
 
 Q, K, V, O are FP16 or BF16 (per overload). LSE is FP32. Both GEMMs (Q K^T and P V) must be accumulated in FP32 and the softmax must be computed in FP32 (the probabilities may be rounded to the 16-bit input type before the P V product, as flash-attention kernels do). Lower-precision arithmetic (FP8, FP6, FP4, INT8 operands, FP16 accumulation, including tensor-core paths that use them) is not allowed even if it passed the tolerance.
@@ -58,7 +60,7 @@ make test        # requires solution.h in the task directory
 ./test B Hq Hkv S causal(0|1) dtype(0=fp16, 1=bf16)    # one custom case (head_dim 128)
 ```
 
-`make ref` builds the cuDNN reference alone. Build / run dependencies of the reference: cudnn-frontend headers (vendored in `reference_sources/cudnn_frontend`, found through `CUDNN_FE_DIR`, default `$CUTLASS_DIR/../cudnn_frontend`), cuDNN 9 (`cudnn.h` + `libcudnn.so.9`, found through `CUDNN_DIR`, default the `nvidia-cudnn-cu13` pip wheel of the active Python), `libnvrtc` and the CUDA driver.
+The shipped `solution.h` is a simple correct baseline; you may replace it entirely.
 
 ## Problem Sizes
 
@@ -72,11 +74,11 @@ Llama-3-70B and Qwen3-32B share the attention geometry (64 query heads, 8 KV hea
 | prefill_8k_causal_fp16   | 1     | 64      | 8        | 8192  | yes    | FP16  |
 | llama8b_8k_causal_bf16   | 1     | 32      | 8        | 8192  | yes    | BF16  |
 
-Inputs are full-mantissa uniform random values: K, V in [-1, 1), Q in [-8, 8) so that the attention distribution is peaked (logit standard deviation about 2.7); skipping a key block, a wrong mask or a wrong KV head therefore changes the output visibly.
+Inputs are full-mantissa uniform random values: K, V in [-1, 1), Q in [-8, 8) (attention logit standard deviation about 2.7).
 
 ## Correctness
 
-The cuDNN reference and your function read the same inputs and write to separate O / LSE buffers that are pre-filled with NaN. After your function returns, **every** element of O and of LSE is compared with the reference:
+The reference and your function read the same inputs and write to separate O / LSE buffers that are pre-filled with NaN. After your function returns, **every** element of O and of LSE is compared with the reference:
 
 - every element must be finite (NaN / Inf fail, so unwritten elements fail);
 - `|x - ref| <= max_rms * RMS(ref) + rel * |ref|` for every element, and the relative Frobenius error `||x - ref|| / ||ref|| <= fro`.
@@ -87,17 +89,13 @@ The cuDNN reference and your function read the same inputs and write to separate
 | O, FP16    | 1.2e-2  | 4.5e-3 | 1e-3 |
 | LSE (FP32) | 5e-5    | 5e-5   | 2e-5 |
 
-Calibration (measured on B200): an exact FP32 kernel with BF16 output differs from the reference by a Frobenius error of 2.4e-3 - 2.5e-3 (FP16 output: 3.0e-4; LSE: 5e-7 - 7e-7), so the bounds are 3x above a correct kernel (and a kernel that rounds P to 16 bits is just as close). They are below the error of every deliberately wrong variant we tried: P or V rounded to FP8 (1.4e-2 - 2.4e-2), BF16 accumulation of P V (1.9e-2 - 2.6e-2), Q/K in FP8 (7e-2), denominator off by 1% (1e-2), scale off by 0.5% (1.1e-2 - 1.5e-2), a skipped KV block (0.13 - 0.21), a causal mask off by one (7e-2 - 9e-2), no causal mask (0.85), wrong KV head mapping (1.3), LSE in the wrong base or offset by 2e-3, half of the rows unwritten. The check is repeated once more at the end on freshly regenerated inputs (new seed): the reference output is recomputed for them, your output is re-poisoned, and your function must produce the right answer for the new inputs.
+**The inputs change on every call.** Q, K and V are all regenerated with a new seed before every timed call of the reference and of your function (outside the timed region); the first correctness check and the final re-check use their own seeds, and the final re-check runs on fresh inputs for every case, with the reference recomputed and your outputs re-poisoned. Outputs and input-dependent intermediates must therefore be recomputed on every call; caching results across calls produces wrong answers.
 
 ## Performance
 
-For each case the harness times the cuDNN reference and your function with CUDA events (the L2 cache is flushed before every trial; O and LSE are re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean of the speedups over the five cases. The cuDNN graph (engine selection, plan, workspace) is built once outside the timed region; only the execute call is timed. On B200 it runs at 1.42 - 1.53 PFLOPS (0.751 / 2.94 / 1.43 / 0.773 / 0.376 ms for the five cases), the same speed as PyTorch's cuDNN SDPA backend on these shapes and on par with FlashAttention-4 (CuTe DSL; 0.73 / 2.90 / 1.70 / 0.845 / 0.427 ms). A kernel that matches the best public Blackwell attention kernels therefore scores about 1.
-
-**The inputs change on every call.** Before every timed call of the reference and of your function (outside the timed region) the harness regenerates Q, K and V with a new seed; the first correctness check and the final re-check use their own seeds as well. Outputs and input-dependent intermediates must therefore be recomputed on every call; caching or memoising results across calls produces wrong answers and fails the final check.
-
-Your function is timed as a whole call, including host-side launch setup. One-time setup (e.g. `cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics.
+For each case the harness times the reference and your function with CUDA events (the L2 cache is flushed before every trial; O and LSE are re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean of the speedups over the five cases. Your function is timed as a whole call, including host-side launch setup. One-time setup (e.g. `cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics.
 
 ## Rules
 
 - Solutions must be your own kernels: no cuBLAS / cuDNN (the reference itself is cuDNN, so any use of cuDNN / cudnn-frontend is rejected), no CUTLASS device / kernel / collective templates. CuTe and low-level building blocks (barriers, pipelines, layouts, `tcgen05` PTX) are allowed.
-- seq_q == seq_k in every test; the causal mask is aligned to the top-left (key j visible to query i iff j <= i).
+- seq_q == seq_k in every test.

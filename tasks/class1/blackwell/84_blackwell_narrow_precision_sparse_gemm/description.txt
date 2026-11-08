@@ -3,8 +3,7 @@
 ## Target Hardware
 NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a` and is skipped on other GPUs.
 
-Structured-sparse NVFP4 x dense NVFP4 -> BF16 block-scaled GEMM (the sparse tcgen05 `kind::mxf4nvf4` tensor-core GEMM),
-compared against the CUTLASS Blackwell sparse block-scaled GEMM (example 84).
+Structured-sparse NVFP4 x dense NVFP4 -> BF16 block-scaled GEMM, compared against a CUTLASS-based reference.
 
 ## Function Signature
 
@@ -33,8 +32,7 @@ folded into `alpha`).
     D[m, n] = bf16( alpha * sum_k  (a[m,k] * sfa[m, k/32]) * (b[n,k] * sfb[n, k/32]) )
 
 `a[m,k]` is the logical (dense, K-wide) sparse matrix reconstructed from `A` + `E`; pruned elements are exactly zero.
-The solution receives **only** the compressed operands: it never sees the dense matrix, and ignoring the metadata
-gives wrong results (the metadata is random, different for every 8-element chunk).
+The solution receives **only** the compressed operands (A, E, SFA); it never sees the dense matrix.
 
 ## Sparsity pattern (what "2:4" means for FP4 on Blackwell)
 
@@ -45,7 +43,7 @@ therefore stores `K / 2` FP4 values.
 
 ## Memory Layouts (exact)
 
-`K` is a multiple of 256 for every timed shape (the metadata atom covers 256 K elements). All pointers are device
+`K` is a multiple of 256 for every tested shape (the metadata tile covers 256 K elements). All pointers are device
 pointers, 256-byte aligned. Notation: `Mp = roundup(M, 128)`.
 
 **Compressed values `A`**: `uint8_t[M][K/4]` row-major (`lda = K/4` bytes). Byte `j = 2c + s` of row `m` is the `s`-th kept
@@ -83,8 +81,8 @@ Padding bytes are zero. `SFA` uses `rows = M`, `SFB` uses `rows = N`.
 **Output**: `D` is row-major [M, N] BF16 (`ldd = N`), i.e. feature-major (rows = output features, columns = tokens). It
 holds NaN on entry; every element must be written.
 
-How the formats come about, for reference: prune a dense A to the pattern above, then for every chunk store the two kept
-pairs in position order and the 4-bit code `idx0 | idx1 << 2`.
+Equivalently: prune a dense A to the pattern above, then for every chunk store the two kept pairs in position order and
+the 4-bit code `idx0 | idx1 << 2`.
 
 ## Build & Test
 
@@ -93,9 +91,6 @@ make test                    # requires solution.h in the task directory
 ./test                       # runs every benchmark shape below (plus two correctness-only cases)
 ./test 8192 128 8192         # one custom shape: M N K  (K multiple of 256)
 ```
-
-`make ref` builds the CUTLASS reference alone (`KH_VALIDATE_REF=1 ./ref` re-validates it against an independent kernel
-that decodes the formats above by hand; `make sweep` times all reference configurations).
 
 ## Problem Sizes
 
@@ -114,8 +109,8 @@ A (M = output features, K = input features); B holds the N tokens: one decode st
 | prefill_mlp_down | 8192   | 8192 | 28672 | FFN down projection          |
 
 Two extra correctness-only cases (not timed): (M=200, N=1152, K=1280) exercises padded metadata / scale rows, and
-(M=1152, N=16, K=2048) a tiny token count. `alpha = 0.00731`. Data: random FP4 codes, random valid metadata nibbles,
-scales log-uniform in [0.125, 4) rounded to UE4M3 (full 3-bit mantissas, never all 1.0).
+(M=1152, N=16, K=2048) a tiny token count. `alpha = 0.00731`. Data: uniformly random FP4 codes, uniformly random valid
+metadata nibbles, scales log-uniform in [0.125, 4) rounded to UE4M3 (full 3-bit mantissas).
 
 ## Data Types and Precision
 
@@ -125,29 +120,24 @@ etc. are not allowed even if they pass the tolerance.
 
 ## Correctness
 
-The CUTLASS reference (which consumes exactly the buffers you receive) and your solution write to separate buffers that
+The reference (which consumes exactly the buffers you receive) and your solution write to separate buffers that
 are pre-filled with NaN. After your function returns, **every** element of D is compared with the reference output:
 
-- every element must be finite;
-- `|D - ref| <= 1e-3 * RMS(ref) + 0.03125 * |ref|` for every element (one BF16 ulp is up to 0.0078 |ref|);
+- every element must be finite (NaN / Inf fail, so unwritten elements fail);
+- `|D - ref| <= 1e-3 * RMS(ref) + 0.03125 * |ref|` for every element;
 - the relative Frobenius error `||D - ref|| / ||ref||` must be `<= 3e-4`.
 
-A plain FP32-FMA implementation measures a relative Frobenius error of 2.2e-5 to 6.1e-5 (0 on the small cases). Deliberately
-wrong variants measure: FP16 accumulation 2.0e-3 to 5.0e-3, BF16 accumulation 7.7e-3 to 3.2e-2, operands rounded to FP8 2.3e-2,
-FP4 magnitudes with the mantissa bit dropped 0.45, scales ignored 0.85, 16-element scale blocks >= 1.1, **metadata ignored
-(first two pairs assumed kept) 1.15**, kept-pair slots swapped 1.41, alpha ignored 136, last 32 K elements skipped
-3.3e-2 - 0.17: all fail on every shape. The check is repeated after the timing loop on a fresh input (see below).
-
-**Inputs change on every call.** Before every timed call of both the reference and your function the harness regenerates the dense activation operand B and its scale factors SFB (the 2:4-sparse weights A with their metadata E and scales SFA stay fixed) with a new random seed (outside the timed region), the first correctness check and the final re-check use their own seeds, and in the final re-check the reference output is recomputed for the new input before your function is called on a freshly poisoned D. Outputs and any input-dependent intermediates must therefore be recomputed on every call; caching them across calls (memoisation) fails the re-check. Only data derived from the fixed operands may be cached.
+**Inputs change on every call.** Before every timed call of both the reference and your function, the harness
+regenerates the dense activation operand B and its scale factors SFB with a new random seed (outside the timed region);
+the 2:4-sparse weights A with their metadata E and scales SFA stay fixed. The final re-check runs on a fresh input for
+every case, with the reference recomputed and D re-poisoned. Outputs and any input-dependent intermediates must therefore
+be recomputed on every call; only data derived from the fixed operands may be cached.
 
 ## Performance
 
-For each shape the harness times the CUTLASS reference and your function with CUDA events (L2 flushed before every trial,
+For each shape the harness times the reference and your function with CUDA events (L2 flushed before every trial,
 D re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The score
-is the geometric mean of the speedups over the seven shapes. The reference uses a tuned configuration per shape (prefill:
-256x256 2-SM tile, cluster 2x1; decode: 256x128 tile, cluster 2x1); it is 1.4-1.6x faster than the dense NVFP4 CUTLASS GEMM
-of the same shape (task 72's reference: 0.23 / 0.18 / 1.30 / 0.68 ms on the four prefill shapes vs 0.159 / 0.128 / 0.840 /
-0.416 ms here), i.e. up to 9.2 effective dense-equivalent PFLOPS.
+is the geometric mean of the speedups over the seven shapes.
 
 Your function is timed as a whole call, including any host-side launch setup. One-time setup (e.g.
 `cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics.
@@ -156,5 +146,4 @@ Your function is timed as a whole call, including any host-side launch setup. On
 
 - Solutions must be your own kernels: no cuBLAS / cuDNN, and no CUTLASS device / kernel / collective GEMM templates.
   CuTe and low-level building blocks (barriers, pipelines, layouts, `tcgen05` PTX) are allowed.
-- The shipped `solution.h` is a deliberately simple FP32-FMA SIMT kernel that expands the compressed tile in shared
-  memory; it validates the harness. A real solution is expected to use the sparse `tcgen05.mma ... kind::mxf4nvf4`.
+- The shipped `solution.h` is a simple correct baseline that you may replace entirely.

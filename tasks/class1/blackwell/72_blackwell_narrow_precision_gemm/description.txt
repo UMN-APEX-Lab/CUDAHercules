@@ -3,8 +3,7 @@
 ## Target Hardware
 NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a` and is skipped on other GPUs.
 
-NVFP4 x NVFP4 -> BF16 block-scaled GEMM (tcgen05 `kind::mxf4nvf4` block-scaled tensor-core GEMM), compared against a
-CUTLASS 3.x/4.x Blackwell block-scaled GEMM.
+NVFP4 x NVFP4 -> BF16 block-scaled GEMM, compared against a CUTLASS-based reference.
 
 ## Function Signature
 
@@ -74,9 +73,6 @@ make test                    # requires solution.h in the task directory
 ./test 8192 8192 8192        # one custom shape: M N K  (K multiple of 64)
 ```
 
-`make ref` builds the CUTLASS reference alone (`KH_VALIDATE_REF=1 ./ref` re-validates it against an independent
-dequantize-and-FMA kernel; `make sweep` times all reference configurations).
-
 ## Problem Sizes
 
 The linear layers of Llama-3.1-70B served in NVFP4 on one B200 (hidden 8192, 64 query / 8 KV heads of dimension 128 ->
@@ -93,39 +89,31 @@ quantized weight (N = output features): either an 8K-token prefill chunk or one 
 | prefill_mlp_up   | 8192 | 57344  | 8192  | fused gate+up projection     |
 | prefill_mlp_down | 8192 | 8192   | 28672 | FFN down projection          |
 
-Two extra correctness-only cases (not timed) check padded scale rows and a K that is not a multiple of the 256-wide
-MMA tile: (M=200, N=1152, K=1344) and (M=16, N=2048, K=4096).
+Two extra correctness-only cases (not timed) check padded scale rows and an irregular K:
+(M=200, N=1152, K=1344) and (M=16, N=2048, K=4096).
 `alpha = 0.00731` in every case. Data: uniformly random FP4 codes; scales are random UE4M3 values, log-uniform in
-[0.125, 4) with full 3-bit mantissas (never all 1.0).
+[0.125, 4) with full 3-bit mantissas.
 
 ## Correctness
 
-The CUTLASS reference and your solution write to separate buffers that are pre-filled with NaN. After your function
+The reference and your solution write to separate buffers that are pre-filled with NaN. After your function
 returns, **every** element of D is compared with the reference output:
 
 - every element must be finite (NaN / Inf fail, so unwritten elements fail);
-- `|D - ref| <= 1e-3 * RMS(ref) + 0.03125 * |ref|` for every element (BF16 has 8 significant bits, so one BF16 ulp is
-  up to 0.0078 |ref|; 0.03125 leaves 4x margin for the rounding flips that different FP32 summation orders cause);
+- `|D - ref| <= 1e-3 * RMS(ref) + 0.03125 * |ref|` for every element;
 - the relative Frobenius error `||D - ref|| / ||ref||` must be `<= 3e-4`.
 
-A plain FP32-FMA implementation of the exact dequantized products measures a relative Frobenius error of 3.5e-5 to 9.1e-5
-(0 on the smallest shapes), i.e. 3-8x below the bound. Deliberately wrong variants measure: FP16 accumulation 2.0e-3 to
-5.0e-3, BF16 accumulation 8e-3 to 3.4e-2, dequantized operands rounded to FP8 3.2e-2, power-of-two scales 0.30,
-FP4 magnitudes with the mantissa bit dropped 0.45, scales ignored 0.85, 32-element scale blocks 0.84, linear
-(unswizzled) scale layout 1.0-1.2, swapped nibble order 1.4, alpha ignored 136, last 32 K elements skipped 3.4e-2 - 0.15:
-all fail on every shape. The check is repeated after the timing loop on a fresh input (see below).
-
-**Inputs change on every call.** Before every timed call of both the reference and your function the harness regenerates the activation matrix A and its scale factors SFA (regenerated with the harness's own random-FP4 / UE4M3 generators; the weights B / SFB stay fixed) with a new random seed (outside the timed region), the first correctness check and the final re-check use their own seeds, and in the final re-check the reference output is recomputed for the new input before your function is called on a freshly poisoned D. Outputs and any input-dependent intermediates must therefore be recomputed on every call; caching them across calls (memoisation) fails the re-check. Only data derived from the fixed operands may be cached.
+**Inputs change on every call.** Before every timed call of both the reference and your function, the harness
+regenerates the activation matrix A and its scale factors SFA with a new random seed (outside the timed region); the
+weights B / SFB stay fixed. The final re-check runs on a fresh input for every case, with the reference recomputed and D
+re-poisoned. Outputs and any input-dependent intermediates must therefore be recomputed on every call; only data
+derived from the fixed operands may be cached.
 
 ## Performance
 
-For each shape the harness times the CUTLASS reference and your function with CUDA events (L2 flushed before every trial,
+For each shape the harness times the reference and your function with CUDA events (L2 flushed before every trial,
 D re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The
-score is the geometric mean of the speedups over the seven shapes. The reference uses a tile / cluster configuration
-tuned per shape (prefill: 256x192 2-SM tile, cluster 2x1; decode: operands swapped so that the 57344 / 8192 / 128256-wide
-N dimension fills the MMA, 256x128 tile with cluster 2x1 or 4x1). Against cuBLAS NVFP4 (`torch` `F.scaled_mm`, BlockWise1x16
-scales) measured on the same B200 it runs at 106 / 107 / 93 / 88% on the four prefill shapes (qkv / o_proj / mlp_up / mlp_down;
-5.7-6.1 PFLOPS dense) and at 136 / 155 / 124% on the three decode shapes (mlp_up / mlp_down / lm_head).
+score is the geometric mean of the speedups over the seven shapes.
 
 Your function is timed as a whole call, including any host-side launch setup. One-time setup (e.g.
 `cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics.
@@ -134,5 +122,4 @@ Your function is timed as a whole call, including any host-side launch setup. On
 
 - Solutions must be your own kernels: no cuBLAS / cuDNN, and no CUTLASS device / kernel / collective GEMM templates.
   CuTe and low-level building blocks (barriers, pipelines, layouts, `tcgen05` PTX) are allowed.
-- The shipped `solution.h` is a deliberately simple FP32-FMA SIMT kernel (about 40 TFLOPS, i.e. ~0.5-1% of the reference's speed); it exists to
-  validate the harness, a real solution is expected to use `tcgen05.mma ... kind::mxf4nvf4`.
+- The shipped `solution.h` is a simple correct baseline that you may replace entirely.

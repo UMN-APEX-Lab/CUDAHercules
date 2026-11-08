@@ -41,6 +41,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -81,15 +82,42 @@ def load_api_config(args) -> tuple[str, str]:
 # Workspace + prompt
 # ---------------------------------------------------------------------------
 
+def _makefile_build_flags(config) -> tuple[str, str]:
+    """(NVCC_FLAGS, ARCH) exactly as the task's Makefile builds the solution; ("", "") if unknown.
+
+    Arch-specific tasks (sm_90a / sm_100a / ...) are built with their own -gencode, not with the
+    plain native `sm_{sm}` target, and some need e.g. -std=c++20 or --expt-extended-lambda.
+    """
+    path = os.path.join(KH_ROOT, config.runner.workdir or "", "Makefile")
+    if not os.path.isfile(path):
+        return "", ""
+    found = {}
+    for line in open(path, errors="replace"):
+        m = re.match(r"^\s*(NVCC_FLAGS|ARCH)\s*[:+?]?=\s*(.*?)\s*$", line)
+        if m and m.group(1) not in found:
+            found[m.group(1)] = m.group(2)
+    return found.get("NVCC_FLAGS", ""), found.get("ARCH", "")
+
+
 def _sandbox_notes(config, gpu_name: str, sm: int) -> str:
     sol = config.runner.solution_file
     flags = "-O3 --use_fast_math --expt-relaxed-constexpr -std=c++17"
+    arch = f"native `sm_{sm}` code plus PTX"
     if config.runner.backend == "class2_defpy":
         flags += (" --expt-extended-lambda -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__"
                   " -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__")
         how = f"`{sol}` is compiled as a PyTorch extension behind an auto-generated pybind11 wrapper."
     else:
         how = f"`{sol}` is included by the judge's private test harness."
+        if config.runner.backend == "class1_make" and "/general/" not in config.task_id:
+            mk_flags, mk_arch = _makefile_build_flags(config)
+            if mk_flags:
+                flags = mk_flags
+            if mk_arch:
+                arch = f"`{mk_arch}`"
+                if re.search(r"(?:sm|compute)_\d+a\b", mk_arch):
+                    arch += (" (architecture-specific target: instructions such as `tcgen05.*` only assemble "
+                             "for the `a` variant; do not build with plain `-arch=sm_%d`)" % sm)
     return f"""### Sandbox notes
 
 - Write your solution to `/workspace/{sol}`. {how}
@@ -98,7 +126,7 @@ def _sandbox_notes(config, gpu_name: str, sm: int) -> str:
 - The judge's harness, the reference implementation and any `make test` /
   `./test` commands mentioned in TASK.md are NOT available in this workspace.
   The only way to run them is `submit`.
-- Judge nvcc flags: `{flags}`, native `sm_{sm}` code plus PTX, and
+- Judge nvcc flags: `{flags}`, target {arch}, and
   `-I/opt/cutlass/include -I/opt/cutlass/tools/util/include -I/opt/cutlass/examples/common`.
 - Tools: `bash` (each call is a fresh shell in /workspace: only files under
   /workspace persist; /tmp and background processes do not survive between

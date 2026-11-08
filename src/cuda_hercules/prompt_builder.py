@@ -185,7 +185,12 @@ def build_prompt(task_dir: str, task_config=None, description_dir: str = None) -
         "- Optimize for maximum performance on the target GPU",
     ]
 
-    if task_id not in PYTORCH_EXTENSION_TASKS:
+    # `extern "C"` is only meaningful where the entry point is looked up by symbol name. class1_make
+    # tasks `#include` solution.h into the harness and call the C++ signature given in the task
+    # description (which may use overloads / templates, e.g. 77_blackwell_fmha), so the rule would
+    # contradict the task there.
+    uses_include_harness = bool(task_config) and task_config.runner.backend == "class1_make"
+    if task_id not in PYTORCH_EXTENSION_TASKS and not uses_include_harness:
         requirements.insert(2, "- The entry function MUST be declared with `extern \"C\"` linkage")
 
     output_format = "Return the complete .cu file content in a ```cuda code block."

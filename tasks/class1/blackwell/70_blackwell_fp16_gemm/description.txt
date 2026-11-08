@@ -52,8 +52,6 @@ make test                    # requires solution.h in the task directory
 ./test 8192 8192 8192        # one custom shape: M N K
 ```
 
-`make ref` builds the CUTLASS reference alone.
-
 ## Problem Sizes
 
 The linear layers of Llama-3-70B served on one B200 (hidden 8192, 64 query / 8 KV heads of
@@ -77,35 +75,32 @@ it is not timed. Inputs are uniform random FP16 values in [-1, 1) with full mant
 
 ## Correctness
 
-The CUTLASS reference and your solution write to separate buffers that are pre-filled with NaN.
-After your function returns, **every** element of C is compared with the reference output:
+The reference and your solution write to separate buffers that are pre-filled with NaN. After
+your function returns, **every** element of C is compared with the reference output:
 
 - every element must be finite (NaN / Inf fail, so unwritten elements fail);
 - `|C - ref| <= 1e-3 * RMS(ref)` for every element, and the relative Frobenius error
   `||C - ref|| / ||ref||` must be `<= 2e-4`.
 
-These bounds are about 5x above the error of a plain FP32-accumulating kernel and about 10x below
-the error of a kernel that rounds the inputs to BF16, so FP32 accumulation of exact FP16 products
-is required. The check is repeated once more after the timing loop, with a fresh A and a freshly poisoned C.
-
-**Inputs change on every call.** The activation matrix A is regenerated with a new random seed before every timed call of both the
-reference and your function (outside the timed region, before the L2 flush), so outputs and any
-input-dependent intermediate must be recomputed on every call; memoizing results does not work. After the timing loop
-the harness regenerates the input once more, recomputes the reference for it, re-poisons the output and calls your
-function again; that second check must pass too. The second operand B (the weights) stays fixed, and one-time
-preprocessing of B (and its scales) into a function-local static cache keyed on the pointers and the shape is allowed, as
-is other one-time setup (see "Performance").
+**Inputs change on every call.** The activation matrix A is regenerated with a new random seed
+before every timed call of both the reference and your function (outside the timed region), so
+outputs and any input-dependent intermediate must be recomputed on every call; memoizing results
+does not work. After the timing loop the harness regenerates A once more, recomputes the
+reference, re-poisons the output and calls your function again; that final check on fresh inputs
+must pass too (it runs for every timed shape). The weights B stay fixed, and one-time
+preprocessing of B into a function-local static cache keyed on the pointers and the shape is
+allowed.
 
 ## Performance
 
-For each shape the harness times the CUTLASS reference and your function with CUDA events (the L2
-cache is flushed before every trial; C is re-poisoned outside the timed region) and reports
-`Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean of
-the speedups over the seven shapes. The CUTLASS reference uses a tile / cluster configuration
-tuned per shape and reaches 87-109% of cuBLAS on every shape.
+For each shape the harness times the reference and your function with CUDA events (the L2 cache
+is flushed before every trial; C is re-poisoned outside the timed region) and reports
+`Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean
+of the speedups over the seven shapes.
 
 Your function is timed as a whole call, including any host-side launch setup. One-time setup
-(e.g. `cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics.
+(e.g. `cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics. The
+shipped `solution.h` is a simple correct baseline that you may replace entirely.
 
 ## Rules
 

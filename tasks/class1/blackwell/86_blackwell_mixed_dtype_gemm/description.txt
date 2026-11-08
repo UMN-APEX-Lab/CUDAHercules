@@ -1,11 +1,10 @@
 # Task: 86_blackwell_mixed_dtype_gemm
 
 ## Target Hardware
-NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a`; on any other GPU the test exits with an error (it never reports a pass without running).
+NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a`.
 
 Weight-only quantized GEMM (W4A16): BF16 activations times INT4 weights with per-group BF16 scales,
-BF16 output, compared against the best public implementation per shape: the vLLM Marlin kernel for small
-batches and the CUTLASS 3.x Blackwell mixed-input GEMM (example 86) for large ones.
+BF16 output, compared against the best public implementation for the shape.
 
 ## Function Signature
 
@@ -40,7 +39,7 @@ A, the scales and D are BF16, the weights are signed INT4, accumulation must be 
 once, at the end). Lower-precision arithmetic (FP8 / FP4 activations or scales, INT8 activation
 quantization, FP16 or BF16 accumulation, including tensor-core paths that use them) is not allowed even if
 it were to pass the tolerance. Whether the dequantized weight `int4 * scale` is formed exactly in FP32 or
-rounded to BF16 (as the CUTLASS reference does) is up to you; both are accepted.
+rounded to BF16 (as the reference does) is up to you; both are accepted.
 
 ## Memory Layout
 
@@ -64,13 +63,10 @@ make test                    # requires solution.h in the task directory
 ./test 64 8192 8192          # one custom shape: M N K
 ```
 
-`make ref` builds the CUTLASS reference alone.
-
 ## Problem Sizes
 
 The linear layers of Llama-3-70B as weight-only INT4 (hidden 8192, fused QKV 10240, FFN 28672 -> fused
-gate+up 57344). M is the number of tokens: decode batches of 1..128 sequences (weight-bandwidth bound:
-the INT4 weights of the large layers are 40-240 MB) and one 8K-token prefill chunk.
+gate+up 57344). M is the number of tokens: decode batches of 1..128 sequences and one 8K-token prefill chunk.
 
 | label               | M    | N     | K     | layer / scenario                         |
 |---------------------|------|-------|-------|------------------------------------------|
@@ -95,61 +91,31 @@ with the reference output:
 - `|D - ref| <= 6e-2 * RMS(ref) + 1.6e-2 * |ref|` for every element, and the relative Frobenius error
   `||D - ref|| / ||ref||` must be `<= 7.5e-3`.
 
-Both references (Marlin and CUTLASS) round the dequantized weights to BF16 before the MMA, so an exact FP32 dequantization differs from them by a
-relative Frobenius error of 2.4e-3, and a BF16-rounded one by 8e-5 .. 3.7e-4. FP16 accumulation
-(1.3e-2 .. 2.4e-2), BF16 accumulation (5e-2 .. 1.8e-1), FP8 activations or scales (2.4e-2 .. 2.5e-2) and FP4
-activations (2.5e-1) all fail; so do a wrong nibble order, a wrong scale layout, ignored scales or a skipped K group.
-The check is repeated once more after the timing loop, from a freshly poisoned D.
+**Inputs change on every call.** The activations A are refreshed with new random values before every
+timed call of both the reference and your function (outside the timed region), so outputs and any
+input-dependent intermediate must be recomputed on every call; memoizing results does not work. After
+the timing loop the harness refreshes A once more, recomputes the reference, re-poisons D and calls your
+function again; that final check on fresh inputs must pass too (it runs for every case). The weights
+and scales stay fixed.
 
 ## Performance
 
-For each shape the harness times the reference and your function with CUDA events (the L2 cache is flushed before
-every trial; D is re-poisoned and the activations A are refreshed with new random values outside the timed region,
-before every call of both sides) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`
-(minimum over the same number of trials for both). The score is the geometric mean of the speedups over the six
-shapes.
+For each shape the harness times the reference and your function with CUDA events (the L2 cache is
+flushed before every trial; D is re-poisoned outside the timed region) and reports `Ref time`,
+`Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean of the speedups
+over the six shapes.
 
-References (both are public, production-grade implementations of exactly this operation; the faster one was chosen
-per shape from a sweep on B200):
+Your function is timed as a whole call, including any host-side launch setup. One-time setup (e.g.
+`cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics. The shipped
+`solution.h` is a simple correct baseline that you may replace entirely.
 
-- M <= 64 (decode): **vLLM Marlin** (`csrc/quantization/marlin`, Apache-2.0, derived from IST-DASLab/Marlin; vendored
-  in `marlin/`). It is the kernel that serves INT4-weight models on B200 in vLLM today (`mma.sync` BF16 tensor
-  cores, weights dequantized in registers, FP32 stripe-partitioned reduction). Launch heuristics are vLLM's
-  (bf16 activations, uint4b8 weights, group size 128, FP32 reduce); for 17..64 rows the 256-thread 64x256 thread
-  tile is used (1.3x faster than vLLM's automatic choice at this shape).
-- M >= 128: CUTLASS 3.x Blackwell mixed-input GEMM (tcgen05, example 86, swap-AB) with the tile configuration chosen
-  per shape. (Marlin is 1.15x / 1.75x slower than it at M=128 and 2.3x slower at M=8192, where CUTLASS runs at 0.87
-  PFLOPs, 53% of cuBLAS BF16 with pre-dequantized weights; no public W4A16 kernel for B200 that is faster was found:
-  tinygemm / `torch._weight_int4pack_mm` is 1.3-25x slower than Marlin, vLLM Machete is Hopper-only (wgmma), the
-  newer CUTLASS main has the same mixed-input kernel, and CUTLASS's smem mixed-input schedules do not compile.)
-
-Reference time versus yardsticks (BF16 cuBLAS with the weights pre-dequantized to BF16, and the INT4 weight-traffic
-roofline at 7.5 TB/s):
-
-| label               | reference | ref us | cuBLAS BF16 us | roofline us | ref speed vs cuBLAS | vs roofline |
-|---------------------|-----------|--------|----------------|-------------|---------------------|-------------|
-| decode_m1_mlp_up    | Marlin    | 87     | 167            | 32.3        | 192%                | 37%         |
-| decode_m16_qkv      | Marlin    | 25     | 44             | 5.8         | 173%                | 23%         |
-| decode_m64_mlp_down | Marlin    | 106    | 101            | 16.1        | 96%                 | 15%         |
-| decode_m128_o_proj  | CUTLASS   | 56     | 40             | 4.6         | 71%                 | 8%          |
-| decode_m128_mlp_up  | CUTLASS   | 190    | 187            | 32.3        | 99%                 | 17%         |
-| prefill_qkv         | CUTLASS   | 1580   | 841            | -           | 53%                 | -           |
-
-The reference is therefore still far from the memory roofline on the decode shapes (at best 37%), so there is
-headroom for a bandwidth-optimal kernel.
-
-Your function is timed as a whole call, including any host-side launch setup.
-
-**Weight repacking (fairness rule).** Both references need the weights in their own kernel-specific layout (Marlin:
-16x64 tensor-core tiles with interleaved nibbles and permuted scales; CUTLASS: scales as [K/128, N]). The harness hands
+**Weight repacking (fairness rule).** The references need the weights in their own kernel-specific layouts. The harness hands
 every implementation the plain layout documented above; the references convert it **once, outside the timed region**
 (what an inference engine does at model-load time), so their timed work is the GEMM kernel launches only. You may do
 the same: repack / transpose / pre-convert `B` and `B_scales` once into a function-local static cache keyed on the
 weight pointers and (N, K), on the first (warm-up) call, and reuse it. Everything that depends on A, alpha, beta or D
-must be recomputed on every call: the harness refreshes A with new values before every timed call and re-checks the
-result after the timing loop with yet another A, so results cannot be memoized. The weights are constant across calls
-(a buffer address and shape always carry identical contents), and the timed trials are the min over 20 calls after 3
-warm-ups, so the first-call repack cost is not measured; a per-call dequantization pass that writes a dequantized copy
+must be recomputed on every call. The weights are constant across calls (a buffer address and shape always carry
+identical contents), so the first-call repack cost is not measured; a per-call dequantization pass that writes a dequantized copy
 of the weights to memory is real per-call work and is not allowed to be hidden this way (see Rules).
 
 ## Rules

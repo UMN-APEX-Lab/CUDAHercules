@@ -4,8 +4,8 @@
 NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a` and is skipped on other GPUs.
 
 FP8 (E4M3) GEMM with block-wise scaling and BF16 output -- the DeepSeek-V3 style "FP8 blockwise" recipe used for FP8
-serving: activations are scaled per token and 128-wide K group ("1x128"), weights per 128x128 block. Compared against the
-CUTLASS Blackwell blockwise-scaled GEMM (example 81).
+serving: activations are scaled per token and 128-wide K group ("1x128"), weights per 128x128 block. Compared against a
+CUTLASS-based reference.
 
 ## Function Signature
 
@@ -37,9 +37,7 @@ the product of the two scales and added to the FP32 accumulator. D is the FP32 a
 ## Data Types and Precision
 
 A, B: FP8 E4M3. Scales: FP32. Accumulation and scaling: FP32. Output: BF16. Lower-precision arithmetic (FP4 / FP6 / E5M2
-inputs, INT8, FP16 or BF16 accumulation, rounding scales, tensor-core kinds that cannot carry FP32 scales such as
-`mxf8f6f4`) is not allowed even if it were to pass the tolerance. Accumulating the partial sums of all K blocks without
-the per-block promotion (or ignoring either scale) gives wrong results.
+inputs, INT8, FP16 or BF16 accumulation, rounding scales) is not allowed even if it were to pass the tolerance.
 
 ## Memory Layouts (exact)
 
@@ -62,9 +60,6 @@ make test                    # requires solution.h in the task directory
 ./test 8192 8192 8192        # one custom shape: M N K  (K multiple of 128)
 ```
 
-`make ref` builds the CUTLASS reference alone (`KH_VALIDATE_REF=1 ./ref` re-validates it against an independent kernel that
-applies the layouts above by hand; `make sweep` times all reference configurations).
-
 ## Problem Sizes
 
 The linear layers of Llama-3-70B served in FP8 on one B200 (hidden 8192, 64 query / 8 KV heads of dimension 128 -> fused
@@ -81,38 +76,30 @@ weight (N = output features): either an 8K-token prefill chunk or one decode ste
 | prefill_mlp_up   | 8192 | 57344  | 8192  | fused gate+up projection     |
 | prefill_mlp_down | 8192 | 8192   | 28672 | FFN down projection          |
 
-Two extra correctness-only cases (not timed): (M=200, N=1152, K=1408) and (M=16, N=2048, K=4096) check M that is not a
-multiple of the tile and tiny M. Data: FP8 values uniform in [-1, 1) rounded to E4M3 (full mantissas); scales are random
-positive FP32 values, log-uniform in [0.25, 4) with full mantissas (never all 1.0, never 0 or negative).
+Two extra correctness-only cases (not timed): (M=200, N=1152, K=1408) and (M=16, N=2048, K=4096).
+Data: FP8 values uniform in [-1, 1) rounded to E4M3 (full mantissas); scales are random positive FP32 values,
+log-uniform in [0.25, 4) with full mantissas.
 
 ## Correctness
 
-The CUTLASS reference and your solution write to separate buffers that are pre-filled with NaN. After your function
+The reference and your solution write to separate buffers that are pre-filled with NaN. After your function
 returns, **every** element of D is compared (on the device) with the reference output:
 
 - every element must be finite (NaN / Inf fail, so unwritten elements fail);
-- `|D - ref| <= 1e-3 * RMS(ref) + 0.03125 * |ref|` for every element (one BF16 ulp is up to 0.0078 |ref|);
+- `|D - ref| <= 1e-3 * RMS(ref) + 0.03125 * |ref|` for every element;
 - the relative Frobenius error `||D - ref|| / ||ref||` must be `<= 3e-4`.
 
-FP8 products and the per-block partial sums are exact in FP32, so a sequential FP32 implementation with the same block
-promotion is bit-identical to the reference, and a correct variant with a different summation order (reverse K order,
-promotion every 32 K, different scale association) measures a relative Frobenius error of 8e-7 to 5.3e-5 (3e-4 is >= 5.7x
-above). Deliberately wrong variants measure: FP16 accumulation 1.6e-3 to 3.2e-3, BF16 accumulation 4.6e-3 to 1.8e-2, last 128 K
-skipped 6e-2 to 0.26, inputs rounded to E5M2 8.2e-2, FP4 inputs 0.40, B scales per column instead of per 128x128 block 0.60,
-A scales ignored 0.64, B scales ignored 0.64, A scales read K-major 0.85: all fail on every shape. The check is repeated after the timing loop on a fresh input (see below).
-
-**Inputs change on every call.** Before every timed call of both the reference and your function the harness regenerates the activation matrix A and its scales SFA (the weights B / SFB stay fixed) with a new random seed (outside the timed region), the first correctness check and the final re-check use their own seeds, and in the final re-check the reference output is recomputed for the new input before your function is called on a freshly poisoned D. Outputs and any input-dependent intermediates must therefore be recomputed on every call; caching them across calls (memoisation) fails the re-check. Only data derived from the fixed operands may be cached.
+**Inputs change on every call.** Before every timed call of both the reference and your function, the harness
+regenerates the activation matrix A and its scales SFA with a new random seed (outside the timed region); the weights
+B / SFB stay fixed. The final re-check runs on a fresh input for every case, with the reference recomputed and D
+re-poisoned. Outputs and any input-dependent intermediates must therefore be recomputed on every call; only data
+derived from the fixed operands may be cached.
 
 ## Performance
 
-For each shape the harness times the CUTLASS reference and your function with CUDA events (L2 flushed before every trial,
+For each shape the harness times the reference and your function with CUDA events (L2 flushed before every trial,
 D re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The
-score is the geometric mean of the speedups over the seven shapes. The reference uses a tile / cluster configuration tuned
-per shape (prefill: 256x128 2-SM tile, cluster 2x1, rasterization swizzle 8; decode: 128x128 tile, cluster 1x2). It reaches 1.7-1.8 PFLOPS on the prefill shapes: 52-60% of cuBLAS tensor-wise-scaled FP8 GEMM (3.0-3.3 PFLOPS) and 67-75% of
-cuBLAS row-wise-scaled FP8 GEMM on the same shapes (neither does per-block promotion of the accumulator), and 108% / 84% / 114% of
-cuBLAS tensor-wise on the decode shapes (mlp_up / mlp_down / lm_head). cuBLAS (via `torch` `F.scaled_mm`) has no blockwise FP8 path
-on SM100, so there is no like-for-like library yardstick; the blockwise reference is roughly half of the dense-FP8 peak
-because the per-128-K promotion runs on CUDA cores.
+score is the geometric mean of the speedups over the seven shapes.
 
 Your function is timed as a whole call, including any host-side launch setup. One-time setup (e.g.
 `cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics.
@@ -121,5 +108,4 @@ Your function is timed as a whole call, including any host-side launch setup. On
 
 - Solutions must be your own kernels: no cuBLAS / cuDNN, and no CUTLASS device / kernel / collective GEMM templates.
   CuTe and low-level building blocks (barriers, pipelines, layouts, `tcgen05` PTX) are allowed.
-- The shipped `solution.h` is a deliberately simple FP32-FMA SIMT kernel; it exists to validate the harness. A real solution
-  is expected to use `tcgen05.mma` (FP8) with per-128-K-block promotion of the accumulator to FP32.
+- The shipped `solution.h` is a simple correct baseline that you may replace entirely.

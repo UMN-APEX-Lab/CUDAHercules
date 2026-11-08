@@ -4,7 +4,7 @@
 NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a` and is skipped on other GPUs.
 
 Mamba-2 (state-space duality, SSD) forward pass with one B/C group shared by all heads, compared against a
-ThunderKittens chunked tensor-core kernel.
+ThunderKittens-style tensor-core reference.
 
 ## Function Signature
 
@@ -34,7 +34,7 @@ with a state S in R^{d_state x 64} (S_{-1} = 0):
     O[b,h,t,:] = Q[b,t] S_t
 
 or, in the quadratic form, O[t] = sum_{s <= t} exp(sum_{r=s+1..t} A[r]) (Q[t] . K[s]) V[s]. The current token
-is included with weight 1. N is a multiple of 64 and H is even (the reference processes two heads per CTA).
+is included with weight 1. N is a multiple of 64 and H is even.
 
 ## Data Types and Precision
 
@@ -53,9 +53,7 @@ Q, K: `[B, 1, N, d_state]`; V, O: `[B, H, N, 64]`; A: `[B, H, N]`; row-major, co
 make test             # builds ./test (needs solution.h in the task directory)
 ./test                # all cases below
 ./test B H N d_state  # one custom shape (N multiple of 64, H even, d_state 64 or 128), timed
-make ref              # the reference alone
 ```
-The build needs the ThunderKittens headers (`TK_DIR`, default `../../../../reference_sources/ThunderKittens`).
 
 ## Problem Sizes
 
@@ -71,16 +69,15 @@ Three small correctness-only cases run first and are not timed: (B,H,N,d_state) 
 
 ## Inputs
 
-Generated on the device with full-mantissa uniform random values: Q, K in [-1.73, 1.73) / d_state^(1/4) (so
-Q.K has unit variance), V in [-1.7, 1.7). A[b,h,t] = -A_h * dt with dt log-uniform in [1e-3, 3e-2] per token and
-A_h in [1, 4) per head, i.e. per-token decay rates between 1e-3 and 0.12 (memory lengths from ~10 to ~1000
-tokens, so the state carried between 64-token chunks matters).
+Generated on the device with full-mantissa uniform random values: Q, K in [-1.73, 1.73) / d_state^(1/4),
+V in [-1.7, 1.7). A[b,h,t] = -A_h * dt with dt log-uniform in [1e-3, 3e-2] per token and A_h in [1, 4)
+per head.
 
-**The inputs change on every call.** Q (C), K (B), V (x*dt) and A (dt*A_h) are regenerated with a new random seed before every timed call of both the
-reference and your function (outside the timed region), and once more before the final re-check (run for every case, also without timing), which
-recomputes the reference for the new data. Outputs and every input-dependent intermediate (states,
-features, K^T V terms, ...) must therefore be recomputed on each call; a solution that caches or memoises
-its result fails the re-check.
+**The inputs change on every call.** Q (C), K (B), V (x*dt) and A (dt*A_h) are all regenerated with a new
+random seed before every timed call of both the reference and your function (outside the timed region),
+and once more before the final re-check, which runs for every case on fresh inputs. Outputs and every
+input-dependent intermediate must therefore be recomputed on each call; a solution that caches or
+memoises its result fails the re-check.
 
 ## Correctness
 
@@ -91,31 +88,19 @@ returns, **every** element of O is compared with the reference output:
 - `|O - ref| <= 0.2 * RMS(ref) + 0.03 * |ref|` for every element;
 - the relative Frobenius error `||O - ref|| / ||ref||` must be `<= 8.5e-3`.
 
-The reference deviates 2.5e-3 (Frobenius) from the official FP32 `ssd_minimal_discrete` (chunk length 128);
-a plain FP32 kernel deviates 2.8e-3 from the reference, so the bound leaves 3x margin. Defective
-implementations are outside it: decay 1 + A instead of exp(A) 1.4e-2, decay of the previous token 2.6e-2, A x1.05 / x0.95
-3.4e-2 / 3.6e-2, Q/K rounded to FP8 3.3e-2, state reset every 2048 / 512 / 64 tokens 0.1 / 0.24 / 0.63, current token left
-out 0.19, half of d_state ignored 0.71, Q and K swapped 1.4, no decay 8-17. For every case the check is repeated once more (also when timing is disabled) on freshly generated inputs, with the reference recomputed and O freshly poisoned.
-
 ## Performance
 
-For each timed case the harness times the reference and your function with CUDA events (3 warm-ups,
-`KH_BENCHMARK` trials, default 20; before every trial the inputs are regenerated, the L2 cache is flushed and O is re-poisoned,
-all outside the timed region) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`.
-The score is the geometric mean of the speedups over the three timed cases.
-
-The reference is a ThunderKittens-style kernel (one CTA per (batch, two heads) sharing the Q/K tiles,
-64-token chunks, TMA double buffering, chunk state in FP32 registers, d_state a template parameter;
-warp-level `mma.sync` tensor-core MMAs, because the upstream wgmma-based ThunderKittens kernel does not build
-for sm_100a). It takes 1.03 / 1.38 / 1.37 ms on the three cases (about 140 TFLOP/s), 15-20x faster than the
-official PyTorch `ssd_minimal_discrete` (19.8 / 20.3 / 21.7 ms). The shipped `solution.h` is a plain FP32 CUDA-core
-recurrence (5.1 / 9.0 / 16.4 ms).
+The reference and your function are timed with CUDA events (3 warm-ups, `KH_BENCHMARK` trials, default
+20). Before every trial the inputs are regenerated, the L2 cache is flushed and O is re-poisoned, all
+outside the timed region. The harness reports `Speedup = ref_min / kernel_min` per case; the score is
+the geometric mean of the speedups over the 3 timed cases.
 
 Your function is timed as a whole call. One-time setup (e.g. `cudaFuncSetAttribute`, scratch
-allocation) may be cached in function-local statics.
+allocation) may be cached in function-local statics. The shipped `solution.h` is a simple correct
+baseline that you may replace entirely.
 
 ## Rules
 
 - Solutions must be your own kernels: no cuBLAS / cuDNN, no ThunderKittens (`kittens::`, headers) and
-  no use of the harness or reference code. CuTe / CUTLASS low-level building blocks, `mma` / `wgmma` /
+  no use of the harness or reference code. CuTe / CUTLASS low-level building blocks, `mma` /
   `tcgen05` PTX and TMA are allowed.
