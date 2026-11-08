@@ -5,14 +5,18 @@ NVCC_FLAGS  = -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr
 ARCH        = -gencode arch=compute_100a,code=sm_100a
 
 # Reference only: compile CUTLASS example (no solution needed)
-ref: 70_blackwell_fp16_gemm.cu
+ref: 70_blackwell_fp16_gemm.cu kh_verify.h
 	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(CUTLASS_INC) $< -o $@
 
 # Test LLM solution: compile with solution.h included (needs CUTLASS headers)
-test: 70_blackwell_fp16_gemm.cu solution.h
+test: 70_blackwell_fp16_gemm.cu solution.h kh_verify.h
 	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(CUTLASS_INC) -DKH_TEST_SOLUTION $< -o $@
 
+# Development aid: time every reference configuration on every shape
+sweep: 70_blackwell_fp16_gemm.cu kh_verify.h
+	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(CUTLASS_INC) -DKH_SWEEP $< -o $@
+
 clean:
-	rm -f ref test
+	rm -f ref test sweep
 
 .PHONY: clean

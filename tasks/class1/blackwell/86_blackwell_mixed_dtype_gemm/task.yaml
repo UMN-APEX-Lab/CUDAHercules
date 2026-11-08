@@ -13,7 +13,7 @@ hardware:
 runner:
   backend: class1_make
   workdir: tasks/class1/blackwell/86_blackwell_mixed_dtype_gemm
-  timeout_sec: 180
+  timeout_sec: 900
   env:
     KH_BENCHMARK: '20'
   solution_file: solution.h
@@ -42,7 +42,13 @@ source:
   commit: ''
   license: BSD-3-Clause
 anti_cheat:
+  # Static check: only blatant cheating (wrapping the reference implementation). Calls to cuBLAS /
+  # cuDNN / CUTLASS kernel templates are blocked by the global rules; numeric precision is enforced by
+  # the run-time tolerance, not by patterns.
   blocked_patterns:
+  - '#\s*include\s*[<\"][^>\"]*marlin'
+  - '\b(MarlinRef|marlin_ref|gptq_marlin\w*)\b'
+  - '\b_weight_int4pack_mm\b'
   required_patterns:
   - __global__\s+void
   - <<<.*>>>

@@ -15,7 +15,7 @@ __global__ void naive_hgemm_kernel(
     float acc = 0.0f;
     for (int k = 0; k < K; ++k)
       acc += __half2float(A[i * lda + k]) * __half2float(B[k + j * ldb]);
-    C[i + j * ldc] = alpha * acc + beta * C[i + j * ldc];
+    C[i + j * ldc] = (beta == 0.0f) ? alpha * acc : alpha * acc + beta * C[i + j * ldc];
   }
 }
 

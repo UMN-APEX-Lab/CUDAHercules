@@ -1,11 +1,43 @@
-#include "kittens.cuh"
-#include "common.cuh"
+/*
+  Task tk_bf16_gemm: BF16 GEMM on Blackwell (sm_100a / B200), C = A * B^T.
+
+  Reference: the ThunderKittens Blackwell BF16 GEMM (kernels/gemm/bf16_b200: 2-CTA clusters, tcgen05
+  MMA, TMA, cluster launch control) with one template configuration chosen per problem shape from a
+  sweep on B200. It differs from the upstream kernel only in the tensor-memory release handshake
+  (both CTAs of a cluster synchronise before tensor memory is deprovisioned; without it the kernel can
+  fault with "unspecified launch failure").
+
+  Solution under test (KH_TEST_SOLUTION), implemented in solution.h:
+
+    void Bf16Gemm(__nv_bfloat16 *A, __nv_bfloat16 *B, __nv_bfloat16 *C, int M, int N, int K);
+
+    A: row-major [M, K], B: row-major [N, K] (the GEMM is C = A * B^T), C: row-major [M, N].
+
+  Verification: A and B are full-mantissa random BF16; the reference and the solution write to
+  different buffers that are pre-filled with NaN; every output element must be finite and within
+  tolerance of the reference. The solution is re-checked after the timing loop.
+*/
+
 #ifdef KH_TEST_SOLUTION
-#include "solution.h"
+#include "solution.h"   // first: the solution must not see ThunderKittens or the harness helpers
 #endif
+
+#include "kittens.cuh"
+#include "kh_verify.h"
+
+#include <functional>
+#include <memory>
+#include <vector>
 
 using namespace kittens;
 
+#ifdef KH_TEST_SOLUTION
+#define KH_PASS_MSG "Passed"
+#else
+#define KH_PASS_MSG "Reference ran (no solution under test)"
+#endif
+
+namespace bf16_gemm {
 template <int _Mb, int _Nb, int _Kb, int _SUPERGROUP_SIZE, bool _OVERLAP_MMA_EPI, int _LOAD_PIPE_DEPTH, int _EPI_PIPE_DEPTH>
 struct config {
     static_assert(_Mb == 256, "Mb must be 256");
@@ -89,12 +121,13 @@ __global__ void kernel(const __grid_constant__ globals<C> g) {
 
     __shared__ uint32_t tmem_addr;
     __shared__ clc::handle clc_handle[C::CLC_PIPE_DEPTH];
-    __shared__ semaphore tmem_provisioned, schedule_arrived[C::CLC_PIPE_DEPTH], schedule_finished[C::CLC_PIPE_DEPTH];
+    __shared__ semaphore tmem_provisioned, tmem_finished, schedule_arrived[C::CLC_PIPE_DEPTH], schedule_finished[C::CLC_PIPE_DEPTH];
     __shared__ semaphore inputs_arrived[C::LOAD_PIPE_DEPTH], inputs_finished[C::LOAD_PIPE_DEPTH], outputs_arrived[C::NUM_CONSUMERS], outputs_finished[C::MMA_PIPE_DEPTH];
     uint32_t bitfield = 0xFFFF0000; // ***_finished phase bits start as 1s, ***_arrived phase bits start as 0s
 
     if (threadIdx.x == 32) {
         init_semaphore(tmem_provisioned, 0, 1);
+        init_semaphore(tmem_finished, 0, 1);
         #pragma unroll
         for (int i = 0; i < C::CLC_PIPE_DEPTH; i++) {
             init_semaphore(schedule_arrived[i], 0, 1);
@@ -246,183 +279,239 @@ __global__ void kernel(const __grid_constant__ globals<C> g) {
             if (!schedule.success) break;
         }
         epilogue_group::sync(4);
-        if (epilogue_group::warpid() == 0) tm_alloc.deprovision();
+        if (epilogue_group::warpid() == 0) {
+            // Both CTAs of the cluster must be done with tensor memory before it is released
+            // (the 2-CTA MMA of CTA 0 also writes CTA 1's tensor memory).
+            if (warp::elect_leader()) tma::cluster::arrive(tmem_finished, 1-cta_rank);
+            wait(tmem_finished, 0);
+            tm_alloc.deprovision();
+        }
     }
 }
 
-template <typename C>
-__host__ double run_benchmark(size_t M, size_t N, size_t K, bool ncu = false) {
-    std::cout << "--------------------  M=" << M << " N=" << N << " K=" << K << "  --------------------\n";
-    std::cout << "Template: Mb=" << C::Mb << " Nb=" << C::Nb << " Kb=" << C::Kb << " SUPERGROUP_SIZE=" << C::SUPERGROUP_SIZE
-              << " OVERLAP_MMA_EPI=" << C::OVERLAP_MMA_EPI << " LOAD_PIPE_DEPTH=" << C::LOAD_PIPE_DEPTH << " EPI_PIPE_DEPTH=" << C::EPI_PIPE_DEPTH << "\n";
-    std::cout << "Total number of clusters: " << (M / (C::Mb*C::NUM_CONSUMERS) * N / C::Nb) << "\n";
-    std::cout << "Number of iterations per task: " << (K / C::Kb) << "\n";
+}  // namespace bf16_gemm
 
-    // Cooldown between configurations
-    sleep_ms(500);
 
-    // L2 cache eviction - multiple buffer groups
-    int l2_cache_size;
-    cudaDeviceGetAttribute(&l2_cache_size, cudaDevAttrL2CacheSize, 0);
-    const size_t arg_size = 2 * (size_t(M) * K + size_t(N) * K + size_t(M) * N);
-    const size_t ideal_arg_size = size_t(l2_cache_size) * 3;
-    const int arg_group_count = (arg_size > ideal_arg_size) ? 1 : int(ideal_arg_size / arg_size) + 1;
+struct Buffers { __nv_bfloat16 *A = nullptr, *B = nullptr, *D = nullptr; };
 
-    // Allocate device memory
-    std::vector<__nv_bfloat16*> d_A(arg_group_count);
-    std::vector<__nv_bfloat16*> d_B(arg_group_count);
-    std::vector<__nv_bfloat16*> d_C(arg_group_count);
-    __nv_bfloat16* d_C_ref;
-    for (int i = 0; i < arg_group_count; i++) {
-        CUDACHECK(cudaMalloc(&d_A[i], M*K*sizeof(__nv_bfloat16)));
-        CUDACHECK(cudaMalloc(&d_B[i], K*N*sizeof(__nv_bfloat16)));
-        CUDACHECK(cudaMalloc(&d_C[i], M*N*sizeof(__nv_bfloat16)));
+static void alloc_and_fill(Buffers &b, int M, int N, int K) {
+  size_t nA = size_t(M) * K, nB = size_t(N) * K, nC = size_t(M) * N;
+  KH_CHECK(cudaMalloc(&b.A, nA * 2));
+  KH_CHECK(cudaMalloc(&b.B, nB * 2));
+  KH_CHECK(cudaMalloc(&b.D, nC * 2));
+  kh_fill_uniform(b.A, nA, 11u);
+  kh_fill_uniform(b.B, nB, 22u);
+}
+/// Regenerates the per-call input A (new random values) with a new seed.
+static void refill_inputs(Buffers &b, int M, int N, int K, unsigned seed) {
+  (void)N;
+  kh_fill_uniform(b.A, size_t(M) * K, seed);
+}
+static void free_buffers(Buffers &b) { cudaFree(b.A); cudaFree(b.B); cudaFree(b.D); }
+
+// Reference configurations, selected per shape below (see the KH_SWEEP development target).
+using Cfg0 = bf16_gemm::config<256, 256, 64, 8, false, 4, 8>;
+using Cfg1 = bf16_gemm::config<256, 256, 64, 4, false, 4, 8>;
+using Cfg2 = bf16_gemm::config<256, 256, 128, 8, true, 3, 4>;
+using Cfg3 = bf16_gemm::config<256, 128, 128, 2, true, 4, 2>;
+using Cfg4 = bf16_gemm::config<256, 256, 64, 16, false, 4, 8>;
+constexpr int kNumCfg = 5;
+
+/// One prepared reference launch: tensor-map (TMA descriptor) construction for the `globals` and the
+/// launch configuration are done in the constructor, so run() is just the kernel launch.
+struct RefGemm {
+  virtual ~RefGemm() {}
+  virtual void run() = 0;
+  virtual int row_multiple() const = 0;
+  virtual int col_multiple() const = 0;
+  virtual int k_multiple() const = 0;
+};
+
+
+template <class C>
+struct TkRef : RefGemm {
+  using G = bf16_gemm::globals<C>;
+  G g;
+  std::unique_ptr<LaunchConfig<true, true>> lc;
+  TkRef(Buffers const &b, int M, int N, int K)
+      : g{typename G::a_gl{b.A, nullptr, nullptr, size_t(M), size_t(K)},
+          typename G::b_gl{b.B, nullptr, nullptr, size_t(N), size_t(K)},
+          typename G::d_gl{b.D, nullptr, nullptr, size_t(M), size_t(N)}} {
+    KH_CHECK(cudaFuncSetAttribute(bf16_gemm::kernel<C>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  g.dynamic_shared_memory()));
+    lc.reset(new LaunchConfig<true, true>(g.grid(), g.block(), g.dynamic_shared_memory(),
+                                          cudaStream_t(0), C::CLUSTER_SIZE));
+  }
+  void run() override { KH_CHECK(cudaLaunchKernelEx(*lc, bf16_gemm::kernel<C>, g)); }
+  int row_multiple() const override { return C::NUM_CONSUMERS * C::Mb; }
+  int col_multiple() const override { return C::Nb; }
+  int k_multiple() const override { return C::Kb; }
+};
+
+
+static std::unique_ptr<RefGemm> make_ref(int cfg, Buffers const &b, int M, int N, int K) {
+  switch (cfg) {
+    case 0: return std::make_unique<TkRef<Cfg0>>(b, M, N, K);
+    case 1: return std::make_unique<TkRef<Cfg1>>(b, M, N, K);
+    case 2: return std::make_unique<TkRef<Cfg2>>(b, M, N, K);
+    case 3: return std::make_unique<TkRef<Cfg3>>(b, M, N, K);
+    case 4: return std::make_unique<TkRef<Cfg4>>(b, M, N, K);
+    default: std::fprintf(stderr, "bad config index\n"); std::exit(2);
+  }
+}
+
+// TOLERANCE_PLACEHOLDER
+// Tolerances (measured; BF16 output, relative Frobenius error vs the reference over all shapes below).
+// The reference's tensor-core accumulation order differs from a sequential FP32 kernel: the shipped
+// baseline measures 2.0e-4 .. 4.0e-4 (max|err|/rms <= 3.6e-2 = single BF16-ulp flips on the largest
+// elements, always inside the per-element rel. term). Bounds: Frobenius 1.5e-3 (3.7x), elements
+// 1e-3*RMS + 1.6e-2*|ref| (two BF16 ulps). Bad variants, all FAIL on every shape: BF16 partial sums
+// every 512 K 2.6e-3, FP16 accumulation 1.3e-2 .. 2.5e-2, FP8 E4M3 inputs 3.4e-2, skipped K block
+// 6.7e-2 .. 1.3e-1, BF16 accumulation 1.0e-1 .. 1.9e-1, B not transposed 1.4, half the outputs
+// unwritten (NaN), empty solution (NaN).
+static KhTol kTol(1.0e-3, 1.5e-3, 1.6e-2);
+
+struct Shape3 { const char *label; int M, N, K, cfg; };
+
+/// Returns false on failure. `timed` = also print Ref / Kernel timings.
+static bool run_case(Shape3 const &s, bool timed, int trials) {
+  int M = s.M, N = s.N, K = s.K;
+  size_t nC = size_t(M) * N;
+  Buffers b;
+  alloc_and_fill(b, M, N, K);
+  __nv_bfloat16 *D_ref = b.D;
+  kh_poison(D_ref, nC * 2);
+  KH_CHECK(cudaDeviceSynchronize());
+
+  auto ref = make_ref(s.cfg, b, M, N, K);
+  if (M % ref->row_multiple() || N % ref->col_multiple() || K % ref->k_multiple()) {
+    std::fprintf(stderr, "shape %dx%dx%d is not a multiple of the reference tile (%d,%d,%d)\n", M, N, K,
+                 ref->row_multiple(), ref->col_multiple(), ref->k_multiple());
+#ifdef KH_SWEEP
+    ref.reset(); free_buffers(b);
+    return true;
+#else
+    std::exit(2);
+#endif
+  }
+  ref->run();
+  KH_CHECK(cudaDeviceSynchronize());
+
+  bool ok = true;
+  {   // the reference must have written every element (it was pre-filled with NaN)
+    KhResult r = kh_compare(D_ref, D_ref, nC, kTol);
+    if (!r.pass) {
+      std::cerr << "Reference output incomplete or non-finite (non-finite = " << r.nonfinite << ")" << std::endl;
+      ok = false;
     }
-    CUDACHECK(cudaMalloc(&d_C_ref, M*N*sizeof(__nv_bfloat16)));
-    std::cout << "Allocated device memory" << std::endl;
-
-    // Initialize matrices with random values on device
-    uint64_t seed = 2024;
-    for (int i = 0; i < arg_group_count; i++) {
-        fill<__nv_bfloat16, FillMode::RANDOM>(d_A[i], M*K, seed + i*100, -1.0f, 1.0f);
-        fill<__nv_bfloat16, FillMode::RANDOM>(d_B[i], K*N, seed + i*100 + 1, -1.0f, 1.0f);
-        fill<__nv_bfloat16, FillMode::CONSTANT>(d_C[i], M*N, 0.0f);
-    }
-    fill<__nv_bfloat16, FillMode::CONSTANT>(d_C_ref, M*N, 0.0f);
-    CUDACHECK(cudaDeviceSynchronize());
-    std::cout << "Initialized matrices on device" << std::endl;
-
-    // Compute reference GEMM on device
-    reference_gemm<__nv_bfloat16, __nv_bfloat16>(d_C_ref, d_A[0], d_B[0], M, N, K);
-    CUDACHECK(cudaDeviceSynchronize());
-    std::cout << "Computed reference GEMM on device" << std::endl;
-
-    // Prepare kernel inputs
-    std::vector<globals<C>> g;
-    for (int i = 0; i < arg_group_count; i++) {
-        typename globals<C>::a_gl Ag{d_A[i], nullptr, nullptr, M, K};
-        typename globals<C>::b_gl Bg{d_B[i], nullptr, nullptr, N, K};
-        typename globals<C>::d_gl Dg{d_C[i], nullptr, nullptr, M, N};
-        g.push_back(globals<C>{Ag, Bg, Dg});
-    }
-
-    // Set kernel attributes
-    CUDACHECK(cudaFuncSetAttribute(kernel<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, g[0].dynamic_shared_memory()));
-
-    // Prepare kernel launch configuration
-    LaunchConfig<true, true> launch_config(g[0].grid(), g[0].block(), g[0].dynamic_shared_memory(), 0, C::CLUSTER_SIZE);
-
-    // Number of iterations
-    int num_warmups = ncu ? 0 : 5;
-    int num_iters = ncu ? 1 : 10;
-
-    // Warmup
-    for(int i = 0; i < num_warmups; i++) {
-        int idx = i % arg_group_count;
-        cudaLaunchKernelEx(launch_config, kernel<C>, g[idx]);
-    }
-
-    // Benchmark
-    cudaEvent_t start, stop;
-    CUDACHECK(cudaEventCreate(&start));
-    CUDACHECK(cudaEventCreate(&stop));
-    CUDACHECK(cudaEventRecord(start));
-    for(int i = 0; i < num_iters; i++) {
-        int idx = i % arg_group_count;
-        cudaLaunchKernelEx(launch_config, kernel<C>, g[idx]);
-    }
-    CUDACHECK(cudaEventRecord(stop));
-    CUDACHECK(cudaEventSynchronize(stop));
-
-    // Calculate duration and TFLOPs
-    float milliseconds;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    double microseconds = milliseconds * 1000.0 / num_iters;
-    double flops = double(2.0) * M * N * K;
-    double tflops = (flops / microseconds) / 1e6;
-    std::cout << "Average kernel execution time: " << microseconds << " us\n";
-    std::cout << "Achieved performance: " << tflops << " TFLOPs\n";
-
-    // Verify results
-    check_correctness(d_C[0], d_C_ref, M * N);
-
-    // Print ref timing in KH format
-    float ref_avg_ms = milliseconds / num_iters;
-    std::cout << "Ref time: " << std::fixed << std::setprecision(4) << ref_avg_ms
-              << " ms (avg over " << num_iters << " trials, min: " << ref_avg_ms << " ms)" << std::endl;
+  }
 
 #ifdef KH_TEST_SOLUTION
-    {
-        // Solution test
-        __nv_bfloat16 *d_C_solution;
-        CUDACHECK(cudaMalloc(&d_C_solution, M*N*sizeof(__nv_bfloat16)));
-        fill<__nv_bfloat16, FillMode::CONSTANT>(d_C_solution, M*N, 0.0f);
-        CUDACHECK(cudaDeviceSynchronize());
-
-        Bf16Gemm(d_A[0], d_B[0], d_C_solution, M, N, K);
-        CUDACHECK(cudaDeviceSynchronize());
-
-        std::cout << "Solution correctness:" << std::endl;
-        check_correctness(d_C_solution, d_C_ref, M * N);
-
-        // Warmup
-        for(int i = 0; i < num_warmups; i++)
-            Bf16Gemm(d_A[0], d_B[0], d_C_solution, M, N, K);
-        CUDACHECK(cudaDeviceSynchronize());
-
-        // Benchmark solution with per-iteration timing
-        float sol_total_ms = 0.0f, sol_min_ms = 1e30f;
-        for(int i = 0; i < num_iters; i++) {
-            cudaEvent_t start2, stop2;
-            CUDACHECK(cudaEventCreate(&start2));
-            CUDACHECK(cudaEventCreate(&stop2));
-            CUDACHECK(cudaEventRecord(start2));
-            Bf16Gemm(d_A[0], d_B[0], d_C_solution, M, N, K);
-            CUDACHECK(cudaEventRecord(stop2));
-            CUDACHECK(cudaEventSynchronize(stop2));
-            float ms;
-            cudaEventElapsedTime(&ms, start2, stop2);
-            sol_total_ms += ms;
-            if (ms < sol_min_ms) sol_min_ms = ms;
-            cudaEventDestroy(start2);
-            cudaEventDestroy(stop2);
-        }
-        float sol_avg_ms = sol_total_ms / num_iters;
-        std::cout << "Kernel time: " << std::fixed << std::setprecision(4) << sol_avg_ms
-                  << " ms (avg over " << num_iters << " trials, min: " << sol_min_ms << " ms)" << std::endl;
-
-        cudaFree(d_C_solution);
-    }
+  __nv_bfloat16 *D_sol = nullptr;
+  KH_CHECK(cudaMalloc(&D_sol, nC * 2));
+  auto reset_sol = [&] { kh_poison(D_sol, nC * 2); };
+  auto call_sol = [&] { Bf16Gemm(b.A, b.B, D_sol, M, N, K); KH_CHECK(cudaGetLastError()); };
+  if (ok) {
+    reset_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    call_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    KhResult r = kh_compare(D_sol, D_ref, nC, kTol);
+    kh_print_result("solution", r, kTol);
+    ok = r.pass;
+  }
 #endif
 
-    // Clean up
-    for (int i = 0; i < arg_group_count; i++) {
-        cudaFree(d_A[i]);
-        cudaFree(d_B[i]);
-        cudaFree(d_C[i]);
+  if (ok && timed) {   // the fresh-input re-check also runs when timing is disabled (KH_BENCHMARK=0)
+    // The activations A (including their block scales when quantised) are regenerated with a new seed,
+    // outside the timed region and before the L2 flush, before every call of both the reference and the
+    // solution, so a result or an A-dependent intermediate cannot be memoized across calls; the weights B
+    // stay fixed. The reference output is re-poisoned before every call.
+    unsigned seed = 1000u;
+    auto refresh = [&] { refill_inputs(b, M, N, K, seed++); };
+    if (trials > 0) {
+    KhTime tr = kh_time([&] { ref->run(); }, trials, [&] { kh_poison(D_ref, nC * 2); refresh(); });
+    kh_print_time("Ref", tr);
+#ifdef KH_TEST_SOLUTION
+    KhTime ts = kh_time(call_sol, trials, [&] { reset_sol(); refresh(); });
+    kh_print_time("Kernel", ts);
+    kh_print_speedup(tr, ts);
+#endif
     }
-    cudaFree(d_C_ref);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+#ifdef KH_TEST_SOLUTION
+    // Re-check after timing with yet another fresh input: recompute the reference for it, re-poison the
+    // solution output, and require the solution to produce the right answer from scratch.
+    refresh();
+    kh_poison(D_ref, nC * 2);
+    ref->run();
+    KH_CHECK(cudaDeviceSynchronize());
+    reset_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    call_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    KhResult r = kh_compare(D_sol, D_ref, nC, kTol);
+    kh_print_result("solution (re-check after timing, fresh input)", r, kTol);
+    ok = r.pass;
+#endif
+  }
 
-    return tflops;
+#ifdef KH_TEST_SOLUTION
+  cudaFree(D_sol);
+#endif
+  ref.reset();
+  free_buffers(b);
+  return ok;
 }
 
-__host__ int main() {
-    int N;
-    bool ncu = false;
+int main(int argc, char **argv) {
+  cudaDeviceProp props;
+  KH_CHECK(cudaGetDeviceProperties(&props, 0));
+  if (props.major != 10 || props.minor != 0) {
+    std::cerr << "This task requires a Blackwell sm_100 GPU (B200)." << std::endl;
+    return 1;
+  }
+  int trials = kh_trials();
+  bool const keep_going = std::getenv("KH_KEEP_GOING") != nullptr;   // development aid
+  bool failed = false;
 
-    // Template parameters: Mb, Nb, Kb, SUPERGROUP_SIZE, OVERLAP_MMA_EPI, LOAD_PIPE_DEPTH, EPI_PIPE_DEPTH
-    N = 1024;
-    run_benchmark<config<256, 64, 128, 4, true, 5, 2>>(N, N, N, ncu);
-    N = 2048;
-    run_benchmark<config<256, 256, 64, 8, true, 5, 4>>(N, N, N, ncu);
-    N = 4096;
-    run_benchmark<config<256, 256,  64, 4, false, 4, 8>>(N, N, N, ncu);
-    N = 8192;
-    run_benchmark<config<256, 256,  64, 8, false, 4, 8>>(N, N, N, ncu);
-    N = 16384;
-    run_benchmark<config<256, 256,  64, 8, false, 4, 8>>(N, N, N, ncu);
+  // Llama-3-70B linear layers (hidden 8192, 64 q / 8 kv heads x 128 -> fused QKV 10240, FFN 28672 ->
+  // fused gate+up 57344); M = tokens. The reference tile is 256 rows per CTA pair, so the smallest
+  // supported batch is 256 tokens (a large decode / speculative batch); the rest are 8K / 16K-token
+  // prefill chunks.
+  std::vector<Shape3> shapes = {
+      {"decode_batch256_qkv", 256, 10240, 8192, 2},
+      {"decode_batch256_mlp_down", 256, 8192, 28672, 3},
+      {"prefill_qkv", 8192, 10240, 8192, 0},
+      {"prefill_o_proj", 8192, 8192, 8192, 0},
+      {"prefill_mlp_up", 8192, 57344, 8192, 0},
+      {"prefill_mlp_down", 8192, 8192, 28672, 1},
+      {"prefill16k_o_proj", 16384, 8192, 8192, 4}
+  };
 
+#ifdef KH_SWEEP
+  // Development aid: time every reference configuration on every shape.
+  for (auto s : shapes) {
+    for (int cfg = 0; cfg < kNumCfg; ++cfg) {
+      s.cfg = cfg;
+      std::printf("\n=== %s cfg=%d: M=%d, N=%d, K=%d ===\n", s.label, cfg, s.M, s.N, s.K);
+      run_case(s, true, 10);
+    }
+  }
+  return 0;
+#endif
+
+  if (argc >= 4) {   // ./test M N K : single custom shape
+    Shape3 s{"custom", atoi(argv[1]), atoi(argv[2]), atoi(argv[3]), atoi(argv[1]) <= 512 ? 2 : 0};
+    std::printf("\n=== custom: M=%d, N=%d, K=%d ===\n", s.M, s.N, s.K);
+    if (!run_case(s, true, trials)) { std::cout << "Incorrect" << std::endl; return 1; }
+    std::cout << KH_PASS_MSG << std::endl;
     return 0;
+  }
+
+  for (auto const &s : shapes) {
+    std::printf("\n=== %s: M=%d, N=%d, K=%d ===\n", s.label, s.M, s.N, s.K);
+    if (!run_case(s, true, trials)) { std::cout << "Incorrect" << std::endl; if (!keep_going) return 1; failed = true; }
+    else std::cout << KH_PASS_MSG << std::endl;
+  }
+  return failed ? 1 : 0;
 }

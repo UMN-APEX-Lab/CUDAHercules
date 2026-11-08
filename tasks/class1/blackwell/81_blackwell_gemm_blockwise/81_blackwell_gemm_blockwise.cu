@@ -2,732 +2,430 @@
  * Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
+ * Redistribution and use in source and binary forms, with or without modification, are permitted
+ * provided that the following conditions are met: (BSD-3-Clause, see the CUTLASS LICENSE.txt)
  **************************************************************************************************/
 
-/*! \file
-    \brief An FP8 blockwise scaled GEMM example for the NVIDIA Blackwell SM100 architecture using CUTLASS.
+/*
+  Task 81_blackwell_gemm_blockwise: FP8 (E4M3) GEMM with block-wise scaling, BF16 output, on Blackwell
+  (sm_100a / B200) -- the DeepSeek-V3 / "FP8 blockwise" serving recipe:
+
+      D[m,n] = sum_kb  SFA[kb,m] * SFB[kb, n/128] * ( sum_{k in block kb} A[m,k] * B[n,k] )
+
+  activations A are scaled per (row, 128-wide K block) ("1x128"), weights B per (128 N) x (128 K)
+  block ("128x128"); the per-block partial sums are promoted to FP32 and accumulated in FP32.
+
+  Reference: the CUTLASS Blackwell blockwise-scaled GEMM (example 81, KernelScheduleSm100Blockwise)
+  with one tile / cluster configuration (and, for decode shapes, swapped operands) chosen per problem
+  shape from a sweep on B200. The reference was validated offline (and can be re-validated with
+  `KH_VALIDATE_REF=1 ./ref`) against an independent device kernel that applies the documented
+  scale layouts by hand.
+
+  Solution under test (KH_TEST_SOLUTION), implemented in solution.h:
+
+    cudaError_t BlackwellBlockwiseGemm(int M, int N, int K,
+                                       __nv_fp8_e4m3 const *A, float const *SFA,
+                                       __nv_fp8_e4m3 const *B, float const *SFB,
+                                       __nv_bfloat16 *D);
+
+  The data / scale layouts are documented in description.txt.
+
+  Verification: random full-mantissa FP8 data and random positive FP32 scales; the reference and the
+  solution write to different buffers pre-filled with NaN; every output element must be finite and
+  within tolerance of the reference (device-side comparison). The solution is re-checked after timing.
 */
 
+#include <cstdio>
+#include <cstring>
+#include <functional>
 #include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
 
 #include "cutlass/cutlass.h"
 
 #ifdef KH_TEST_SOLUTION
+#include <cuda_bf16.h>
 #include <cuda_fp8.h>
-#include "solution.h"
+#include "solution.h"   // must stay before kh_verify.h: the solution must not see the helpers
 #endif
 
 #include "cute/tensor.hpp"
-#include "cutlass/tensor_ref.h"
-#include "cutlass/epilogue/thread/activation.h"
+#include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/epilogue/dispatch_policy.hpp"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/detail/blockwise_scale_layout.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
-#include "cutlass/gemm/kernel/tile_scheduler_params.h"
-
-#include "cutlass/util/command_line.h"
-#include "cutlass/util/distribution.h"
-#include "cutlass/util/host_tensor.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "cutlass/util/tensor_view_io.h"
-#include "cutlass/util/reference/host/tensor_fill.h"
-#include "cutlass/util/reference/host/tensor_copy.h"
-#include "cutlass/util/reference/host/tensor_compare.h"
-#include "cutlass/util/reference/host/tensor_norm.h"
 
-#include "cutlass/util/reference/host/gett.hpp"
-
-#include "helper.h"
+#include "kh_verify.h"
 
 using namespace cute;
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/// GEMM kernel configurations
-/////////////////////////////////////////////////////////////////////////////////////////////////
-// A matrix configuration
-using ElementA            = cutlass::float_e4m3_t;                          // Element type for A matrix operand
-using LayoutA             = cutlass::layout::RowMajor;                      // Layout type for A matrix operand
-constexpr int AlignmentA  = 128 / cutlass::sizeof_bits<ElementA>::value;    // Memory access granularity/alignment of A matrix in units of elements (up to 16 bytes)
-
-// B matrix configuration
-using ElementB            = cutlass::float_e4m3_t;                          // Element type for B matrix operand
-using LayoutB             = cutlass::layout::ColumnMajor;                   // Layout type for B matrix operand
-constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;    // Memory access granularity/alignment of A matrix in units of elements (up to 16 bytes)
-
-// C/D matrix configuration
-using ElementC            = cutlass::float_e4m3_t;                          // Element type for C and D matrix operands
-using LayoutC             = cutlass::layout::ColumnMajor;                   // Layout type for C and D matrix operands
-constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Memory access granularity/alignment of A matrix in units of elements (up to 16 bytes)
-
-using ElementD           = ElementC;
-using LayoutD            = LayoutC;
-constexpr int AlignmentD = AlignmentC;
-
-// MMA type
-using ElementAccumulator = float;                                           // Element Accumulator will also be our scale factor type
-using ElementCompute = float;
-
-
-// MMA and Cluster Tile Shapes
-// Shape of the tile computed by tcgen05 MMA, could be across 2 SMs if Cluster Shape %2 == 0 
-using MmaTileShape_MNK = Shape<_128,_128,_128>;                          
-// Shape of the threadblocks in a cluster
-using ClusterShape_MNK = Shape<_1,_1,_1>;
- 
-using ScaleConfig = decltype(cutlass::detail::sm100_trivial_blockwise_scale_config(MmaTileShape_MNK{}));
-
-using LayoutSFA             = decltype(ScaleConfig::deduce_layoutSFA());                     // Layout type for SFA matrix operand
-using LayoutSFB             = decltype(ScaleConfig::deduce_layoutSFB());                     // Layout type for SFB matrix operand
-
-
-using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
-    MmaTileShape_MNK, ClusterShape_MNK,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementCompute,
-    ElementC, LayoutC, AlignmentC,
-    ElementD, LayoutC, AlignmentD,
-    cutlass::epilogue::collective::EpilogueScheduleAuto
-  >::CollectiveOp;
-
-using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
-    ElementA, cute::tuple<LayoutA, LayoutSFA>, AlignmentA,
-    ElementB, cute::tuple<LayoutB, LayoutSFB>, AlignmentB,
-    ElementAccumulator,
-    MmaTileShape_MNK, ClusterShape_MNK,
-    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::KernelScheduleSm100Blockwise
-  >::CollectiveOp;
-
-using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int,int,int,int>,
-    CollectiveMainloop,
-    CollectiveEpilogue,
-    void>;                // Default to ClusterLaunchControl (CLC) based tile scheduler
-
-using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-
-using StrideA = typename Gemm::GemmKernel::StrideA;
-using StrideB = typename Gemm::GemmKernel::StrideB;
-using StrideC = typename Gemm::GemmKernel::StrideC;
-using StrideD = typename Gemm::GemmKernel::StrideD;
-
-/// Initialization
-StrideA stride_A;
-StrideB stride_B;
-StrideC stride_C;
-StrideD stride_D;
-// Strides just iterate over scalars and have no zeros
-LayoutSFA layout_SFA;
-LayoutSFB layout_SFB;
-// Layouts are tiled to the problem size and the strides have zeros
-uint64_t seed;
-
-cutlass::HostTensor<ElementA          , LayoutA> tensor_A;
-cutlass::HostTensor<ElementAccumulator, cutlass::layout::PackedVectorLayout> tensor_SFA;
-cutlass::HostTensor<ElementB          , LayoutB> tensor_B;
-cutlass::HostTensor<ElementAccumulator, cutlass::layout::PackedVectorLayout> tensor_SFB;
-cutlass::HostTensor<ElementC          , LayoutC> tensor_C;
-cutlass::HostTensor<ElementD          , LayoutD> tensor_D;
-cutlass::HostTensor<ElementD          , LayoutD> tensor_ref_D;
-
-#endif // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/// Testbed utility types
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Command line options parsing
-struct Options {
-
-  bool help = false;
-  bool skip_verification = false;
-
-  float alpha = 1.f, beta = 0.f;
-  int iterations = 1000;
-  int m = 1024, n = 512, k = 1024, l = 1;
-
-  // Parses the command line
-  void parse(int argc, char const **args) {
-    cutlass::CommandLine cmd(argc, args);
-
-    if (cmd.check_cmd_line_flag("help")) {
-      help = true;
-      return;
-    }
-
-    if (cmd.check_cmd_line_flag("skip-verification")) {
-      skip_verification = true;
-    }
-
-    cmd.get_cmd_line_argument("m", m);
-    cmd.get_cmd_line_argument("n", n);
-    cmd.get_cmd_line_argument("k", k);
-    cmd.get_cmd_line_argument("l", l);
-    cmd.get_cmd_line_argument("alpha", alpha, 1.f);
-    cmd.get_cmd_line_argument("beta", beta, 0.f);
-    cmd.get_cmd_line_argument("iterations", iterations);
+#define CUTLASS_CHECK_KH(status)                                                         \
+  {                                                                                      \
+    cutlass::Status error = status;                                                      \
+    if (error != cutlass::Status::kSuccess) {                                            \
+      std::cerr << "Got cutlass error: " << cutlassGetStatusString(error) << " at: "     \
+                << __LINE__ << std::endl;                                                \
+      std::exit(2);                                                                      \
+    }                                                                                    \
   }
 
-  /// Prints the usage statement.
-  std::ostream & print_usage(std::ostream &out) const {
+constexpr int kBlk = 128;   // scale block size along K, and along N for B
 
-    out << "81_blackwell_gemm_blockwise\n\n"
-      << "  Blackwell FP8 GEMM with Blockwise Scaling using a Warp Specialized kernel.\n\n"
-      << "Options:\n\n"
-      << "  --help                      If specified, displays this usage statement\n\n"
-      << "  --m=<int>                   Sets the M extent of the GEMM\n"
-      << "  --n=<int>                   Sets the N extent of the GEMM\n"
-      << "  --k=<int>                   Sets the K extent of the GEMM\n"
-      << "  --l=<int>                   Sets the l extent (batch) of the GEMM\n"
-      << "  --alpha=<f32>               Epilogue scalar alpha\n"
-      << "  --beta=<f32>                Epilogue scalar beta\n"
-      << "  --iterations=<int>          Number of profiling iterations to perform.\n\n"
-      << "  --skip-verification         Skip verification.\n\n";
+using ElementAB = cutlass::float_e4m3_t;
+using LayoutATag = cutlass::layout::RowMajor;
+using LayoutBTag = cutlass::layout::ColumnMajor;
+constexpr int AlignmentAB = 128 / cutlass::sizeof_bits<ElementAB>::value;
+using ElementD = cutlass::bfloat16_t;
+constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+using ElementAccumulator = float;
 
-    out
-      << "\n\nExamples:\n\n"
-      << "$ " << "112_blackwell_gemm_blockwise" << " --m=1024 --n=512 --k=1024 --alpha=2 --beta=0.707 \n\n";
-
-    return out;
-  }
-
-  /// Compute performance in GFLOP/s
-  double gflops(double runtime_s) const {
-    // Two flops per multiply-add
-    uint64_t flop = uint64_t(2) * m * n * k;
-    double gflop = double(flop) / double(1.0e9);
-    return gflop / runtime_s;
-  }
+// Swap = false: D[M,N] = A[M,K] * B[K,N]  (row-major D), A scaled 1x128, B scaled 128x128.
+// Swap = true : operands exchange roles, D^T[N,M] = B[N,K] * A^T (a column-major D^T is exactly the
+//               row-major D[M,N] of the task): then the CUTLASS "A" operand carries the 128x128 scales.
+template <class MmaTile, class ClusterShape, bool Swap>
+struct GemmCfg {
+  using ScaleConfig = cute::conditional_t<Swap, cutlass::detail::Sm100BlockwiseScaleConfig<128, 1, 128>,
+                                          cutlass::detail::Sm100BlockwiseScaleConfig<1, 128, 128>>;
+  using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
+  using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
+  using LayoutDTag = cute::conditional_t<Swap, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, MmaTile, ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, float,
+      void, LayoutDTag, AlignmentD, ElementD, LayoutDTag, AlignmentD,
+      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+      ElementAB, cute::tuple<LayoutATag, LayoutSFA>, AlignmentAB,
+      ElementAB, cute::tuple<LayoutBTag, LayoutSFB>, AlignmentAB,
+      ElementAccumulator, MmaTile, ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      cutlass::gemm::KernelScheduleSm100Blockwise>::CollectiveOp;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>,
+                                                          CollectiveMainloop, CollectiveEpilogue,
+                                                          void>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  static constexpr bool kSwap = Swap;
 };
 
-/// Result structure
-struct Result {
-  double avg_runtime_ms;
-  double gflops;
-  cutlass::Status status;
-  cudaError_t error;
-  bool passed;
+// Reference configurations, selected per shape from a sweep on B200 (see KH_SWEEP; swizzle is the
+// CUTLASS tile-scheduler raster swizzle):
+//   0: prefill (M >= 8K): 256x128 MMA tile, 2-SM, cluster 2x1, swizzle 8
+//   1: decode (M = 128 tokens): 128x128 tile, 1-SM, cluster 1x2 (two CTAs along N share the A tile)
+using Cfg0 = GemmCfg<Shape<_256, _128, _128>, Shape<_2, _1, _1>, false>;
+using Cfg1 = GemmCfg<Shape<_128, _128, _128>, Shape<_1, _2, _1>, false>;
+#ifdef KH_SWEEP
+using Cfg2 = GemmCfg<Shape<_128, _128, _128>, Shape<_1, _1, _1>, false>;
+using Cfg3 = GemmCfg<Shape<_256, _128, _128>, Shape<_2, _2, _1>, false>;
+using Cfg4 = GemmCfg<Shape<_256, _128, _128>, Shape<_4, _1, _1>, false>;
+using Cfg5 = GemmCfg<Shape<_128, _128, _128>, Shape<_1, _1, _1>, true>;    // swapped operands
+using Cfg6 = GemmCfg<Shape<_256, _128, _128>, Shape<_2, _1, _1>, true>;
+using Cfg7 = GemmCfg<Shape<_128, _128, _128>, Shape<_1, _4, _1>, false>;
+using Cfg8 = GemmCfg<Shape<_256, _128, _128>, Shape<_4, _1, _1>, true>;
+using Cfg9 = GemmCfg<Shape<_128, _256, _128>, Shape<_1, _1, _1>, false>;
+using Cfg10 = GemmCfg<Shape<_128, _32, _128>, Shape<_1, _1, _1>, true>;
+using Cfg11 = GemmCfg<Shape<_256, _64, _128>, Shape<_2, _1, _1>, true>;
+using Cfg12 = GemmCfg<Shape<_256, _256, _128>, Shape<_2, _1, _1>, false>;
+constexpr int kNumCfg = 13;
+#endif
 
-  Result(
-    double avg_runtime_ms = 0,
-    double gflops = 0,
-    cutlass::Status status = cutlass::Status::kSuccess,
-    cudaError_t error = cudaSuccess)
-  :
-    avg_runtime_ms(avg_runtime_ms), gflops(gflops), status(status), error(error), passed(false)
-  {}
+// ---------------------------------------------------------------------------------------------
+// Operand layouts (see description.txt)
+//   A   : fp8 e4m3 [M, K]   row-major (K contiguous)
+//   B   : fp8 e4m3 [N, K]   row-major (== column-major [K, N])
+//   SFA : fp32 [K/128][M]            : SFA[kb * M + m]
+//   SFB : fp32 [K/128][ceil(N/128)]  : SFB[kb * ceil(N/128) + n / 128]
+// ---------------------------------------------------------------------------------------------
+static inline int kh_cdiv(int a, int b) { return (a + b - 1) / b; }
 
+// Scales: log-uniform in [2^-2, 2^2): random positive full-mantissa floats.
+__global__ void gen_scales_kernel(float *p, size_t n, unsigned seed) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
+    p[i] = exp2f(kh_uniform_pos(i, seed, 0.f, 1.f) * 4.f - 2.f);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Independent reference (device): applies the scale layouts by hand; validates the CUTLASS kernel
+// ---------------------------------------------------------------------------------------------
+__global__ void indep_ref_kernel(int M, int N, int K, __nv_fp8_e4m3 const *A, float const *SFA,
+                                 __nv_fp8_e4m3 const *B, float const *SFB, __nv_bfloat16 *D) {
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  int i = blockIdx.y;
+  if (j >= N) return;
+  int nbk = (N + kBlk - 1) / kBlk;
+  float acc = 0.f;
+  for (int kb = 0; kb < K / kBlk; ++kb) {
+    float part = 0.f;
+    for (int k = kb * kBlk; k < (kb + 1) * kBlk; ++k)
+      part = fmaf(float(A[size_t(i) * K + k]), float(B[size_t(j) * K + k]), part);
+    acc = fmaf(part, SFA[size_t(kb) * M + i] * SFB[size_t(kb) * nbk + j / kBlk], acc);
+  }
+  D[size_t(i) * N + j] = __float2bfloat16_rn(acc);
+}
+
+/// One prepared CUTLASS GEMM; argument packing / workspace are done in the constructor.
+struct RefGemm {
+  virtual ~RefGemm() {}
+  virtual void run() = 0;
 };
 
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/// GEMM setup and evaluation
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Helper to initialize a block of device data
-template <typename Element, typename Layout>
-bool initialize_tensor(
-  cutlass::TensorView<Element, Layout> view,
-  cutlass::Distribution::Kind dist_kind,
-  uint64_t seed) {
-
-  if (dist_kind == cutlass::Distribution::Uniform) {
-
-    double scope_max, scope_min;
-    int bits_input = cutlass::sizeof_bits<Element>::value;
-    int bits_output = cutlass::sizeof_bits<Element>::value;
-
-    if (bits_input == 1) {
-      scope_max = 2;
-      scope_min = 0;
-    } 
-    else if (bits_input <= 8) {
-      scope_max = 2;
-      scope_min = -2;
-    } 
-    else if (bits_output == 16) {
-      scope_max = 5;
-      scope_min = -5;
-    } 
-    else {
-      scope_max = 8;
-      scope_min = -8;
-    }
-
-    cutlass::reference::host::TensorFillRandomUniform(
-      view, seed, scope_max, scope_min, 0);
-  }
-  else if (dist_kind == cutlass::Distribution::AllZeros) {
-    cutlass::reference::host::TensorFill(view);
-  }
-  else if (dist_kind == cutlass::Distribution::Identity) {
-
-    cutlass::reference::host::TensorFillIdentity(view);
-  }
-  else if (dist_kind == cutlass::Distribution::Gaussian) {
-
-    cutlass::reference::host::TensorFillRandomGaussian(view, seed, 0, 0.5);
-  }
-  else if (dist_kind == cutlass::Distribution::Sequential) {
-    cutlass::reference::host::BlockFillSequential(view.data(), view.capacity());
-  }
-  else {
-    throw std::runtime_error("Not implementated.");
-  }
-
-  return true;
-}
-
-/// Helper to initialize a block of device data (scale_tensors)
-template <typename Element, typename Layout>
-bool initialize_scale_tensor(
-  cutlass::TensorView<Element, Layout> view,
-  cutlass::Distribution::Kind dist_kind,
-  uint64_t seed) {
-
-  if (dist_kind == cutlass::Distribution::Uniform) {
-
-    double scope_max, scope_min;
-
-    scope_min = -8;
-    scope_max = 8;
-
-    cutlass::reference::host::TensorFillRandomUniform(
-      view, seed, scope_max, scope_min, 0);
-  }
-  else if (dist_kind == cutlass::Distribution::AllZeros) {
-    cutlass::reference::host::TensorFill(view);
-  }
-  else if (dist_kind == cutlass::Distribution::Identity) {
-
-    cutlass::reference::host::TensorFillIdentity(view);
-  }
-  else if (dist_kind == cutlass::Distribution::Gaussian) {
-
-    cutlass::reference::host::TensorFillRandomGaussian(view, seed, 0, 0.5);
-  }
-  else if (dist_kind == cutlass::Distribution::Sequential) {
-    cutlass::reference::host::BlockFillSequential(view.data(), view.capacity());
-  }
-  else {
-    throw std::runtime_error("Not implementated.");
-  }
-
-  return true;
-}
-
-/// Initialize operands to be used in the GEMM and reference GEMM
-void initialize(const Options &options) {
-  using namespace cute;
-
-  auto gemm_problem_shape = cute::make_shape(options.m, options.n, options.k);
-
-  stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(options.m, options.k, options.l));
-  stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(options.n, options.k, options.l));
-  stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(options.m, options.n, options.l));
-  stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(options.m, options.n, options.l));
-
-  layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(options.m, options.n, options.k, options.l));
-  layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(options.m, options.n, options.k, options.l));
-
-  auto a_coord = cutlass::make_Coord(options.m * options.l, options.k);
-  auto c_coord = cutlass::make_Coord(options.m * options.l, options.n);
-  auto b_coord = cutlass::make_Coord(options.k, options.n * options.l);
-  auto blockscale_a_coord = cutlass::make_Coord(size(filter_zeros(layout_SFA)));
-  auto blockscale_b_coord = cutlass::make_Coord(size(filter_zeros(layout_SFB)));
-
-  tensor_A.resize(a_coord);
-  tensor_B.resize(b_coord);
-  tensor_C.resize(c_coord);
-  tensor_D.resize(c_coord);
-  tensor_ref_D.resize(c_coord);
-  tensor_SFA.resize(blockscale_a_coord);
-  tensor_SFB.resize(blockscale_b_coord);
-
-  initialize_tensor(tensor_A.host_view(), cutlass::Distribution::Uniform, seed + 2022);
-  initialize_tensor(tensor_B.host_view(), cutlass::Distribution::Uniform, seed + 2023);
-  initialize_tensor(tensor_C.host_view(), cutlass::Distribution::Uniform, seed + 2024);
-
-  initialize_scale_tensor(tensor_SFA.host_view(), cutlass::Distribution::Uniform, seed + 2025);
-  initialize_scale_tensor(tensor_SFB.host_view(), cutlass::Distribution::Uniform, seed + 2026);
-
-  tensor_A.sync_device();
-  tensor_B.sync_device();
-  tensor_C.sync_device();
-  tensor_D.sync_device();
-
-  tensor_SFA.sync_device();
-  tensor_SFB.sync_device();
-
-}
-
-/// Populates a Gemm::Arguments structure from the given commandline options
-typename Gemm::Arguments args_from_options(const Options &options) {
-  typename Gemm::Arguments arguments{
-    cutlass::gemm::GemmUniversalMode::kGemm,
-    {options.m, options.n, options.k, options.l},
-    {tensor_A.device_data(), stride_A, 
-     tensor_B.device_data(), stride_B,
-     tensor_SFA.device_data(), layout_SFA,
-     tensor_SFB.device_data(), layout_SFB},
-    {
-      {}, // epilogue.thread
-      tensor_C.device_data(), stride_C,
-      tensor_D.device_data(), stride_D
-    }
-  };
-
-  auto &fusion_args = arguments.epilogue.thread;
-  fusion_args.alpha = options.alpha;
-  fusion_args.beta = options.beta;
-
-  return arguments;
-}
-
-bool verify(const Options &options) {
-  //
-  // Compute reference output
-  //
-
-  // Create instantiation for device reference gemm kernel
-  auto A = cute::make_tensor(tensor_A.host_data(),
-      cute::make_layout(cute::make_shape(options.m, options.k, options.l), stride_A));
-  auto B = cute::make_tensor(tensor_B.host_data(),
-      cute::make_layout(cute::make_shape(options.n, options.k, options.l), stride_B));
-  auto C = cute::make_tensor(tensor_C.host_data(),
-      cute::make_layout(cute::make_shape(options.m, options.n, options.l), stride_C));
-  auto D = cute::make_tensor(tensor_ref_D.host_data(),
-      cute::make_layout(cute::make_shape(options.m, options.n, options.l), stride_D));
-  auto SFA = cute::make_tensor(tensor_SFA.host_data(), layout_SFA);
-  auto SFB = cute::make_tensor(tensor_SFB.host_data(), layout_SFB);
-
-  using unused_t = decltype(D);
-
-  cutlass::reference::host::GettBlockScalingMainloopParams<
-      ElementAccumulator,
-      decltype(A), 
-      decltype(SFA), 
-      decltype(B),
-      decltype(SFB)
-    > mainloop_params{A, SFA, B, SFB};
-
-  cutlass::reference::host::GettEpilogueParams<
-      ElementAccumulator,
-      ElementAccumulator,
-      ElementAccumulator,
-      ElementCompute,
-      decltype(C),
-      decltype(D)
-  > epilogue_params;
-
-  epilogue_params.C = C;
-  epilogue_params.D = D;
-  epilogue_params.alpha = options.alpha;
-  epilogue_params.beta = options.beta;
-
-  // get reference result
-  cutlass::reference::host::Gemm3x(mainloop_params, epilogue_params);
-
-  // compare_reference
-  tensor_D.sync_host();
-  bool passed = cutlass::reference::host::TensorEquals(tensor_ref_D.host_view(), tensor_D.host_view());
-
-  return passed;
-}
-
-/// Execute a given example GEMM computation
-template <typename Gemm>
-int run(Options &options) {
-  initialize(options);
-
-  // Instantiate CUTLASS kernel depending on templates
+template <class Cfg>
+struct RefGemmImpl : RefGemm {
+  using Gemm = typename Cfg::Gemm;
   Gemm gemm;
-
-  // Create a structure of gemm kernel arguments suitable for invoking an instance of Gemm
-  auto arguments = args_from_options(options);
-
-  // Using the arguments, query for extra workspace required for matrix multiplication computation
-  size_t workspace_size = Gemm::get_workspace_size(arguments);
-
-  // Allocate workspace memory
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-
-  // Check if the problem size is supported or not
-  CUTLASS_CHECK(gemm.can_implement(arguments));
-
-  // Initialize CUTLASS kernel with arguments and workspace pointer
-  CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
-
-  // Correctness / Warmup iteration
-  CUTLASS_CHECK(gemm.run());
-
-  Result result;
-  if (!options.skip_verification) {
-    // Check if output from CUTLASS kernel and reference kernel are equal or not
-    result.passed = verify(options);
-
-    if (!result.passed) {
-      std::cout << "Incorrect" << std::endl;
-      return -1;
-    }
+  void *workspace = nullptr;
+  RefGemmImpl(int M, int N, int K, __nv_fp8_e4m3 const *A, float const *SFA, __nv_fp8_e4m3 const *B,
+              float const *SFB, __nv_bfloat16 *D, int swizzle) {
+    using StrideA = typename Gemm::GemmKernel::StrideA;
+    using StrideB = typename Gemm::GemmKernel::StrideB;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+    constexpr bool S = Cfg::kSwap;
+    int Mg = S ? N : M, Ng = S ? M : N;   // GEMM problem handed to CUTLASS
+    auto const *Ag = S ? B : A;
+    auto const *Bg = S ? A : B;
+    float const *SFAg = S ? SFB : SFA, *SFBg = S ? SFA : SFB;
+    StrideA sa = cutlass::make_cute_packed_stride(StrideA{}, {Mg, K, 1});
+    StrideB sb = cutlass::make_cute_packed_stride(StrideB{}, {Ng, K, 1});
+    StrideD sd = cutlass::make_cute_packed_stride(StrideD{}, {Mg, Ng, 1});
+    auto lsfa = Cfg::ScaleConfig::tile_atom_to_shape_SFA(cute::make_shape(Mg, Ng, K, 1));
+    auto lsfb = Cfg::ScaleConfig::tile_atom_to_shape_SFB(cute::make_shape(Mg, Ng, K, 1));
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {Mg, Ng, K, 1},
+        {reinterpret_cast<ElementAB const *>(Ag), sa, reinterpret_cast<ElementAB const *>(Bg), sb,
+         SFAg, lsfa, SFBg, lsfb},
+        {{1.f, 0.f}, nullptr, sd, reinterpret_cast<ElementD *>(D), sd}};
+    args.scheduler.max_swizzle_size = swizzle;
+    size_t ws = Gemm::get_workspace_size(args);
+    if (ws) KH_CHECK(cudaMalloc(&workspace, ws));
+    CUTLASS_CHECK_KH(gemm.can_implement(args));
+    CUTLASS_CHECK_KH(gemm.initialize(args, workspace));
   }
+  ~RefGemmImpl() override { cudaFree(workspace); }
+  void run() override { CUTLASS_CHECK_KH(gemm.run()); }
+};
 
-#ifdef KH_TEST_SOLUTION
-  // Run solution and verify against CUTLASS reference output
-  {
-    // Allocate solution output
-    cutlass::DeviceAllocation<ElementD> sol_D;
-    sol_D.reset(options.m * options.n);
-
-    // Block size for scaling = MMA tile K dimension
-    int block_size = cute::size<2>(MmaTileShape_MNK{});
-
-    // Run solution
-    cudaError_t sol_err = BlackwellBlockwiseGemm(
-      options.m, options.n, options.k, options.alpha,
-      reinterpret_cast<const __nv_fp8_e4m3*>(tensor_A.device_data()),
-      options.k,  // lda (row-major)
-      tensor_SFA.device_data(),
-      reinterpret_cast<const __nv_fp8_e4m3*>(tensor_B.device_data()),
-      options.k,  // ldb (col-major)
-      tensor_SFB.device_data(),
-      options.beta,
-      reinterpret_cast<__nv_fp8_e4m3*>(sol_D.get()),
-      options.m,  // ldd (col-major)
-      block_size);
-    cudaDeviceSynchronize();
-
-    if (sol_err != cudaSuccess) {
-      std::cerr << "Solution kernel failed: " << cudaGetErrorString(sol_err) << std::endl;
-      std::cout << "Incorrect" << std::endl;
-      return -1;
-    }
-
-    // Compare solution vs CUTLASS reference
-    bool sol_passed = cutlass::reference::host::TensorEquals(
-      cutlass::TensorView<ElementD, LayoutD>(sol_D.get(), LayoutD::packed({options.m, options.n}), {options.m, options.n}),
-      cutlass::TensorView<ElementD, LayoutD>(tensor_D.device_data(), LayoutD::packed({options.m, options.n}), {options.m, options.n}));
-
-    if (!sol_passed) {
-      // Fallback: copy to host and compare with tolerance
-      std::vector<ElementD> h_sol(options.m * options.n), h_ref(options.m * options.n);
-      cudaMemcpy(h_sol.data(), sol_D.get(), options.m * options.n * sizeof(ElementD), cudaMemcpyDeviceToHost);
-      cudaMemcpy(h_ref.data(), tensor_D.device_data(), options.m * options.n * sizeof(ElementD), cudaMemcpyDeviceToHost);
-      float max_diff = 0;
-      for (int i = 0; i < options.m * options.n; ++i) {
-        max_diff = fmaxf(max_diff, fabsf(float(h_sol[i]) - float(h_ref[i])));
-      }
-      if (max_diff > 1.0f) {
-        std::cerr << "Solution incorrect. Max diff vs reference: " << max_diff << std::endl;
-        std::cout << "Incorrect" << std::endl;
-        return -1;
-      }
-    }
-  }
+static std::unique_ptr<RefGemm> make_ref(int cfg, int M, int N, int K, __nv_fp8_e4m3 const *A,
+                                         float const *SFA, __nv_fp8_e4m3 const *B, float const *SFB,
+                                         __nv_bfloat16 *D, int swz) {
+#define KH_CASE(i) case i: return std::make_unique<RefGemmImpl<Cfg##i>>(M, N, K, A, SFA, B, SFB, D, swz);
+  switch (cfg) {
+    KH_CASE(1)
+#ifdef KH_SWEEP
+    KH_CASE(2) KH_CASE(3) KH_CASE(4) KH_CASE(5) KH_CASE(6) KH_CASE(7) KH_CASE(8) KH_CASE(9) KH_CASE(10) KH_CASE(11) KH_CASE(12)
 #endif
-
-  std::cout << "Passed" << std::endl;
-
-  // Profiling
-  if (options.iterations > 0) {
-    int const kIterations = options.iterations;
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    // Warmup reference
-    for (int i = 0; i < 3; i++) {
-      CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
-      CUTLASS_CHECK(gemm.run());
-    }
-    cudaDeviceSynchronize();
-
-    // Profile reference
-    float ref_total_ms = 0, ref_min_ms = 1e30f;
-    for (int iter = 0; iter < kIterations; ++iter) {
-      CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
-      cudaEventRecord(start);
-      CUTLASS_CHECK(gemm.run());
-      cudaEventRecord(stop);
-      cudaEventSynchronize(stop);
-      float ms;
-      cudaEventElapsedTime(&ms, start, stop);
-      ref_total_ms += ms;
-      if (ms < ref_min_ms) ref_min_ms = ms;
-    }
-    fprintf(stdout, "Ref time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
-            ref_total_ms / kIterations, kIterations, ref_min_ms);
-
-#ifdef KH_TEST_SOLUTION
-    {
-      cutlass::DeviceAllocation<ElementD> sol_D;
-      sol_D.reset(options.m * options.n);
-      int block_size = cute::size<2>(MmaTileShape_MNK{});
-
-      // Warmup solution
-      for (int i = 0; i < 3; i++) {
-        BlackwellBlockwiseGemm(
-          options.m, options.n, options.k, options.alpha,
-          reinterpret_cast<const __nv_fp8_e4m3*>(tensor_A.device_data()),
-          options.k, tensor_SFA.device_data(),
-          reinterpret_cast<const __nv_fp8_e4m3*>(tensor_B.device_data()),
-          options.k, tensor_SFB.device_data(),
-          options.beta,
-          reinterpret_cast<__nv_fp8_e4m3*>(sol_D.get()),
-          options.m, block_size);
-      }
-      cudaDeviceSynchronize();
-
-      // Profile solution
-      float sol_total_ms = 0, sol_min_ms = 1e30f;
-      for (int iter = 0; iter < kIterations; ++iter) {
-        cudaEventRecord(start);
-        BlackwellBlockwiseGemm(
-          options.m, options.n, options.k, options.alpha,
-          reinterpret_cast<const __nv_fp8_e4m3*>(tensor_A.device_data()),
-          options.k, tensor_SFA.device_data(),
-          reinterpret_cast<const __nv_fp8_e4m3*>(tensor_B.device_data()),
-          options.k, tensor_SFB.device_data(),
-          options.beta,
-          reinterpret_cast<__nv_fp8_e4m3*>(sol_D.get()),
-          options.m, block_size);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        float ms;
-        cudaEventElapsedTime(&ms, start, stop);
-        sol_total_ms += ms;
-        if (ms < sol_min_ms) sol_min_ms = ms;
-      }
-      fprintf(stdout, "Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
-              sol_total_ms / kIterations, kIterations, sol_min_ms);
-      fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
-    }
-#endif
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    default: return std::make_unique<RefGemmImpl<Cfg0>>(M, N, K, A, SFA, B, SFB, D, swz);
   }
-
-  return 0;
+#undef KH_CASE
 }
 
-#endif // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+// Tolerances: |x - ref| <= 1e-3 * RMS(ref) + 0.03125 * |ref| per element, and relative Frobenius error
+// <= 3e-4. Reference and solution round an FP32 result to BF16; summation-order differences flip single BF16
+// roundings (<= 1 ulp = 0.0078 |ref|, hence the 4x relative term). Measured vs the CUTLASS reference: a
+// sequential FP32 solution with the same block promotion is bit-identical (FP8 products and the per-block
+// sums are exact in FP32); a correct variant with a different order (reverse K, promotion every 32 K,
+// (part*sb)*sa) measures rel. Frobenius 8e-7 .. 5.3e-5 and max|err|/rms <= 2.5e-2, so 3e-4 is >= 5.7x
+// above. Deliberately wrong solutions (Frobenius error): FP16 accumulation 1.6e-3 .. 3.2e-3, BF16 accumulation
+// 4.6e-3 .. 1.8e-2, last 128 K skipped 6e-2 .. 0.26, inputs rounded to E5M2 8.2e-2, FP4 inputs 0.40, scales
+// of B per N-column instead of 128x128 blocks 0.60, A scales ignored 0.64, B scales ignored 0.64, A scales
+// read K-major 0.85, half the outputs / everything unwritten (NaN): all fail on every size.
+static KhTol kTol(1.0e-3, 3.0e-4, 0.03125);
 
-///////////////////////////////////////////////////////////////////////////////////////////////////
+struct Shape3 { const char *label; int M, N, K, cfg; int swz = 0; };
 
-int main(int argc, char const **args) {
+/// Returns false on failure. `timed` = also print Ref / Kernel timings.
+static bool run_case(Shape3 const &s, bool timed, int trials) {
+  int M = s.M, N = s.N, K = s.K;
+  size_t nD = size_t(M) * N;
+  __nv_fp8_e4m3 *A, *B;
+  float *SFA, *SFB;
+  __nv_bfloat16 *D_ref;
+  size_t nSFA = size_t(K / kBlk) * M, nSFB = size_t(K / kBlk) * kh_cdiv(N, kBlk);
+  KH_CHECK(cudaMalloc(&A, size_t(M) * K));
+  KH_CHECK(cudaMalloc(&B, size_t(N) * K));
+  KH_CHECK(cudaMalloc(&SFA, nSFA * sizeof(float)));
+  KH_CHECK(cudaMalloc(&SFB, nSFB * sizeof(float)));
+  KH_CHECK(cudaMalloc(&D_ref, nD * sizeof(__nv_bfloat16)));
+  kh_fill_uniform(A, size_t(M) * K, 11u);
+  kh_fill_uniform(B, size_t(N) * K, 22u);
+  gen_scales_kernel<<<1024, 256>>>(SFA, nSFA, 33u);
+  gen_scales_kernel<<<1024, 256>>>(SFB, nSFB, 44u);
+  KH_CHECK(cudaGetLastError());
+  kh_poison(D_ref, nD * sizeof(__nv_bfloat16));
+  KH_CHECK(cudaDeviceSynchronize());
 
-  // CUTLASS must be compiled with CUDA 12.0 Toolkit to run this example
-  // and must have compute capability at least sm100a.
+  auto ref = make_ref(s.cfg, M, N, K, A, SFA, B, SFB, D_ref, s.swz);
+  ref->run();
+  KH_CHECK(cudaDeviceSynchronize());
 
-  if (__CUDACC_VER_MAJOR__ < 12) {
-    std::cerr << "This example requires CUDA 12 or newer.\n";
-    return 0;
+  bool ok = true;
+  // The reference must have written every element (it was pre-filled with NaN).
+  {
+    KhResult r = kh_compare(D_ref, D_ref, nD, kTol);
+    if (!r.pass) {
+      std::cerr << "Reference output incomplete or non-finite (non-finite = " << r.nonfinite << ")" << std::endl;
+      ok = false;
+    }
+  }
+  if (std::getenv("KH_VALIDATE_REF")) {   // development aid: CUTLASS reference vs independent kernel
+    __nv_bfloat16 *D_chk;
+    KH_CHECK(cudaMalloc(&D_chk, nD * sizeof(__nv_bfloat16)));
+    kh_poison(D_chk, nD * sizeof(__nv_bfloat16));
+    indep_ref_kernel<<<dim3((N + 127) / 128, M), 128>>>(M, N, K, A, SFA, B, SFB, D_chk);
+    KH_CHECK(cudaGetLastError());
+    KH_CHECK(cudaDeviceSynchronize());
+    KhResult r = kh_compare(D_chk, D_ref, nD, kTol);
+    kh_print_result("independent kernel vs CUTLASS reference", r, kTol);
+    ok = ok && r.pass;
+    cudaFree(D_chk);
   }
 
+#ifdef KH_TEST_SOLUTION
+  __nv_bfloat16 *D_sol = nullptr;
+  KH_CHECK(cudaMalloc(&D_sol, nD * sizeof(__nv_bfloat16)));
+  auto reset_sol = [&] { kh_poison(D_sol, nD * sizeof(__nv_bfloat16)); };
+  auto call_sol = [&] {
+    cudaError_t e = BlackwellBlockwiseGemm(M, N, K, A, SFA, B, SFB, D_sol);
+    if (e != cudaSuccess) {
+      std::cerr << "Solution kernel failed: " << cudaGetErrorString(e) << std::endl;
+      std::exit(1);
+    }
+  };
+  if (ok) {
+    reset_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    call_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    KhResult r = kh_compare(D_sol, D_ref, nD, kTol);
+    kh_print_result("solution", r, kTol);
+    ok = r.pass;
+  }
+#endif
+
+  // Anti-memoisation: the operand that varies per call in deployment (the activations and their scale
+  // factors; the weights stay fixed) is regenerated with a fresh seed before EVERY timed call of both the
+  // reference and the solution, outside the timed region (before the L2 flush), so nothing derived from the
+  // input can be cached across calls. The first check above and the final re-check use their own seeds.
+  auto regen_input = [&](unsigned seed) {
+    kh_fill_uniform(A, size_t(M) * K, seed);
+    gen_scales_kernel<<<1024, 256>>>(SFA, nSFA, seed + 1u);
+    KH_CHECK(cudaGetLastError());
+  };
+  unsigned seed_ctr = 1000u;
+  auto fresh = [&] { regen_input(++seed_ctr); };
+
+  if (ok && timed && trials > 0) {
+    KhTime tr = kh_time([&] { ref->run(); }, trials, [&] { fresh(); kh_poison(D_ref, nD * sizeof(__nv_bfloat16)); });
+    kh_print_time("Ref", tr);
+#ifdef KH_TEST_SOLUTION
+    KhTime ts = kh_time(call_sol, trials, [&] { fresh(); reset_sol(); });
+    kh_print_time("Kernel", ts);
+    kh_print_speedup(tr, ts);
+#endif
+  }
+
+#ifdef KH_TEST_SOLUTION
+  if (ok) {
+    // Re-check on a brand-new input (also for the correctness-only cases): regenerate the activations,
+    // recompute the reference for them, re-poison the solution output, call the solution, compare.
+    regen_input(777777u);
+    kh_poison(D_ref, nD * sizeof(__nv_bfloat16));
+    KH_CHECK(cudaDeviceSynchronize());
+    ref->run();
+    KH_CHECK(cudaDeviceSynchronize());
+    reset_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    call_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    KhResult r = kh_compare(D_sol, D_ref, nD, kTol);
+    kh_print_result("solution (re-check, fresh input)", r, kTol);
+    ok = r.pass;
+  }
+  cudaFree(D_sol);
+#endif
+  cudaFree(A); cudaFree(B); cudaFree(SFA); cudaFree(SFB); cudaFree(D_ref);
+  return ok;
+}
+
+#endif  // CUTLASS_ARCH_MMA_SM100_SUPPORTED
+
+int main(int argc, char const **argv) {
   cudaDeviceProp props;
-  int current_device_id;
-  CUDA_CHECK(cudaGetDevice(&current_device_id));
-  CUDA_CHECK(cudaGetDeviceProperties(&props, current_device_id));
-  cudaError_t error = cudaGetDeviceProperties(&props, 0);
+  KH_CHECK(cudaGetDeviceProperties(&props, 0));
   if (props.major != 10 || props.minor != 0) {
-    std::cerr << "This example requires a GPU with compute capability 100a)." << std::endl;
+    std::cerr << "This task requires a Blackwell sm_100 GPU (B200)." << std::endl;
     return 0;
   }
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  int trials = kh_trials();
+  bool const keep_going = std::getenv("KH_KEEP_GOING") != nullptr;   // development aid
+  bool failed = false;
 
-  //
-  // Parse options
-  //
-
-  Options options;
-
-  options.parse(argc, args);
-
-  if (options.help) {
-    options.print_usage(std::cout) << std::endl;
-    return 0;
-  }
-
-  //
-  // Multi-size testing
-  //
-
-  struct TestConfig {
-    const char* label;
-    int m, n, k;
+  // Llama-3-70B linear layers in FP8 on one B200 (hidden 8192, fused QKV 10240, FFN 28672 -> fused
+  // gate+up 57344, vocab 128256). M = tokens: one decode step of 128 sequences, or an 8K-token prefill
+  // chunk. (The decode fused-QKV layer, 84 MB of weights, is ~10 us and too short to time reliably.)
+  std::vector<Shape3> shapes = {
+      {"decode_mlp_up",    128,  57344,  8192, 1, 0},
+      {"decode_mlp_down",  128,   8192, 28672, 1, 0},
+      {"decode_lm_head",   128, 128256,  8192, 1, 0},
+      {"prefill_qkv",     8192,  10240,  8192, 0, 8},
+      {"prefill_o_proj",  8192,   8192,  8192, 0, 8},
+      {"prefill_mlp_up",  8192,  57344,  8192, 0, 8},
+      {"prefill_mlp_down",8192,   8192, 28672, 0, 8},
   };
 
-  bool explicit_size = false;
-  // Check if user passed explicit --m, --n, or --k
-  {
-    cutlass::CommandLine cmd(argc, args);
-    explicit_size = cmd.check_cmd_line_flag("m") ||
-                    cmd.check_cmd_line_flag("n") ||
-                    cmd.check_cmd_line_flag("k");
-  }
-
-  std::vector<TestConfig> configs;
-  if (explicit_size) {
-    configs.push_back({"custom", options.m, options.n, options.k});
-  } else {
-    configs = {
-      {"small",   1024, 1024, 1024},
-      {"medium",  4096, 4096, 4096},
-      {"large",   8192, 8192, 8192},
-    };
-  }
-
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  for (const auto& cfg : configs) {
-    fprintf(stdout, "\n=== %s: M=%d, N=%d, K=%d ===\n", cfg.label, cfg.m, cfg.n, cfg.k);
-
-    options.m = cfg.m;
-    options.n = cfg.n;
-    options.k = cfg.k;
-
-    int result = run<Gemm>(options);
-    if (result != 0) {
-      return -1;
+#ifdef KH_SWEEP
+  // Development aid: time every reference configuration on every shape.
+  for (auto s : shapes) {
+    for (int cfg = 0; cfg < kNumCfg; ++cfg) {
+      bool swapped_cfg = cfg == 5 || cfg == 6 || cfg == 8 || cfg == 10 || cfg == 11;
+      if (swapped_cfg && s.M > 512) continue;
+      for (int swz : {0, 4, 8}) {
+        s.cfg = cfg; s.swz = swz;
+        std::printf("\n=== %s cfg=%d swz=%d: M=%d, N=%d, K=%d ===\n", s.label, cfg, swz, s.M, s.N, s.K);
+        run_case(s, true, 10);
+      }
     }
   }
-#endif // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  return 0;
+#endif
 
+  if (argc >= 4) {   // ./test M N K : single custom shape
+    Shape3 s{"custom", atoi(argv[1]), atoi(argv[2]), atoi(argv[3]), atoi(argv[1]) <= 512 ? 1 : 0, 8};
+    std::printf("\n=== custom: M=%d, N=%d, K=%d ===\n", s.M, s.N, s.K);
+    if (!run_case(s, true, trials)) { std::cout << "Incorrect" << std::endl; return 1; }
+    std::cout << "Passed" << std::endl;
+    return 0;
+  }
+
+  // Correctness-only cases ("---" header, not "===": the runner pairs each "=== name ===" block with
+  // timing lines). M = 200 is not a multiple of 128 and N = 1152 / K = 1408 are not multiples of
+  // the tile; M = 16 is a tiny decode batch.
+  {
+    Shape3 extra[] = {{"odd_m", 200, 1152, 1408, 0, 0}, {"tiny_m", 16, 2048, 4096, 1, 0}};
+    for (auto const &s : extra) {
+      std::printf("\n--- %s: M=%d, N=%d, K=%d (correctness only) ---\n", s.label, s.M, s.N, s.K);
+      if (!run_case(s, false, 0)) { std::cout << "Incorrect" << std::endl; if (!keep_going) return 1; failed = true; }
+      else std::cout << "Passed" << std::endl;
+    }
+  }
+
+  for (auto const &s : shapes) {
+    std::printf("\n=== %s: M=%d, N=%d, K=%d ===\n", s.label, s.M, s.N, s.K);
+    if (!run_case(s, true, trials)) { std::cout << "Incorrect" << std::endl; if (!keep_going) return 1; failed = true; }
+    else std::cout << "Passed" << std::endl;
+  }
+  return failed ? 1 : 0;
+#endif
   return 0;
 }
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-

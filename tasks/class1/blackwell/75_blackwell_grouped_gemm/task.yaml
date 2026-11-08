@@ -5,6 +5,9 @@ task_class: 1
 domain: ml
 tags:
 - gemm
+- grouped-gemm
+- moe
+- bf16
 hardware:
   min_sm: 100
   tested_sms:
@@ -13,7 +16,7 @@ hardware:
 runner:
   backend: class1_make
   workdir: tasks/class1/blackwell/75_blackwell_grouped_gemm
-  timeout_sec: 180
+  timeout_sec: 300
   env:
     KH_BENCHMARK: '20'
   solution_file: solution.h
@@ -42,6 +45,9 @@ source:
   commit: ''
   license: BSD-3-Clause
 anti_cheat:
+  # Static check: only blatant cheating (wrapping the reference implementation). Calls to cuBLAS /
+  # cuDNN / CUTLASS kernel templates are blocked by the global rules; numeric precision is enforced by
+  # the run-time tolerance, not by patterns.
   blocked_patterns:
   required_patterns:
   - __global__\s+void

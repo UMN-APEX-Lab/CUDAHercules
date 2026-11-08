@@ -1,192 +1,160 @@
 # Task: 86_blackwell_mixed_dtype_gemm
 
 ## Target Hardware
-NVIDIA Blackwell GPU (SM100/SM120).
+NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a`; on any other GPU the test exits with an error (it never reports a pass without running).
 
+Weight-only quantized GEMM (W4A16): BF16 activations times INT4 weights with per-group BF16 scales,
+BF16 output, compared against the best public implementation per shape: the vLLM Marlin kernel for small
+batches and the CUTLASS 3.x Blackwell mixed-input GEMM (example 86) for large ones.
 
-Blackwell SM100 Mixed-Dtype GEMM test harness
-BF16 A + INT4 B (with per-block BF16 scale factors) -> BF16 D
-Based on CUTLASS example 86_blackwell_mixed_dtype_gemm
-The LLM must implement:
-  cudaError_t BlackwellMixedDtypeGemm(int M, int N, int K, float alpha,
-      __nv_bfloat16 const *A, int lda,
-      int8_t const *B, int ldb,
-      __nv_bfloat16 const *B_scales, int scale_ldb,
-      float beta, __nv_bfloat16 *D, int ldd);
-A is row-major [M, K] (lda = K) in BF16.
-B is column-major [K, N] (ldb = K) in INT4 stored as int8_t (one element per byte,
-  values in [-8, 7]). The LLM must pack into CUTLASS int4b_t layout internally.
-B_scales: [N, ceil(K/128)] row-major, one BF16 scale per group of 128 K-elements.
-  B is dequantized as: B_float[k,j] = int4_val * scale[j, k/128].
-D is row-major [M, N] (ldd = N) in BF16.
-Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
-         -I<cutlass>/include harness.cu solution.cu -o test
+## Function Signature
 
----
-## Test Harness (harness.cu)
-
-Your solution will be compiled and linked with this test harness.
-Study it to understand the exact function signature, data types, and verification logic.
+Implement the following function in `solution.h`:
 
 ```cuda
-/*
- * Blackwell SM100 Mixed-Dtype GEMM test harness
- * BF16 A + INT4 B (with per-block BF16 scale factors) -> BF16 D
- * Based on CUTLASS example 86_blackwell_mixed_dtype_gemm
- *
- * The LLM must implement:
- *   cudaError_t BlackwellMixedDtypeGemm(int M, int N, int K, float alpha,
- *       __nv_bfloat16 const *A, int lda,
- *       int8_t const *B, int ldb,
- *       __nv_bfloat16 const *B_scales, int scale_ldb,
- *       float beta, __nv_bfloat16 *D, int ldd);
- *
- * A is row-major [M, K] (lda = K) in BF16.
- * B is column-major [K, N] (ldb = K) in INT4 stored as int8_t (one element per byte,
- *   values in [-8, 7]). The LLM must pack into CUTLASS int4b_t layout internally.
- * B_scales: [N, ceil(K/128)] row-major, one BF16 scale per group of 128 K-elements.
- *   B is dequantized as: B_float[k,j] = int4_val * scale[j, k/128].
- * D is row-major [M, N] (ldd = N) in BF16.
- *
- * Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
- *          -I<cutlass>/include harness.cu solution.cu -o test
- */
-
-#include <iostream>
-#include <sstream>
-#include <vector>
-#include <cmath>
+#pragma once
+#include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include "../../include/kh_benchmark.h"
+#include <stdint.h>
 
-#define CUDA_CHECK(status)                                              \
-  {                                                                     \
-    cudaError_t error = status;                                         \
-    if (error != cudaSuccess) {                                         \
-      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
-                << " at line: " << __LINE__ << std::endl;               \
-      exit(EXIT_FAILURE);                                               \
-    }                                                                   \
-  }
-
-static constexpr int kGroupSize = 128;
-
-extern cudaError_t BlackwellMixedDtypeGemm(
-  int M, int N, int K,
-  float alpha,
-  __nv_bfloat16 const *A, int lda,
-  int8_t const *B, int ldb,
-  __nv_bfloat16 const *B_scales, int scale_ldb,
-  float beta,
-  __nv_bfloat16 *D, int ldd);
-
-void reference_gemm(int M, int N, int K, float alpha,
-  std::vector<float> const &fA, int lda,
-  std::vector<float> const &fB, int ldb,
-  float beta, std::vector<float> &D, int ldd) {
-  for (int i = 0; i < M; ++i)
-    for (int j = 0; j < N; ++j) {
-      float acc = 0;
-      for (int k = 0; k < K; ++k) acc += fA[i*lda+k] * fB[k+j*ldb];
-      D[i*ldd+j] = alpha * acc + beta * D[i*ldd+j];
-    }
-}
-
-int main(int argc, const char *arg[]) {
-  int M = 256, N = 256, K = 256;
-  for (int i = 1; i < argc && i < 4; ++i) {
-    std::stringstream ss(arg[i]);
-    if (i == 1) ss >> M; else if (i == 2) ss >> N; else if (i == 3) ss >> K;
-  }
-
-  int lda = K, ldb = K, ldd = N;
-  float alpha = 1.0f, beta = 0.0f;
-  int k_groups = (K + kGroupSize - 1) / kGroupSize;
-
-  // BF16 A
-  std::vector<__nv_bfloat16> hA(M * K);
-  std::vector<float> fA(M * K);
-  for (int i = 0; i < M * K; ++i) {
-    float val = float((i * 16807 % 16) - 8) * 0.125f;
-    hA[i] = __float2bfloat16(val);
-    fA[i] = __bfloat162float(hA[i]);
-  }
-
-  // INT4 B stored as int8_t (one element per byte, values in [-8, 7])
-  std::vector<int8_t> hB(K * N);
-  std::vector<float> fB_raw(K * N);
-  for (int i = 0; i < K * N; ++i) {
-    hB[i] = int8_t(((i * 48271 % 9) - 4));  // range [-4, 4] fits int4
-    fB_raw[i] = float(hB[i]);
-  }
-
-  // BF16 scales for B: [N, k_groups] row-major
-  std::vector<__nv_bfloat16> hB_scales(N * k_groups);
-  std::vector<float> fB_scales(N * k_groups);
-  for (int i = 0; i < N * k_groups; ++i) {
-    hB_scales[i] = __float2bfloat16(1.0f);
-    fB_scales[i] = 1.0f;
-  }
-
-  // Dequantized B for reference: B_float[k,j] = int4_val * scale[j, k/128]
-  std::vector<float> fB(K * N);
-  for (int j = 0; j < N; ++j)
-    for (int k = 0; k < K; ++k) {
-      int kg = k / kGroupSize;
-      fB[k + j * ldb] = fB_raw[k + j * ldb] * fB_scales[j * k_groups + kg];
-    }
-
-  __nv_bfloat16 *dA; int8_t *dB; __nv_bfloat16 *dB_scales, *dD;
-  CUDA_CHECK(cudaMalloc(&dA, M * K * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&dB, K * N * sizeof(int8_t)));
-  CUDA_CHECK(cudaMalloc(&dB_scales, N * k_groups * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&dD, M * N * sizeof(__nv_bfloat16)));
-
-  CUDA_CHECK(cudaMemcpy(dA, hA.data(), M * K * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dB, hB.data(), K * N * sizeof(int8_t), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dB_scales, hB_scales.data(), N * k_groups * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemset(dD, 0, M * N * sizeof(__nv_bfloat16)));
-
-  cudaError_t r = BlackwellMixedDtypeGemm(M, N, K, alpha, dA, lda, dB, ldb, dB_scales, k_groups, beta, dD, ldd);
-  if (r != cudaSuccess) {
-    std::cerr << "GEMM kernel failed: " << cudaGetErrorString(r) << std::endl;
-    cudaFree(dA); cudaFree(dB); cudaFree(dB_scales); cudaFree(dD);
-    return -1;
-  }
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  // Benchmark (triggered by KH_BENCHMARK=N env var)
-  {
-    int _kh_trials = kh_benchmark_trials();
-    if (_kh_trials > 0 && r == cudaSuccess) {
-      kh_benchmark([&]() { BlackwellMixedDtypeGemm(M, N, K, alpha, dA, lda, dB, ldb, dB_scales, k_groups, beta, dD, ldd); }, _kh_trials);
-    }
-  }
-
-
-  std::vector<__nv_bfloat16> hD(M * N);
-  CUDA_CHECK(cudaMemcpy(hD.data(), dD, M * N * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
-  cudaFree(dA); cudaFree(dB); cudaFree(dB_scales); cudaFree(dD);
-
-  std::vector<float> fD(M * N), fRef(M * N, 0);
-  for (int i = 0; i < M * N; ++i) fD[i] = __bfloat162float(hD[i]);
-  reference_gemm(M, N, K, alpha, fA, lda, fB, ldb, beta, fRef, ldd);
-
-  float max_rel_diff = 0; int mismatches = 0;
-  for (int idx = 0; idx < M * N; ++idx) {
-    float diff = std::fabs(fD[idx] - fRef[idx]);
-    float denom = std::fmax(std::fabs(fRef[idx]), 1e-6f);
-    float rel = diff / denom;
-    max_rel_diff = std::fmax(max_rel_diff, rel);
-    if (rel > 0.3f) mismatches++;
-  }
-  float mismatch_rate = float(mismatches) / float(M * N);
-  if (mismatch_rate > 0.01f) {
-    std::cerr << "Results incorrect. Max relative diff: " << max_rel_diff
-              << ", mismatch rate: " << mismatch_rate << std::endl;
-    return -1;
-  }
-  std::cout << "Passed." << std::endl;
-  return 0;
-}
+cudaError_t BlackwellMixedDtypeGemm(
+    int M, int N, int K,
+    float alpha,
+    __nv_bfloat16 const *A, int lda,
+    uint8_t const *B, int ldb,
+    __nv_bfloat16 const *B_scales, int scale_ldb,
+    float beta,
+    __nv_bfloat16 *D, int ldd);
 ```
+
+## Operation
+
+D = alpha * A * dequant(B) + beta * D
+
+with `dequant(B)[k, j] = int4(B[k, j]) * B_scales[j, k / 128]`.
+A is M x K, dequant(B) is K x N, D is M x N.
+
+## Data Types and Precision
+
+A, the scales and D are BF16, the weights are signed INT4, accumulation must be FP32 (rounded to BF16
+once, at the end). Lower-precision arithmetic (FP8 / FP4 activations or scales, INT8 activation
+quantization, FP16 or BF16 accumulation, including tensor-core paths that use them) is not allowed even if
+it were to pass the tolerance. Whether the dequantized weight `int4 * scale` is formed exactly in FP32 or
+rounded to BF16 (as the CUTLASS reference does) is up to you; both are accepted.
+
+## Memory Layout
+
+- A: **row-major** [M, K] BF16. Element (i, k) at `A[i * lda + k]`, `lda == K`.
+- B: **packed INT4, column-major [K, N]** (equivalently [N, K] with K contiguous). Column j occupies K/2
+  contiguous bytes starting at `B + j * ldb`, `ldb == K / 2` (in bytes). Element (k, j) is in byte
+  `B[j * ldb + k / 2]`: the **low nibble for even k, the high nibble for odd k**, two's complement,
+  values in [-8, 7] (all 16 codes occur).
+- B_scales: BF16, **row-major [N, K / 128]**: the scale of (k, j) is `B_scales[j * scale_ldb + k / 128]`,
+  `scale_ldb == K / 128`. Group size is 128 along K. Scales are random positive BF16 values in [0.004, 0.06).
+- D: **row-major** [M, N] BF16, `ldd == N`.
+
+All pointers are device pointers, 256-byte aligned. When `beta == 0`, D holds NaN on entry: you must not
+read it (do not compute `0 * D`). K is a multiple of 128 and N a multiple of 8.
+
+## Build & Test
+
+```bash
+make test                    # requires solution.h in the task directory
+./test                       # runs every benchmark shape below
+./test 64 8192 8192          # one custom shape: M N K
+```
+
+`make ref` builds the CUTLASS reference alone.
+
+## Problem Sizes
+
+The linear layers of Llama-3-70B as weight-only INT4 (hidden 8192, fused QKV 10240, FFN 28672 -> fused
+gate+up 57344). M is the number of tokens: decode batches of 1..128 sequences (weight-bandwidth bound:
+the INT4 weights of the large layers are 40-240 MB) and one 8K-token prefill chunk.
+
+| label               | M    | N     | K     | layer / scenario                         |
+|---------------------|------|-------|-------|------------------------------------------|
+| decode_m1_mlp_up    | 1    | 57344 | 8192  | single sequence, gate+up projection      |
+| decode_m16_qkv      | 16   | 10240 | 8192  | 16 sequences, fused QKV                  |
+| decode_m64_mlp_down | 64   | 8192  | 28672 | 64 sequences, FFN down projection        |
+| decode_m128_o_proj  | 128  | 8192  | 8192  | 128 sequences, attention output          |
+| decode_m128_mlp_up  | 128  | 57344 | 8192  | 128 sequences, gate+up projection        |
+| prefill_qkv         | 8192 | 10240 | 8192  | 8K-token prefill chunk, fused QKV        |
+
+All shapes use `alpha = 1, beta = 0`. One extra correctness-only case (M=48, N=1280, K=8192,
+`alpha = 0.75`, `beta = 0.5`, D initialised with random BF16 data) checks alpha / beta; it is not timed.
+A is uniform random BF16 in [-1, 1) with full mantissas.
+
+## Correctness
+
+The reference and your solution write to separate buffers that are pre-filled with NaN (for
+`beta != 0`: with the same random D). After your function returns, **every** element of D is compared
+with the reference output:
+
+- every element must be finite (NaN / Inf fail, so unwritten elements fail);
+- `|D - ref| <= 6e-2 * RMS(ref) + 1.6e-2 * |ref|` for every element, and the relative Frobenius error
+  `||D - ref|| / ||ref||` must be `<= 7.5e-3`.
+
+Both references (Marlin and CUTLASS) round the dequantized weights to BF16 before the MMA, so an exact FP32 dequantization differs from them by a
+relative Frobenius error of 2.4e-3, and a BF16-rounded one by 8e-5 .. 3.7e-4. FP16 accumulation
+(1.3e-2 .. 2.4e-2), BF16 accumulation (5e-2 .. 1.8e-1), FP8 activations or scales (2.4e-2 .. 2.5e-2) and FP4
+activations (2.5e-1) all fail; so do a wrong nibble order, a wrong scale layout, ignored scales or a skipped K group.
+The check is repeated once more after the timing loop, from a freshly poisoned D.
+
+## Performance
+
+For each shape the harness times the reference and your function with CUDA events (the L2 cache is flushed before
+every trial; D is re-poisoned and the activations A are refreshed with new random values outside the timed region,
+before every call of both sides) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`
+(minimum over the same number of trials for both). The score is the geometric mean of the speedups over the six
+shapes.
+
+References (both are public, production-grade implementations of exactly this operation; the faster one was chosen
+per shape from a sweep on B200):
+
+- M <= 64 (decode): **vLLM Marlin** (`csrc/quantization/marlin`, Apache-2.0, derived from IST-DASLab/Marlin; vendored
+  in `marlin/`). It is the kernel that serves INT4-weight models on B200 in vLLM today (`mma.sync` BF16 tensor
+  cores, weights dequantized in registers, FP32 stripe-partitioned reduction). Launch heuristics are vLLM's
+  (bf16 activations, uint4b8 weights, group size 128, FP32 reduce); for 17..64 rows the 256-thread 64x256 thread
+  tile is used (1.3x faster than vLLM's automatic choice at this shape).
+- M >= 128: CUTLASS 3.x Blackwell mixed-input GEMM (tcgen05, example 86, swap-AB) with the tile configuration chosen
+  per shape. (Marlin is 1.15x / 1.75x slower than it at M=128 and 2.3x slower at M=8192, where CUTLASS runs at 0.87
+  PFLOPs, 53% of cuBLAS BF16 with pre-dequantized weights; no public W4A16 kernel for B200 that is faster was found:
+  tinygemm / `torch._weight_int4pack_mm` is 1.3-25x slower than Marlin, vLLM Machete is Hopper-only (wgmma), the
+  newer CUTLASS main has the same mixed-input kernel, and CUTLASS's smem mixed-input schedules do not compile.)
+
+Reference time versus yardsticks (BF16 cuBLAS with the weights pre-dequantized to BF16, and the INT4 weight-traffic
+roofline at 7.5 TB/s):
+
+| label               | reference | ref us | cuBLAS BF16 us | roofline us | ref speed vs cuBLAS | vs roofline |
+|---------------------|-----------|--------|----------------|-------------|---------------------|-------------|
+| decode_m1_mlp_up    | Marlin    | 87     | 167            | 32.3        | 192%                | 37%         |
+| decode_m16_qkv      | Marlin    | 25     | 44             | 5.8         | 173%                | 23%         |
+| decode_m64_mlp_down | Marlin    | 106    | 101            | 16.1        | 96%                 | 15%         |
+| decode_m128_o_proj  | CUTLASS   | 56     | 40             | 4.6         | 71%                 | 8%          |
+| decode_m128_mlp_up  | CUTLASS   | 190    | 187            | 32.3        | 99%                 | 17%         |
+| prefill_qkv         | CUTLASS   | 1580   | 841            | -           | 53%                 | -           |
+
+The reference is therefore still far from the memory roofline on the decode shapes (at best 37%), so there is
+headroom for a bandwidth-optimal kernel.
+
+Your function is timed as a whole call, including any host-side launch setup.
+
+**Weight repacking (fairness rule).** Both references need the weights in their own kernel-specific layout (Marlin:
+16x64 tensor-core tiles with interleaved nibbles and permuted scales; CUTLASS: scales as [K/128, N]). The harness hands
+every implementation the plain layout documented above; the references convert it **once, outside the timed region**
+(what an inference engine does at model-load time), so their timed work is the GEMM kernel launches only. You may do
+the same: repack / transpose / pre-convert `B` and `B_scales` once into a function-local static cache keyed on the
+weight pointers and (N, K), on the first (warm-up) call, and reuse it. Everything that depends on A, alpha, beta or D
+must be recomputed on every call: the harness refreshes A with new values before every timed call and re-checks the
+result after the timing loop with yet another A, so results cannot be memoized. The weights are constant across calls
+(a buffer address and shape always carry identical contents), and the timed trials are the min over 20 calls after 3
+warm-ups, so the first-call repack cost is not measured; a per-call dequantization pass that writes a dequantized copy
+of the weights to memory is real per-call work and is not allowed to be hidden this way (see Rules).
+
+## Rules
+
+- Solutions must be your own kernels: no cuBLAS / cuDNN, and no CUTLASS device / kernel / collective GEMM
+  templates. CuTe and low-level building blocks (barriers, pipelines, layouts, `tcgen05` PTX) are allowed.
+- The steady-state per-call kernel must read the INT4 weights (the packed bytes or a one-time repacked copy of the same
+  4-bit data, about N*K/2 bytes), not a dequantized 8/16-bit copy of the weights; the activations stay BF16.

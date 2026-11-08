@@ -5,10 +5,10 @@ NVCC_FLAGS = -O3 --use_fast_math -std=c++20 --expt-extended-lambda --expt-relaxe
 ARCH     = -gencode arch=compute_100a,code=sm_100a
 LIBS     = -lcuda -lcudadevrt -lcudart_static -lrt -lpthread -ldl
 
-ref: hedgehog.cu harness.impl
+ref: hedgehog.cu kh_verify.h
 	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_BLACKWELL $< -o $@
 
-test: hedgehog.cu harness.impl solution.h
+test: hedgehog.cu solution.h kh_verify.h
 	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_BLACKWELL -DKH_TEST_SOLUTION $< -o $@
 
 clean:

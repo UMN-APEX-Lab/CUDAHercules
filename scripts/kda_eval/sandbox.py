@@ -142,12 +142,72 @@ def build_bwrap_argv(spec: SandboxSpec, command: list[str]) -> list[str]:
     return argv
 
 
+# ---------------------------------------------------------------------------
+# Fallback without bwrap (containers that forbid user namespaces).
+#
+# Set KDA_AGENT_USER=<unprivileged local user> to run every tool call as that user instead
+# of inside bwrap. This is MUCH weaker isolation: there is no network, mount, PID or
+# filesystem-view isolation. What it does keep: the agent cannot read the repository, the
+# reference code, the API key (.env) or other runs' results as long as their parent
+# directories are not world-accessible (e.g. a 0700 /root), and it cannot modify them. Use
+# an --output directory outside such a home (e.g. /srv/kda_results). Results obtained this
+# way are NOT comparable with sandboxed runs.
+# ---------------------------------------------------------------------------
+
+def _uid_mode() -> str:
+    return os.environ.get("KDA_AGENT_USER", "")
+
+
+def _link(target: str, path: str) -> None:
+    tmp = f"{path}.tmp{os.getpid()}"
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    os.symlink(target, tmp)
+    os.replace(tmp, path)          # atomic; replaces a previous task's symlink
+
+
+def _prepare_uid_layout(spec: SandboxSpec, user: str) -> tuple[int, int]:
+    """Create the fixed paths the agent sees (/workspace, /opt/kh, /opt/cutlass, /run/kh)."""
+    import pwd
+    pw = pwd.getpwnam(user)
+    cutlass = os.path.join(KH_ROOT, "reference_sources", "cutlass")
+    for sub in CUTLASS_INCLUDE_SUBDIRS:
+        src, dst = os.path.join(cutlass, sub), f"/opt/cutlass/{sub}"
+        if os.path.isdir(src) and not os.path.isdir(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copytree(src, dst)
+    os.makedirs("/opt", exist_ok=True)
+    os.makedirs("/run", exist_ok=True)
+    _link(spec.workspace, SANDBOX_WORKSPACE)
+    _link(spec.opt_kh, "/opt/kh")
+    _link(spec.sock_dir, SANDBOX_SOCK_DIR)
+    os.chmod(spec.sock_dir, 0o755)
+    # the agent owns its workspace (files seeded by the orchestrator are root-owned)
+    subprocess.run(["chown", "-R", f"{pw.pw_uid}:{pw.pw_gid}", spec.workspace], check=True)
+    os.makedirs(os.path.join(pw.pw_dir, "tmp"), exist_ok=True)
+    subprocess.run(["chown", "-R", f"{pw.pw_uid}:{pw.pw_gid}", pw.pw_dir], check=True)
+    return pw.pw_uid, pw.pw_gid
+
+
+def build_uid_argv(spec: SandboxSpec, command: list[str], user: str) -> list[str]:
+    uid, gid = _prepare_uid_layout(spec, user)
+    env = base_env()
+    env.update(spec.env)
+    env["TMPDIR"] = f"{SANDBOX_HOME}/tmp"
+    env["CUDA_VISIBLE_DEVICES"] = str(spec.gpu_index)
+    return (["setpriv", f"--reuid={uid}", f"--regid={gid}", "--clear-groups", "--no-new-privs",
+             "env", "-i"] + [f"{k}={v}" for k, v in env.items()] + command)
+
+
 def run_in_sandbox(spec: SandboxSpec, command: list[str], stdin: str = "",
                    timeout_s: float = 600) -> tuple[int, str, str, bool]:
     """Run one command in a fresh sandbox. Returns (rc, stdout, stderr, timed_out)."""
-    proc = subprocess.Popen(build_bwrap_argv(spec, command), stdin=subprocess.PIPE,
+    user = _uid_mode()
+    argv = build_uid_argv(spec, command, user) if user else build_bwrap_argv(spec, command)
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            start_new_session=True)
+                            start_new_session=True,
+                            cwd=SANDBOX_WORKSPACE if user else None)
     try:
         out, err = proc.communicate(stdin.encode(), timeout=timeout_s)
         timed_out = False

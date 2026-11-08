@@ -1,670 +1,348 @@
+// Task tk_linear_attention: causal linear attention with per-head exponential decay on B200.
+//
+// Reference: ThunderKittens-style chunked kernel (64-token chunks, TMA double buffering, warp-level
+// tensor-core MMA so that it runs on sm_100a). Solution under test (KH_TEST_SOLUTION): solution.h
+//   void LinearAttention(Q, K, V, O, slopes, B, H, N, D)
+// Inputs are generated on the device; reference and solution write to different, NaN-poisoned
+// buffers; every output element is compared.
+
+#ifdef KH_TEST_SOLUTION
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include "solution.h"   // must stay before the reference code / kh_verify.h
+#endif
+
+// Reference kernel: causal linear attention with per-head exponential decay (ThunderKittens,
+// warp-level tensor-core MMA so that it runs on sm_100a). One CTA per (batch, head), 64-token chunks.
 #include "kittens.cuh"
-#include <tuple>
 
-static constexpr int NUM_WORKERS = (8);
-static constexpr int NUM_THREADS = (NUM_WORKERS*kittens::WARP_THREADS);
-static constexpr int NUM_WARPGROUPS = (NUM_WORKERS/kittens::WARPGROUP_WARPS);
-
+namespace khref_la {
 using namespace kittens;
 
-#define CHUNK_SIZE 64
-#define ATTN_D 128
-#define ATTN_F 128
+constexpr int CHUNK = 64;     // tokens per chunk
+constexpr int HD = 128;       // head dimension (q/k/v/o)
+constexpr int NWARPS = 8;
+constexpr int NTHREADS = NWARPS * 32;
 
-struct la_globals { 
-    // shapes    
-    using q_tile       = st_bf<CHUNK_SIZE, ATTN_F>;
-    using k_tile       = st_bf<CHUNK_SIZE, ATTN_F>;
-    using k_tile_split = st_bf<CHUNK_SIZE, ATTN_F/2>;
-    using v_tile       = st_bf<CHUNK_SIZE, ATTN_D>;
-    using o_tile       = st_bf<CHUNK_SIZE, ATTN_D>;
+using tile_t = st_bf<CHUNK, HD>;               // 64 x 128 bf16, TMA tile for q / k / v / o
+using gl_t = gl<bf16, -1, -1, -1, -1, tile_t>;
 
-    // global layouts
-    using q_gl       = gl<bf16,  -1, -1, -1, -1, q_tile>;
-    using k_gl       = gl<bf16,  -1, -1, -1, -1, k_tile>;
-    using k_split_gl = gl<bf16,  -1, -1, -1, -1, k_tile_split>;
-    using v_gl       = gl<bf16,  -1, -1, -1, -1, v_tile>;
-    using o_gl       = gl<bf16,  -1, -1, -1, -1, o_tile>;
-
-    // pointers
-    q_gl       q;
-    k_gl       k;
-    k_split_gl k_split;
-    v_gl       v;
-    o_gl       o;
-
-    float *slopes;
+struct globals {
+  gl_t q, k, v, o;
+  const float *slopes;   // [H] decay rate per head, > 0
+  int n;                 // sequence length (multiple of CHUNK)
 };
 
-template<ducks::rt::row_layout RT>
-__device__ static inline void wg_mask(RT &dst, const RT &src, float slope) {
-    const typename RT::dtype packed_val = base_types::packing<typename RT::dtype>::pack(0.0f);
+// smem: q,k,v double buffered (96 KB) + o (16 KB) + decayed k (16 KB) + kv state bf16 (32 KB)
+constexpr size_t SMEM_BYTES = 6 * sizeof(tile_t) + 2 * sizeof(tile_t) + sizeof(st_bf<HD, HD>) + 1024;
 
-    int i = warpid() % kittens::WARPGROUP_WARPS;
-    #pragma unroll
-    for(int j = 0; j < dst.width; j++) {
-        if(j < i) { // below the diagonal, copy
-            #pragma unroll
-            for(int k = 0; k < dst.packed_per_tile; k++) {
-                const int row = (i * dst.tile_size_row) + ((k % 2) * 8) + ((laneid() / 4)); 
-                const int col_x = (j * dst.tile_size_col) + ((k / 2) * 8) + ((laneid() % 4) * 2);
-                const int col_y = (j * dst.tile_size_col) + ((k / 2) * 8) + ((laneid() % 4) * 2) + 1;
+__global__ __launch_bounds__(NTHREADS, 1) void la_kernel(const __grid_constant__ globals g) {
+  extern __shared__ alignment_dummy __shm[];
+  tma_swizzle_allocator al((int *)&__shm[0]);
+  tile_t(&q_s)[2] = al.allocate<tile_t, 2>();
+  tile_t(&k_s)[2] = al.allocate<tile_t, 2>();
+  tile_t(&v_s)[2] = al.allocate<tile_t, 2>();
+  tile_t &o_s = al.allocate<tile_t>();
+  tile_t &kd_s = al.allocate<tile_t>();
+  st_bf<HD, HD> &kv_s = al.allocate<st_bf<HD, HD>>();
+  __shared__ semaphore bar;
 
-                const float decay_x = __expf(-1.0f * slope * (row - col_x));
-                const float decay_y = __expf(-1.0f * slope * (row - col_y));
+  const int batch = blockIdx.y, head = blockIdx.x;
+  const int w = warpid(), lane = laneid();
+  const int rr = w & 3;     // which 16-row slice of the chunk this warp produces
+  const int ch = w >> 2;    // which 64-column half of the output / which half... of V
+  const float slope = g.slopes[head];
+  const int nblk = g.n / CHUNK;
+  constexpr uint32_t TILE_BYTES = sizeof(tile_t);
 
-                dst.tiles[i][j].data[k].x = src.tiles[i][j].data[k].x * decay_x;
-                dst.tiles[i][j].data[k].y = src.tiles[i][j].data[k].y * decay_y;
-            }
-        }
-        else if(j > i) { // above the diagonal, zero
-            #pragma unroll
-            for(int k = 0; k < dst.packed_per_tile; k++) {
-                dst.tiles[i][j].data[k] = packed_val;
-            }
-        }
-        else { // on the diagonal, interesting!
-            constexpr uint32_t MASK_X = 0xFF773311, MASK_Y = 0xF7733110; // magic numbers for on-diagonal core matrices
+  if (threadIdx.x == 0) {
+    init_semaphore(bar, 0, 1);
+    tma::expect_bytes(bar, 3 * TILE_BYTES);
+    tma::load_async(q_s[0], g.q, {batch, head, 0, 0}, bar);
+    tma::load_async(k_s[0], g.k, {batch, head, 0, 0}, bar);
+    tma::load_async(v_s[0], g.v, {batch, head, 0, 0}, bar);
+  }
+  // zero the kv state (bf16 copy in smem) and the fp32 register state
+  for (int i = threadIdx.x; i < HD * HD; i += NTHREADS) kv_s.data[i] = __float2bfloat16(0.f);
+  rt_fl<16, 32> kv[4];   // state rows [16w, 16w+16), all 128 value columns
+#pragma unroll
+  for (int j = 0; j < 4; j++) warp::zero(kv[j]);
+  __syncthreads();
 
-            const int row   = (i * dst.tile_size_row) + ((1 % 2) * 8) + ((laneid() / 4)); 
-            const int col_x = (j * dst.tile_size_col) + ((1 / 2) * 8) + ((laneid() % 4) * 2);
-            const int col_y = (j * dst.tile_size_col) + ((1 / 2) * 8) + ((laneid() % 4) * 2) + 1;
-
-            const float decay_x = __expf(-1.0f * slope * (row - col_x));
-            const float decay_y = __expf(-1.0f * slope * (row - col_y));
-
-            dst.tiles[i][j].data[1].x = src.tiles[i][j].data[1].x * decay_x;
-            dst.tiles[i][j].data[1].y = src.tiles[i][j].data[1].y * decay_y;
-
-            dst.tiles[i][j].data[2] = packed_val; // above diagonal, zero
-            
-            if((MASK_X >> laneid()) & 1) {
-                int row       = (i * dst.tile_size_row) + ((0 % 2) * 8) + ((laneid() / 4)); 
-                int col_x     = (j * dst.tile_size_col) + ((0 / 2) * 8) + ((laneid() % 4) * 2);
-                float decay_x = __expf(-1.0f * slope * (row - col_x));
-                dst.tiles[i][j].data[0].x = src.tiles[i][j].data[0].x * decay_x;
-
-                row     = (i * dst.tile_size_row) + ((3 % 2) * 8) + ((laneid() / 4)); 
-                col_x   = (j * dst.tile_size_col) + ((3 / 2) * 8) + ((laneid() % 4) * 2);
-                decay_x = __expf(-1.0f * slope * (row - col_x));
-                dst.tiles[i][j].data[3].x = src.tiles[i][j].data[3].x * decay_x;
-            }
-            else {
-                dst.tiles[i][j].data[0].x = 0.0f;
-                dst.tiles[i][j].data[3].x = 0.0f;
-            }
-            if((MASK_Y >> laneid()) & 1) {
-                int row       = (i * dst.tile_size_row) + ((0 % 2) * 8) + ((laneid() / 4)); 
-                int col_y     = (j * dst.tile_size_col) + ((0 / 2) * 8) + ((laneid() % 4) * 2) + 1;
-                float decay_y = __expf(-1.0f * slope * (row - col_y));
-                dst.tiles[i][j].data[0].y = src.tiles[i][j].data[0].y * decay_y;
-
-                row     = (i * dst.tile_size_row) + ((3 % 2) * 8) + ((laneid() / 4)); 
-                col_y   = (j * dst.tile_size_col) + ((3 / 2) * 8) + ((laneid() % 4) * 2) + 1;
-                decay_y = __expf(-1.0f * slope * (row - col_y));    
-                dst.tiles[i][j].data[3].y = src.tiles[i][j].data[3].y * decay_y;
-            }
-            else {
-                dst.tiles[i][j].data[0].y = 0.0f;
-                dst.tiles[i][j].data[3].y = 0.0f;
-            }
-        }
-        __syncwarp();
-    }
-    group<4>::sync(10 + warpgroupid());
-}
-
-__device__ static inline void wg_arange(auto &vec) {
-    // Each warp in the warpgroup writes to its own portion to avoid races
-    // vec.length = 64 (CHUNK_SIZE), 4 warps per warpgroup -> 16 elements per warp
-    constexpr int WARPS_PER_WG = kittens::WARPGROUP_WARPS;
-    int warp_in_group = warpid() % WARPS_PER_WG;
-    int elements_per_warp = vec.length / WARPS_PER_WG;
-    int start = warp_in_group * elements_per_warp;
-    #pragma unroll
-    for(int i = 0; i < elements_per_warp; i++) {
-        float val = static_cast<float>(start + i);
-        vec.data[start + i] = val;
-    }
-    group<4>::sync(5 + warpgroupid());
-}
-
-
-__global__ __launch_bounds__(NUM_THREADS, 1)
-void la_kernel (const __grid_constant__ la_globals g, int N)  
-{
-    extern __shared__ int __shm[]; // this is the CUDA shared memory
-    tma_swizzle_allocator al((int*)&__shm[0]);
-
-    const int batch = blockIdx.y;
-    const int head  = blockIdx.x;
-
-    float slope = g.slopes[head];
-
-    // smem
-    using q_tile              = st_bf<CHUNK_SIZE, ATTN_F>;
-
-    using k_tile              = st_bf<CHUNK_SIZE, ATTN_F>;
-    using k_tile_split        = st_bf<CHUNK_SIZE, ATTN_F/2>; 
-
-    using v_tile              = st_bf<CHUNK_SIZE, ATTN_D>;
-    using o_tile              = st_bf<CHUNK_SIZE, ATTN_D>;
-    using kv_state_tile       = st_bf<ATTN_F,     ATTN_D>;
-
-    q_tile             (&q_smem)[2]    = al.allocate<q_tile, 2>();          // 64 x 128 x 2 x 2 = 32k
-    k_tile             (&k_smem)[2]    = al.allocate<k_tile, 2>();          // 64 x 128 x 2 x 2 = 32k
-    k_tile_split (&k_smem_split)[2][2] = al.allocate<k_tile_split, 2, 2>(); // 64 x 128 x 2 x 2 = 32k
-    v_tile             (&v_smem)[2]    = al.allocate<v_tile, 2>();          // 64 x 128 x 2 x 2 = 32k
-
-    kv_state_tile (&kv_smem)                 = al.allocate<kv_state_tile>();          // 128 x 128 x 2 = 32k
-    o_tile         (&o_smem)[NUM_WARPGROUPS] = al.allocate<o_tile, NUM_WARPGROUPS>(); // 64 x 128 x 2 x 2 = 32k
-
-    col_vec<st_fl<CHUNK_SIZE, ATTN_D>> (&q_decay) = al.allocate<col_vec<st_fl<CHUNK_SIZE, ATTN_D>>>();
-    col_vec<st_fl<CHUNK_SIZE, ATTN_D>> (&k_decay) = al.allocate<col_vec<st_fl<CHUNK_SIZE, ATTN_D>>>();
-
-    int warpid      = kittens::warpid();
-    int warpgroupid = warpid/4;
-    int blocks      = N / (CHUNK_SIZE);
-
-    int tic = 0, toc = 1;
-
-    __shared__ semaphore qkv_semaphore;
-    if (warpid == 0) {
-        init_semaphore(qkv_semaphore, 0, 1);
-        warp::tma::expect_bytes(qkv_semaphore, 
-            size_bytes<typeof(q_smem[0])> + 
-            size_bytes<typeof(k_smem[0])> + 
-            size_bytes<typeof(k_smem_split[0][0])> + 
-            size_bytes<typeof(k_smem_split[0][1])> + 
-            size_bytes<typeof(v_smem[0])>);
-        
-        warp::tma::load_async(q_smem[tic],          g.q,       {batch, head, 0, 0}, qkv_semaphore);
-        warp::tma::load_async(k_smem[tic],          g.k,       {batch, head, 0, 0}, qkv_semaphore);
-        warp::tma::load_async(k_smem_split[tic][0], g.k_split, {batch, head, 0, 0}, qkv_semaphore);
-        warp::tma::load_async(k_smem_split[tic][1], g.k_split, {batch, head, 0, 1}, qkv_semaphore);
-        warp::tma::load_async(v_smem[tic],          g.v,       {batch, head, 0, 0}, qkv_semaphore);
+  const float block_decay = __expf(-slope * float(CHUNK));
+  int tic = 0;
+  for (int blk = 0; blk < nblk; blk++, tic ^= 1) {
+    wait(bar, tic);
+    __syncthreads();   // everyone is past the previous chunk (buffers [tic^1] free)
+    if (threadIdx.x == 0 && blk + 1 < nblk) {
+      tma::expect_bytes(bar, 3 * TILE_BYTES);
+      tma::load_async(q_s[tic ^ 1], g.q, {batch, head, blk + 1, 0}, bar);
+      tma::load_async(k_s[tic ^ 1], g.k, {batch, head, blk + 1, 0}, bar);
+      tma::load_async(v_s[tic ^ 1], g.v, {batch, head, blk + 1, 0}, bar);
     }
 
-    if (warpgroupid == 0) {
-        wg_arange(q_decay);
-        warp::mul(q_decay, q_decay, -1.0f * slope);
-        warp::exp(q_decay, q_decay);
+    // ---- S = Q_r K^T (16 x 64), decayed and causally masked -> bf16
+    rt_fl<16, 64> S;
+    warp::zero(S);
+#pragma unroll
+    for (int kk = 0; kk < HD / 32; kk++) {
+      rt_bf<16, 32> a;
+      rt_bf<64, 32> b;
+      warp::load(a, q_s[tic].template subtile<16, 32>({rr, kk}));
+      warp::load(b, k_s[tic].template subtile<64, 32>({0, kk}));
+      warp::mma_ABt(S, a, b, S);
     }
-    if (warpgroupid == 1) {
-        wg_arange(k_decay);
-        warp::mul(k_decay, k_decay, -1.0f); 
-        warp::add(k_decay, k_decay, CHUNK_SIZE);
-        warp::mul(k_decay, k_decay, -1.0f * slope);
-        warp::exp(k_decay, k_decay);
+    const int row0 = rr * 16;
+    warp::apply(S, S, [&](int row, int col, float val) {
+      int r = row0 + row;
+      return col <= r ? val * __expf(-slope * float(r - col)) : 0.f;
+    });
+    rt_bf<16, 64> P;
+    warp::copy(P, S);
+
+    // ---- O_local = P V[:, half]
+    rt_fl<16, 64> O, Oi;
+    warp::zero(O);
+    warp::zero(Oi);
+    {
+      rt_bf<64, 64, ducks::rt_layout::col> vb;
+      warp::load(vb, v_s[tic].template subtile<64, 64>({0, ch}));
+      warp::mma_AB(O, P, vb, O);
     }
-
-    warp::zero(kv_smem);
-
-    for (int block = 0; block < blocks; block++, tic^=1, toc^=1) {
-
-        wait(qkv_semaphore, tic);
-        __syncthreads();
-
-        if (warpid == 0 && block < blocks-1) {
-            warp::tma::expect_bytes(qkv_semaphore,
-                size_bytes<typeof(q_smem[0])> + 
-                size_bytes<typeof(k_smem[0])> + 
-                size_bytes<typeof(k_smem_split[0][0])> + 
-                size_bytes<typeof(k_smem_split[0][1])> + 
-                size_bytes<typeof(v_smem[0])>
-            );
-            warp::tma::load_async(q_smem[toc],          g.q,       {batch, head, block+1, 0}, qkv_semaphore); 
-            warp::tma::load_async(k_smem[toc],          g.k,       {batch, head, block+1, 0}, qkv_semaphore); 
-            warp::tma::load_async(k_smem_split[toc][0], g.k_split, {batch, head, block+1, 0}, qkv_semaphore);
-            warp::tma::load_async(k_smem_split[toc][1], g.k_split, {batch, head, block+1, 1}, qkv_semaphore);
-            warp::tma::load_async(v_smem[toc],          g.v,       {batch, head, block+1, 0}, qkv_semaphore);
-        }
-        __syncthreads();
-
-        if (warpgroupid == 0) {
-            rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, ATTN_D> linear_o;  
-
-            rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, CHUNK_SIZE> qk; 
-            rt_bf<CHUNK_SIZE/kittens::WARPGROUP_WARPS, CHUNK_SIZE> qk_bf;
-
-            warpgroup::mm_ABt(qk, q_smem[tic], k_smem[tic]);
-            warpgroup::mma_async_wait();
-
-            wg_mask(qk, qk, slope);
-            warp::copy(qk_bf, qk);
-
-            warpgroup::mm_AB(linear_o, qk_bf, v_smem[tic]);
-            warpgroup::mma_async_wait();
-
-            warpgroup::store(o_smem[warpgroupid], linear_o);
-
-            if (block != 0 && warpid == 0) { warp::tma::store_async_wait(); }
-            if               (warpid == 0) { warp::tma::store_add_async(g.o, o_smem[warpgroupid], {batch, head, block, 0}); }
-        }
-
-        if (warpgroupid == 1) {
-            rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, ATTN_D> linear_o;  
-
-            static_assert(NUM_WARPGROUPS == 2, "NUM_WARPGROUPS must be 2");
-            rt_fl<ATTN_F/(kittens::WARPGROUP_WARPS * NUM_WARPGROUPS), ATTN_D> local_kv_0; 
-            rt_fl<ATTN_F/(kittens::WARPGROUP_WARPS * NUM_WARPGROUPS), ATTN_D> local_kv_1;
-
-            rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, ATTN_F/2> local_k_0;
-            rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, ATTN_F/2> local_k_1;
-
-            col_vec<rt_fl<CHUNK_SIZE/kittens::WARPGROUP_WARPS, ATTN_D>> decay; 
-
-            auto kv_subtile_0 = kv_smem.subtile<ATTN_F/2, ATTN_D>({0, 0});
-            auto kv_subtile_1 = kv_smem.subtile<ATTN_F/2, ATTN_D>({1, 0});
-
-            warpgroup::mm_AB(linear_o, q_smem[tic], kv_smem);
-            warpgroup::load(decay, q_decay);
-            warpgroup::mma_async_wait();
-            warp::mul_row(linear_o, linear_o, decay);
-            
-            warpgroup::store(o_smem[warpgroupid], linear_o);
-
-            warpgroup::load(local_k_0, k_smem_split[tic][0]);
-            warpgroup::load(local_k_1, k_smem_split[tic][1]);
-            warpgroup::load(decay, k_decay);
-            warp::mul_row(local_k_0, local_k_0, decay);
-            warp::mul_row(local_k_1, local_k_1, decay);
-            // Store decayed K back to tic (safe since TMA is done with it)
-            // NOT to toc, which races with TMA loading the next block
-            warpgroup::store(k_smem_split[tic][0], local_k_0);
-            warpgroup::store(k_smem_split[tic][1], local_k_1);
-
-            if (block != 0 && warpid == 4) { warp::tma::store_async_wait(); }
-            if               (warpid == 4) { warp::tma::store_add_async(g.o, o_smem[warpgroupid], {batch, head, block, 0}); }
-
-            float block_decay = __expf(-slope * static_cast<float>(CHUNK_SIZE));
-
-            warpgroup::load(local_kv_0, kv_subtile_0); 
-            warp::mul(local_kv_0, local_kv_0, block_decay);
-            warpgroup::mma_AtB(local_kv_0, k_smem_split[tic][0], v_smem[tic]);
-            
-            warpgroup::load(local_kv_1, kv_subtile_1); 
-            warp::mul(local_kv_1, local_kv_1, block_decay);
-            warpgroup::mma_AtB(local_kv_1, k_smem_split[tic][1], v_smem[tic]);
-    
-            warpgroup::mma_async_wait();
-
-            warpgroup::store(kv_subtile_0, local_kv_0);
-            warpgroup::store(kv_subtile_1, local_kv_1);
-        }
+    // ---- O_inter = decay_q * (Q_r @ KV[:, half])
+#pragma unroll
+    for (int kk = 0; kk < HD / 32; kk++) {
+      rt_bf<16, 32> a;
+      rt_bf<32, 64, ducks::rt_layout::col> b;
+      warp::load(a, q_s[tic].template subtile<16, 32>({rr, kk}));
+      warp::load(b, kv_s.template subtile<32, 64>({kk, ch}));
+      warp::mma_AB(Oi, a, b, Oi);
     }
+    warp::apply(Oi, Oi, [&](int row, int col, float val) {
+      return val * __expf(-slope * float(row0 + row));
+    });
+    warp::add(O, O, Oi);
+    { auto o_sub = o_s.template subtile<16, 64>({rr, ch}); warp::store(o_sub, O); }
 
-    tma::store_async_wait();
+    // ---- decayed K for the state update: kd[m, :] = k[m, :] * exp(-slope * (CHUNK - m))
+    for (int idx = threadIdx.x; idx < CHUNK * HD / 2; idx += NTHREADS) {
+      int m = idx / (HD / 2);
+      int c2 = idx % (HD / 2);
+      bf16_2 x = *reinterpret_cast<bf16_2 *>(&k_s[tic][{m, 2 * c2}]);
+      float d = __expf(-slope * float(CHUNK - m));
+      float2 xf = __bfloat1622float2(x);
+      bf16_2 y = __floats2bfloat162_rn(xf.x * d, xf.y * d);
+      *reinterpret_cast<bf16_2 *>(&kd_s[{m, 2 * c2}]) = y;
+    }
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    __syncthreads();   // o_s, kd_s complete; everybody finished reading kv_s
+    if (threadIdx.x == 0) tma::store_async(g.o, o_s, {batch, head, blk, 0});
+
+    // ---- state update: KV_w = decay^64 * KV_w + Kd^T[16w..16w+16, :] @ V
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      warp::mul(kv[j], kv[j], block_decay);
+      rt_bf<64, 16, ducks::rt_layout::col> a;
+      rt_bf<64, 32, ducks::rt_layout::col> b;
+      warp::load(a, kd_s.template subtile<64, 16>({0, w}));
+      warp::load(b, v_s[tic].template subtile<64, 32>({0, j}));
+      warp::mma_AtB(kv[j], a, b, kv[j]);
+    }
+#pragma unroll
+    for (int j = 0; j < 4; j++) { auto kv_sub = kv_s.template subtile<16, 32>({w, j}); warp::store(kv_sub, kv[j]); }
+    if (threadIdx.x == 0) tma::store_async_read_wait();
     __syncthreads();
+  }
+  if (threadIdx.x == 0) tma::store_async_wait();
 }
 
-la_globals la_init(
-    bf16 *d_q, bf16 *d_k, bf16 *d_v, bf16 *d_o,
-    float *d_slopes,
-    size_t B, size_t H, size_t N
-) {
-    // global pointers. 
-    using q_tile       = st_bf<CHUNK_SIZE,   ATTN_F>;
-    using k_tile       = st_bf<CHUNK_SIZE,   ATTN_F>;
-    using k_split_tile = st_bf<CHUNK_SIZE,   ATTN_F/2>;
-    using v_tile       = st_bf<CHUNK_SIZE,   ATTN_D>;
-    using o_tile       = st_bf<CHUNK_SIZE,   ATTN_D>;
-    
-    using q_global       = gl<bf16, -1, -1, -1, -1, q_tile>;
-    using k_global       = gl<bf16, -1, -1, -1, -1, k_tile>;
-    using k_split_global = gl<bf16, -1, -1, -1, -1, k_split_tile>;
-    using v_global       = gl<bf16, -1, -1, -1, -1, v_tile>;
-    using o_global       = gl<bf16, -1, -1, -1, -1, o_tile>;
-
-    using globals = la_globals;
-    q_global             q_arg{d_q, B, H, N, ATTN_F};
-    k_global             k_arg{d_k, B, H, N, ATTN_F};
-    k_split_global k_split_arg{d_k, B, H, N, ATTN_F}; 
-    v_global             v_arg{d_v, B, H, N, ATTN_D};
-    o_global             o_arg{d_o, B, H, N, ATTN_D};
-
-    globals g{
-        q_arg, k_arg, k_split_arg, v_arg, o_arg,
-        d_slopes
-    };
-
-    return g;
+inline globals make_globals(bf16 *q, bf16 *k, bf16 *v, bf16 *o, const float *slopes, int B, int H, int N) {
+  size_t b_ = B, h_ = H, n_ = N, d_ = HD;
+  gl_t qg{q, b_, h_, n_, d_}, kg{k, b_, h_, n_, d_}, vg{v, b_, h_, n_, d_}, og{o, b_, h_, n_, d_};
+  return globals{qg, kg, vg, og, slopes, N};
 }
 
-#include <iostream>
-#include <iomanip>
+inline void launch(globals const &g, int B, int H, cudaStream_t s = 0) {
+  static bool init = false;
+  if (!init) {
+    cudaFuncSetAttribute(la_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM_BYTES);
+    init = true;
+  }
+  la_kernel<<<dim3(H, B), NTHREADS, SMEM_BYTES, s>>>(g);
+}
+}  // namespace khref_la
+
+#include "kh_verify.h"
+#include <cstdio>
 #include <string>
-#include <fstream>
-#include <chrono>
+#include <vector>
+
+namespace {
+using namespace khref_la;
+
+// Tolerances: |x - ref| <= max_rms * RMS(ref) + rel * |ref| for every element, and rel. Frobenius
+// error <= fro. Measured with the shipped FP32 recurrence on all sizes: max|err|/rms <= 0.072,
+// fro = 2.9e-3 (the reference and the solution both round to BF16 at different places; the
+// reference itself deviates 2.7e-3 from an independent FP32 PyTorch computation). Bad variants
+// (fro / elements failing at max_rms=0.2, rel=0.03; timed sizes): state rounded to BF16 every
+// step 1.4e-2; Q,K rounded to FP8 4.1e-2; slope x1.1 6.5e-2; slope x0.9 7.5e-2; slope of the
+// wrong head 0.29-0.55; state reset every 2048 / 512 / 64 tokens 0.16 / 0.35 / 0.75; current
+// token excluded 0.2; no decay 13+; half of the outputs unwritten / empty solution: non-finite.
+// (State kept in FP16 is as accurate as the reference: 3.4e-3, passes.)
+KhTol kTol(0.2, 9.0e-3, 0.03);
+
+struct Case { const char *label; int B, H, N; };
+
+void dump(const char *dir, const char *name, const void *dptr, size_t bytes) {
+  std::vector<char> h(bytes);
+  KH_CHECK(cudaMemcpy(h.data(), dptr, bytes, cudaMemcpyDeviceToHost));
+  std::string path = std::string(dir) + "/" + name;
+  FILE *f = std::fopen(path.c_str(), "wb");
+  std::fwrite(h.data(), 1, bytes, f);
+  std::fclose(f);
+}
+
+bool run_case(Case const &c, bool timed, int trials) {
+  const int B = c.B, H = c.H, N = c.N;
+  const size_t n_el = size_t(B) * H * N * HD;
+  bf16 *q, *k, *v, *o_ref;
+  float *slopes;
+  KH_CHECK(cudaMalloc(&q, n_el * 2)); KH_CHECK(cudaMalloc(&k, n_el * 2));
+  KH_CHECK(cudaMalloc(&v, n_el * 2)); KH_CHECK(cudaMalloc(&o_ref, n_el * 2));
+  KH_CHECK(cudaMalloc(&slopes, H * sizeof(float)));
+  // q.k has std ~ 1/sqrt(HD) and v has unit std, so O has std ~ 1
+  // Q, K, V are regenerated with a new seed before every timed call and before the final re-check.
+  unsigned seq = 1;
+  auto refresh = [&](unsigned seed) {
+    kh_fill_uniform(q, n_el, 11u + 7919u * seed, 0.153f);
+    kh_fill_uniform(k, n_el, 22u + 7919u * seed, 0.153f);
+    kh_fill_uniform(v, n_el, 33u + 7919u * seed, 1.7f);
+  };
+  refresh(seq);
+  {
+    std::vector<float> hs(H);
+    for (int h = 0; h < H; h++)   // ALiBi / lightning-attention style slopes, jittered
+      hs[h] = std::exp2(-8.0f * (h + 1) / H) * kh_uniform_pos(h, 44u, 0.9f, 1.1f);
+    KH_CHECK(cudaMemcpy(slopes, hs.data(), H * sizeof(float), cudaMemcpyHostToDevice));
+  }
+  kh_poison(o_ref, n_el * 2);
+  KH_CHECK(cudaDeviceSynchronize());
+
+  globals g = make_globals(q, k, v, o_ref, slopes, B, H, N);
+  auto run_ref = [&] { launch(g, B, H); };
+  run_ref();
+  KH_CHECK(cudaGetLastError());
+  KH_CHECK(cudaDeviceSynchronize());
+
+  bool ok = true;
+  {
+    KhResult r = kh_compare(o_ref, o_ref, n_el, kTol);
+    if (!r.pass) { std::fprintf(stderr, "Reference output incomplete or non-finite (non-finite = %llu)\n", r.nonfinite); ok = false; }
+  }
+  if (const char *dir = std::getenv("KH_DUMP_DIR")) {
+    dump(dir, "q.bin", q, n_el * 2); dump(dir, "k.bin", k, n_el * 2); dump(dir, "v.bin", v, n_el * 2);
+    dump(dir, "slopes.bin", slopes, H * 4); dump(dir, "o_ref.bin", o_ref, n_el * 2);
+  }
 
 #ifdef KH_TEST_SOLUTION
-#include "solution.h"
+  bf16 *o_sol;
+  KH_CHECK(cudaMalloc(&o_sol, n_el * 2));
+  auto reset_sol = [&] { kh_poison(o_sol, n_el * 2); };
+  auto call_sol = [&] {
+    LinearAttention(reinterpret_cast<__nv_bfloat16 *>(q), reinterpret_cast<__nv_bfloat16 *>(k),
+                    reinterpret_cast<__nv_bfloat16 *>(v), reinterpret_cast<__nv_bfloat16 *>(o_sol),
+                    slopes, B, H, N, HD);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "Solution kernel failed: %s\n", cudaGetErrorString(e)); std::exit(1); }
+  };
+  if (ok) {
+    reset_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    call_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    KhResult r = kh_compare(o_sol, o_ref, n_el, kTol);
+    kh_print_result("solution", r, kTol);
+    ok = r.pass;
+#ifdef KH_TOL_SCAN   // development aid: how many elements would fail at other (max_rms, rel) settings
+    for (double m : {0.01, 0.02, 0.03, 0.05, 0.1}) for (double rl : {0.0, 0.005, 0.01, 0.02, 0.04, 0.08}) {
+      KhResult rs = kh_compare(o_sol, o_ref, n_el, KhTol(m, 1.0, rl));
+      std::printf("SCAN max_rms=%.3f rel=%.3f nbad=%llu max_err_rel=%.4e fro=%.4e\n", m, rl, rs.nbad, rs.max_err_rel, rs.fro_rel);
+    }
 #endif
-
-#define ATTN_B (1)
-#define ATTN_H (8)
-#define ATTN_N (1024)
-
-#define CudaCheckError()    __cudaCheckError( __FILE__, __LINE__ )
-inline void __cudaCheckError( const char *file, const int line ) {
-    cudaError err = cudaGetLastError();
-    if ( cudaSuccess != err ) {
-        fprintf( stderr, "cudaCheckError() failed at %s:%i : %s\n",
-                 file, line, cudaGetErrorString( err ) );
-        exit( -1 );
-    }
-    err = cudaDeviceSynchronize();
-    if( cudaSuccess != err ) {
-        fprintf( stderr, "cudaCheckError() with sync failed at %s:%i : %s\n",
-                 file, line, cudaGetErrorString( err ) );
-        exit( -1 );
-    }
+  }
+#endif
+  if (ok && timed && trials > 0) {
+    KhTime tr = kh_time(run_ref, trials, [&] { refresh(++seq); kh_poison(o_ref, n_el * 2); });
+    kh_print_time("Ref", tr);
+#ifdef KH_TEST_SOLUTION
+    KhTime ts = kh_time(call_sol, trials, [&] { refresh(++seq); reset_sol(); });
+    kh_print_time("Kernel", ts);
+    kh_print_speedup(tr, ts);
+#endif
+  }
+#ifdef KH_TEST_SOLUTION
+  // Final re-check, unconditionally (also without timing): fresh inputs, reference recomputed for them,
+  // freshly poisoned solution output. A solution that memoises its output fails here.
+  if (ok) {
+    refresh(++seq);   // fresh inputs: recompute the reference, then run the solution on them
+    run_ref();
+    KH_CHECK(cudaDeviceSynchronize());
+    reset_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    call_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    KhResult rr = kh_compare(o_sol, o_ref, n_el, kTol);
+    kh_print_result("solution (re-check, fresh inputs)", rr, kTol);
+    ok = rr.pass;
+  }
+#endif
+#ifdef KH_TEST_SOLUTION
+  cudaFree(o_sol);
+#endif
+  cudaFree(q); cudaFree(k); cudaFree(v); cudaFree(o_ref); cudaFree(slopes);
+  return ok;
 }
+}  // namespace
 
 int main(int argc, char **argv) {
-    std::cout << "Entered main!" << std::endl;
-
-    constexpr int TOTAL_ELEMENTS_QK = ATTN_B*ATTN_H*ATTN_N*ATTN_D;
-    constexpr int TOTAL_ELEMENTS_VO = ATTN_B*ATTN_H*ATTN_N*ATTN_F;
-    
-    float *slopes      = new float[ATTN_H];
-    float *q           = new float[TOTAL_ELEMENTS_QK];
-    float *k           = new float[TOTAL_ELEMENTS_QK];
-    float *v           = new float[TOTAL_ELEMENTS_VO];
-    float *o_ref       = new float[TOTAL_ELEMENTS_VO];
-    float *o           = new float[TOTAL_ELEMENTS_VO];
-    
-    bf16 *q_bf        = new bf16[TOTAL_ELEMENTS_QK];
-    bf16 *k_bf        = new bf16[TOTAL_ELEMENTS_QK];
-    bf16 *v_bf        = new bf16[TOTAL_ELEMENTS_VO];
-    bf16 *o_bf        = new bf16[TOTAL_ELEMENTS_VO];
-
-    if(argc > 1) {
-        std::ifstream infile(argv[1]);
-        std::cout << "Reading input file: " << argv[1] << std::endl;
-
-        // 1. Read slopes
-        for(int i = 0; i < ATTN_H; i++) {
-            infile >> slopes[i];
-            printf("slopes[%d] = %f\n", i, slopes[i]);
-        }
-        std::cout << "Finished loading " << ATTN_H << " slopes" << std::endl;
-
-        // 2. Read Q
-        for(int i = 0; i < TOTAL_ELEMENTS_QK; i++) infile >> q[i];
-        std::cout << "Finished loading " << TOTAL_ELEMENTS_QK << " elements of Q" << std::endl;
-
-        // 3. Read K
-        for(int i = 0; i < TOTAL_ELEMENTS_QK; i++) infile >> k[i];
-        std::cout << "Finished loading " << TOTAL_ELEMENTS_QK << " elements of K" << std::endl;
-
-        // 4. Read V
-        for(int i = 0; i < TOTAL_ELEMENTS_VO; i++) infile >> v[i];
-        std::cout << "Finished loading " << TOTAL_ELEMENTS_VO << " elements of V" << std::endl;
-
-        // 5. Read O reference
-        for(int i = 0; i < TOTAL_ELEMENTS_VO; i++) infile >> o_ref[i];
-        std::cout << "Finished loading " << TOTAL_ELEMENTS_VO << " elements of O_REF" << std::endl;
-    }
-
-    // Convert to bf16
-    for(uint64_t i = 0; i < TOTAL_ELEMENTS_QK; i++) {
-        q_bf[i] = __float2bfloat16(q[i]);
-        k_bf[i] = __float2bfloat16(k[i]);
-    }
-    for(uint64_t i = 0; i < TOTAL_ELEMENTS_VO; i++) {
-        v_bf[i] = __float2bfloat16(v[i]);
-    }
-
-    bf16 *d_q, *d_k, *d_v, *d_o;
-    float *d_slopes;
-    
-    cudaMalloc(&d_slopes,   ATTN_H            * sizeof(float));
-    cudaMalloc(&d_q,        TOTAL_ELEMENTS_QK * sizeof(bf16));
-    cudaMalloc(&d_k,        TOTAL_ELEMENTS_QK * sizeof(bf16));
-    cudaMalloc(&d_v,        TOTAL_ELEMENTS_VO * sizeof(bf16));
-    cudaMalloc(&d_o,        TOTAL_ELEMENTS_VO * sizeof(bf16));
-
-    cudaMemcpy(d_slopes, slopes,   ATTN_H            * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_q,      q_bf,     TOTAL_ELEMENTS_QK * sizeof(bf16),  cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k,      k_bf,     TOTAL_ELEMENTS_QK * sizeof(bf16),  cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v,      v_bf,     TOTAL_ELEMENTS_VO * sizeof(bf16),  cudaMemcpyHostToDevice);
-    
-    // zero out d_o
-    cudaMemset(d_o, 0, TOTAL_ELEMENTS_VO * sizeof(bf16));
-
-    cudaDeviceSynchronize();
-    CudaCheckError();
-
-    // Set up kernel configuration
-    unsigned long mem_size = kittens::MAX_SHARED_MEMORY - 1024; 
-
-    // Initialize kernel configuration
-    la_globals g = la_init(
-        d_q, d_k, d_v, d_o,
-        d_slopes,
-        ATTN_B, ATTN_H, ATTN_N
-    );
-
-    cudaFuncSetAttribute(
-        la_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        mem_size
-    );
-
-    // Run kernel
-    const int ITER = 1;
-    cudaDeviceSynchronize();
-    CudaCheckError();
-
-    std::cout << "Starting kernel with " << ATTN_B*ATTN_H << " blocks and " << NUM_THREADS << " threads\n";
-    float avg_us = 0;
-    for(int i = 0; i < ITER; i++) {
-        // zero out d_o
-        cudaMemset(d_o, 0, TOTAL_ELEMENTS_VO * sizeof(bf16));
-        cudaDeviceSynchronize();
-        CudaCheckError();
-
-        const auto start = std::chrono::high_resolution_clock::now();
-        la_kernel<<<dim3(ATTN_H,ATTN_B), NUM_THREADS, mem_size>>>(g, ATTN_N);
-        cudaDeviceSynchronize();
-        const auto finish = std::chrono::high_resolution_clock::now();
-        CudaCheckError();
-        avg_us += std::chrono::duration_cast<std::chrono::microseconds>(finish - start).count();
-    }
-    avg_us /= ITER;
-    std::cout << "Average execution time: " << avg_us << " us" << std::endl;
-
-    // Copy results back and compare
-    cudaMemcpy(o_bf, d_o, TOTAL_ELEMENTS_VO * sizeof(bf16), cudaMemcpyDeviceToHost);
-    
-    // Convert output to float
-    for(int i = 0; i < TOTAL_ELEMENTS_VO; i++) {
-        o[i] = __bfloat162float(o_bf[i]);
-    }
-
-    // Write results to files for analysis
-    std::ofstream o_ref_file("printouts/o_ref.txt");
-    std::ofstream o_file("printouts/o.txt");
-    std::ofstream diff_file("printouts/diff.txt");
-
-    float max_diff = 0, total_diff = 0, total_abs = 0;
-    for(int i = 0; i < TOTAL_ELEMENTS_VO; i++) {
-        float diff = o[i] - o_ref[i];
-        
-        o_ref_file << o_ref[i] << ' ';
-        o_file << o[i] << ' ';
-        diff_file << diff << ' ';
-        
-        if(i % 64 == 63) {
-            o_ref_file << std::endl;
-            o_file << std::endl;
-            diff_file << std::endl;
-        }
-
-        if(abs(diff) > max_diff || isnan(diff)) {
-            max_diff = abs(diff);
-            if(isnan(diff)) {
-                printf("NAN detected idx=%d, o = %f, o_ref = %f, diff = %f\n", i, o[i], o_ref[i], diff);
-                break;
-            }
-        }
-
-        total_abs += abs(o_ref[i]);
-        total_diff += abs(diff);
-    }
-
-    // Print error metrics
-    std::cout.setf(std::ios::fixed, std::ios::floatfield);
-    std::cout.precision(6);
-    std::cout.width(12);
-    std::cout << "O | avg_diff=" << (total_diff/TOTAL_ELEMENTS_VO)
-              << ", avg_abs=" << (total_abs/TOTAL_ELEMENTS_VO)
-              << ", rel_diff=" << 100*(total_diff/total_abs)
-              << "%, max_diff=" << max_diff << std::endl;
-
-#ifdef KH_TEST_SOLUTION
-    // --- Solution testing block ---
-    bf16 *d_o_solution;
-    cudaMalloc(&d_o_solution, TOTAL_ELEMENTS_VO * sizeof(bf16));
-    cudaMemset(d_o_solution, 0, TOTAL_ELEMENTS_VO * sizeof(bf16));
-
-    // Run solution kernel
-    LinearAttention(
-        reinterpret_cast<__nv_bfloat16*>(d_q),
-        reinterpret_cast<__nv_bfloat16*>(d_k),
-        reinterpret_cast<__nv_bfloat16*>(d_v),
-        reinterpret_cast<__nv_bfloat16*>(d_o_solution),
-        d_slopes,
-        ATTN_B, ATTN_H, ATTN_N, ATTN_D);
-    cudaDeviceSynchronize();
-    CudaCheckError();
-
-    // Copy solution output to host and compare against TK output (o[])
-    bf16 *sol_bf = new bf16[TOTAL_ELEMENTS_VO];
-    float *sol_f = new float[TOTAL_ELEMENTS_VO];
-    cudaMemcpy(sol_bf, d_o_solution, TOTAL_ELEMENTS_VO * sizeof(bf16), cudaMemcpyDeviceToHost);
-    for (int i = 0; i < TOTAL_ELEMENTS_VO; i++) {
-        sol_f[i] = __bfloat162float(sol_bf[i]);
-    }
-
-    printf("\n=== linear_attention: B=%d, H=%d, N=%d, D=%d ===\n", ATTN_B, ATTN_H, ATTN_N, ATTN_D);
-    constexpr float sol_abs_tol = 0.5f;
-    constexpr float sol_rel_tol = 0.05f;
-    bool sol_correct = true;
-    int sol_diff_counter = 0;
-    float sol_max_diff = 0.0f;
-    for (int i = 0; i < TOTAL_ELEMENTS_VO; i++) {
-        float diff = abs(sol_f[i] - o[i]);
-        if (isnan(diff) || isinf(sol_f[i])) {
-            sol_correct = false;
-            sol_diff_counter++;
-        } else if (diff > fmax(sol_abs_tol, abs(o[i]) * sol_rel_tol)) {
-            sol_correct = false;
-            sol_diff_counter++;
-        }
-        sol_max_diff = fmax(sol_max_diff, diff);
-    }
-
-    if (sol_correct) {
-        printf("Passed\n");
-    } else {
-        printf("Failed (%d elements differ, max diff: %f)\n", sol_diff_counter, sol_max_diff);
-    }
-
-    // CUDA event timing
-    const int WARMUP = 3;
-    const int TIMED = 10;
-    cudaEvent_t ev_start, ev_stop;
-    cudaEventCreate(&ev_start);
-    cudaEventCreate(&ev_stop);
-
-    // --- Time TK reference kernel ---
-    for (int i = 0; i < WARMUP; i++) {
-        cudaMemset(d_o, 0, TOTAL_ELEMENTS_VO * sizeof(bf16));
-        la_kernel<<<dim3(ATTN_H,ATTN_B), NUM_THREADS, mem_size>>>(g, ATTN_N);
-    }
-    cudaDeviceSynchronize();
-
-    float ref_total_ms = 0.0f;
-    float ref_min_ms = 1e9f;
-    for (int i = 0; i < TIMED; i++) {
-        cudaMemset(d_o, 0, TOTAL_ELEMENTS_VO * sizeof(bf16));
-        cudaDeviceSynchronize();
-        cudaEventRecord(ev_start);
-        la_kernel<<<dim3(ATTN_H,ATTN_B), NUM_THREADS, mem_size>>>(g, ATTN_N);
-        cudaEventRecord(ev_stop);
-        cudaEventSynchronize(ev_stop);
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, ev_start, ev_stop);
-        ref_total_ms += ms;
-        if (ms < ref_min_ms) ref_min_ms = ms;
-    }
-    float ref_avg_ms = ref_total_ms / TIMED;
-
-    // --- Time solution kernel ---
-    for (int i = 0; i < WARMUP; i++) {
-        cudaMemset(d_o_solution, 0, TOTAL_ELEMENTS_VO * sizeof(bf16));
-        LinearAttention(
-            reinterpret_cast<__nv_bfloat16*>(d_q),
-            reinterpret_cast<__nv_bfloat16*>(d_k),
-            reinterpret_cast<__nv_bfloat16*>(d_v),
-            reinterpret_cast<__nv_bfloat16*>(d_o_solution),
-            d_slopes,
-            ATTN_B, ATTN_H, ATTN_N, ATTN_D);
-    }
-    cudaDeviceSynchronize();
-
-    float sol_total_ms = 0.0f;
-    float sol_min_ms = 1e9f;
-    for (int i = 0; i < TIMED; i++) {
-        cudaMemset(d_o_solution, 0, TOTAL_ELEMENTS_VO * sizeof(bf16));
-        cudaDeviceSynchronize();
-        cudaEventRecord(ev_start);
-        LinearAttention(
-            reinterpret_cast<__nv_bfloat16*>(d_q),
-            reinterpret_cast<__nv_bfloat16*>(d_k),
-            reinterpret_cast<__nv_bfloat16*>(d_v),
-            reinterpret_cast<__nv_bfloat16*>(d_o_solution),
-            d_slopes,
-            ATTN_B, ATTN_H, ATTN_N, ATTN_D);
-        cudaEventRecord(ev_stop);
-        cudaEventSynchronize(ev_stop);
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, ev_start, ev_stop);
-        sol_total_ms += ms;
-        if (ms < sol_min_ms) sol_min_ms = ms;
-    }
-    float sol_avg_ms = sol_total_ms / TIMED;
-
-    printf("Ref time: %.4f ms (avg over %d trials, min: %.4f ms)\n", ref_avg_ms, TIMED, ref_min_ms);
-    printf("Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n", sol_avg_ms, TIMED, sol_min_ms);
-    printf("Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
-
-    cudaEventDestroy(ev_start);
-    cudaEventDestroy(ev_stop);
-    delete[] sol_bf;
-    delete[] sol_f;
-    cudaFree(d_o_solution);
-#endif
-
-    // Cleanup
-    cudaFree(d_q);
-    cudaFree(d_k);
-    cudaFree(d_v);
-    cudaFree(d_o);
-    cudaFree(d_slopes);
-
-    delete[] slopes;
-    delete[] q;
-    delete[] k;
-    delete[] v;
-    delete[] o;
-    delete[] o_ref;
-    delete[] q_bf;
-    delete[] k_bf;
-    delete[] v_bf;
-    delete[] o_bf;
-
+  cudaDeviceProp props;
+  KH_CHECK(cudaGetDeviceProperties(&props, 0));
+  if (props.major != 10 || props.minor != 0) {
+    std::fprintf(stderr, "This task requires a Blackwell sm_100 GPU (B200).\n");
     return 0;
+  }
+  const int trials = kh_trials();
+  const bool keep_going = std::getenv("KH_KEEP_GOING") != nullptr;
+  bool failed = false;
+
+  if (argc >= 4) {   // ./test B H N : single custom shape
+    Case c{"custom", std::atoi(argv[1]), std::atoi(argv[2]), std::atoi(argv[3])};
+    std::printf("\n=== custom: B=%d, H=%d, N=%d, D=%d ===\n", c.B, c.H, c.N, HD);
+    if (!run_case(c, true, trials)) { std::printf("Incorrect\n"); return 1; }
+    std::printf("Passed\n");
+    return 0;
+  }
+  std::vector<Case> cases = {
+      {"b8_n8k", 8, 32, 8192},
+      {"b4_n16k", 4, 64, 16384},
+      {"b1_n64k", 1, 64, 65536},
+  };
+
+  // Correctness-only cases (odd batch / head counts, short sequences); not timed.
+  std::vector<Case> small = {
+      {"odd_shape", 3, 5, 1536},
+      {"short_seq", 2, 8, 64},
+  };
+  for (auto const &c : small) {
+    std::printf("\n--- %s: B=%d, H=%d, N=%d, D=128 (correctness only) ---\n", c.label, c.B, c.H, c.N);
+    if (!run_case(c, false, 0)) { std::printf("Incorrect\n"); if (!keep_going) return 1; failed = true; }
+    else std::printf("Passed\n");
+  }
+
+  for (auto const &c : cases) {
+    std::printf("\n=== %s: B=%d, H=%d, N=%d, D=%d ===\n", c.label, c.B, c.H, c.N, HD);
+    if (!run_case(c, true, trials)) { std::printf("Incorrect\n"); if (!keep_going) return 1; failed = true; }
+    else std::printf("Passed\n");
+  }
+  return failed ? 1 : 0;
 }

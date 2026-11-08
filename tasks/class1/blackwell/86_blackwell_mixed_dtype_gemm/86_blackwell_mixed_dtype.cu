@@ -2,685 +2,421 @@
  * Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
+ * Redistribution and use in source and binary forms, with or without modification, are permitted
+ * provided that the following conditions are met: (BSD-3-Clause, see the CUTLASS LICENSE.txt)
  **************************************************************************************************/
 
+/*
+  Task 86_blackwell_mixed_dtype_gemm: weight-only INT4 GEMM (W4A16) on Blackwell (sm_100a / B200).
+
+  Reference: the CUTLASS 3.x Blackwell mixed-input GEMM (example 86, ScaleOnly mode: A is swapped
+  with B and transposed so that the narrow weights are the MMA "A" operand), with one tile /
+  cluster configuration chosen per problem shape from a sweep on B200.
+
+  Solution under test (KH_TEST_SOLUTION), implemented in solution.h:
+
+    cudaError_t BlackwellMixedDtypeGemm(int M, int N, int K, float alpha,
+                                        __nv_bfloat16 const *A, int lda,
+                                        uint8_t const *B, int ldb,
+                                        __nv_bfloat16 const *B_scales, int scale_ldb,
+                                        float beta, __nv_bfloat16 *D, int ldd);
+
+    A        row-major [M, K] BF16 (lda = K)
+    B        packed INT4 weights, column-major [K, N]: column j occupies K/2 contiguous bytes
+             at B + j * ldb (ldb = K / 2 bytes); element (k, j) is in byte k / 2, low nibble for
+             even k, high nibble for odd k; two's complement, values in [-8, 7]
+    B_scales BF16 group scales, row-major [N, K / 128]: scale of (k, j) at
+             B_scales[j * scale_ldb + k / 128] (scale_ldb = K / 128)
+    D        row-major [M, N] BF16 (ldd = N);    D = alpha * A * (B * scale) + beta * D
+
+  Verification: A and the scales are full-mantissa random BF16, B random nibbles; the reference
+  and the solution write to different buffers pre-filled with NaN (beta != 0: with the same random
+  C); every output element must be finite and within tolerance of the reference. The solution is
+  re-checked after the timing loop.
+*/
+
+#include <cstdio>
+#include <cstring>
+#include <functional>
 #include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
 
 #include "cutlass/cutlass.h"
 
+#ifdef KH_TEST_SOLUTION
+#include <cuda_bf16.h>
+#include "solution.h"   // must stay before kh_verify.h: the solution must not see the helpers
+#endif
+
 #include "cute/tensor.hpp"
-#include "cutlass/tensor_ref.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
-
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/epilogue/dispatch_policy.hpp"
-#include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
-
-#include "cutlass/util/command_line.h"
-#include "cutlass/util/distribution.h"
-#include "cutlass/util/host_tensor.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "cutlass/util/tensor_view_io.h"
-
-#include "cutlass/util/reference/device/gemm.h"
-#include "cutlass/util/reference/device/tensor_fill.h"
-#include "cutlass/util/reference/device/tensor_compare.h"
-
-#include "cutlass/util/mixed_dtype_utils.hpp"
 #include "cutlass/detail/collective/mixed_input_utils.hpp"
 
-#include "helper.h"
-
-#include "mixed_dtype_helper.cuh"
-
-#ifdef KH_TEST_SOLUTION
-#include <cuda_bf16.h>
-#include "solution.h"
-#endif
+#include "kh_verify.h"
+#include "marlin_ref.h"
 
 using namespace cute;
 
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/// GEMM kernel configurations
-/////////////////////////////////////////////////////////////////////////////////////////////////
+#define CUTLASS_CHECK_KH(status)                                                         \
+  {                                                                                      \
+    cutlass::Status error = status;                                                      \
+    if (error != cutlass::Status::kSuccess) {                                            \
+      std::cerr << "Got cutlass error: " << cutlassGetStatusString(error) << " at: "     \
+                << __LINE__ << std::endl;                                                \
+      std::exit(2);                                                                      \
+    }                                                                                    \
+  }
+
 using MmaType = cutlass::bfloat16_t;
 using QuantType = cutlass::int4b_t;
-using AccumulatorType = float;
-
-// A matrix configuration
-using         ElementA    = MmaType;                                                   // Element type for A matrix operand
-using         LayoutA     = cutlass::layout::RowMajor;                                 // Layout type for A matrix operand
-constexpr int AlignmentA  = 128 / cutlass::sizeof_bits<ElementA>::value;               // Memory access granularity/alignment of A matrix in units of elements (up to 16 bytes)
-
-// B matrix configuration
-using         ElementB    = QuantType;                                                 // Element type for B matrix operand
-using         LayoutB     = cutlass::layout::ColumnMajor;                              // Layout type for B matrix operand
-constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;               // Memory access granularity/alignment of B matrix in units of elements (up to 16 bytes)
-
-// This example manually swaps and transposes, so keep transpose of input layouts
+using ElementA = MmaType;
+using LayoutA = cutlass::layout::RowMajor;
+constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+using ElementB = QuantType;
+using LayoutB = cutlass::layout::ColumnMajor;
+constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
 using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
 using LayoutB_Transpose = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
-
-using ElementZero = MmaType;
 using ElementScale = MmaType;
+using ElementC = cutlass::bfloat16_t;
+using LayoutC = cutlass::layout::RowMajor;
+constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+using ElementD = ElementC;
+using LayoutD = LayoutC;
+constexpr int AlignmentD = AlignmentC;
+using ElementAccumulator = float;
+using ArchTag = cutlass::arch::Sm100;
+using OperatorClass = cutlass::arch::OpClassTensorOp;
+using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 
-// C/D matrix configuration
-using         ElementC    = cutlass::bfloat16_t;                                       // Element type for C and D matrix operands
-using         LayoutC     = cutlass::layout::RowMajor;                                 // Layout type for C and D matrix operands
-constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;               // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
+constexpr int kGroup = 128;   // scale granularity along K
+using ScaleConfig = cutlass::detail::Sm100MixedInputBlockwiseScaleConfig<1, kGroup>;
+using LayoutScale = decltype(ScaleConfig::deduce_layout_scale());
 
-// D matrix configuration
-using         ElementD    = cutlass::bfloat16_t;                                       // Element type for C and D matrix operands
-using         LayoutD     = cutlass::layout::RowMajor;
-constexpr int AlignmentD  = 128 / cutlass::sizeof_bits<ElementD>::value;
+/// MmaTile is given in the swapped problem: (weights N tile, tokens M tile, K tile).
+template <class MmaTile, class ClusterShape, bool TwoSm>
+struct GemmCfg {
+  using MainloopSchedule = cute::conditional_t<
+      TwoSm, cutlass::gemm::KernelTmaWarpSpecialized2SmMixedInputSm100,
+      cutlass::gemm::KernelTmaWarpSpecialized1SmMixedInputSm100>;
+  using EpilogueSchedule = cute::conditional_t<TwoSm, cutlass::epilogue::TmaWarpSpecialized2Sm,
+                                               cutlass::epilogue::TmaWarpSpecialized1Sm>;
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, MmaTile, ClusterShape, EpilogueTileType, ElementAccumulator,
+      ElementAccumulator, ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type,
+      AlignmentC, ElementD, typename cutlass::layout::LayoutTranspose<LayoutD>::type, AlignmentD,
+      EpilogueSchedule>::CollectiveOp;
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag, OperatorClass, cute::tuple<ElementB, ElementScale>,
+      cute::tuple<LayoutB_Transpose, LayoutScale>, AlignmentB, ElementA, LayoutA_Transpose,
+      AlignmentA, ElementAccumulator, MmaTile, ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      MainloopSchedule>::CollectiveOp;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>,
+                                                          CollectiveMainloop, CollectiveEpilogue>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+};
 
-// Core kernel configurations
-using ElementAccumulator  = AccumulatorType;                                            // Element type for internal accumulation
-using ElementCompute      = AccumulatorType;                                            // Element type for epilogue computation
-using ArchTag             = cutlass::arch::Sm100;                                       // Tag indicating the minimum SM that supports the intended feature
-using OperatorClass       = cutlass::arch::OpClassTensorOp;                             // Operator class tag
-using MmaTileShape        = Shape<_256,_128,_128>;                                       // (MmaTileShape_N, MmaTileShape_M, MmaTileShape_K) as A and B will be swapped
-using ClusterShape        = Shape<_2,_1,_1>;                                            // Shape of the threadblocks in a cluster
-using MainloopSchedule    = cutlass::gemm::KernelTmaWarpSpecialized2SmMixedInputSm100;  // Kernel to launch based on the default setting in the Collective Builder 
-using EpilogueSchedule    = cutlass::epilogue::TmaWarpSpecialized2Sm;
-using EpilogueTileType    = cutlass::epilogue::collective::EpilogueTileAuto;
+// Reference configurations (selected per shape below; see the KH_SWEEP development target).
+// (weights tile, token tile, K tile), cluster, 2-SM?
+using Cfg0 = GemmCfg<Shape<_256, _128, _128>, Shape<_2, _1, _1>, true>;
+using Cfg1 = GemmCfg<Shape<_256, _64, _128>, Shape<_2, _1, _1>, true>;
+using Cfg2 = GemmCfg<Shape<_128, _128, _128>, Shape<_1, _1, _1>, false>;
+using Cfg3 = GemmCfg<Shape<_128, _64, _128>, Shape<_1, _1, _1>, false>;
+using Cfg4 = GemmCfg<Shape<_128, _32, _128>, Shape<_1, _1, _1>, false>;
+constexpr int kNumCfg = 5;
 
-constexpr int ScaleGranularityN = 1; //Should be less than or equal to GEMM_N
-constexpr int ScaleGranularityK = 128; //Should be less than or equal to GEMM_K
-using ScaleConfig = cutlass::detail::Sm100MixedInputBlockwiseScaleConfig<ScaleGranularityN, ScaleGranularityK>;
-using LayoutScale  = decltype(ScaleConfig::deduce_layout_scale()); // Layout type for SFA matrix operand
-LayoutScale layout_S;
-
-using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    MmaTileShape, ClusterShape,
-    EpilogueTileType,
-    ElementAccumulator, ElementCompute,
-    // Transpose layout of D here since we use explicit swap + transpose
-    // the void type for C tells the builder to allocate 0 smem for the C matrix.
-    // We can enable this if beta == 0 by changing ElementC to void below.
-    ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type, AlignmentC,
-    ElementD, typename cutlass::layout::LayoutTranspose<LayoutD>::type, AlignmentD,
-    EpilogueSchedule // This is the only epi supporting the required swap + transpose.
-  >::CollectiveOp;
-
-// ============================================================ MIXED INPUT NO SCALES ============================================================================
- //The collective will infer that the narrow type should be upcasted to the wide type.
- //We swap A and B operands to the builder here
-using CollectiveMainloopConvertOnly = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    cute::tuple<ElementB>, LayoutB_Transpose, AlignmentB,
-    ElementA, LayoutA_Transpose, AlignmentA,
-    ElementAccumulator,
-    MmaTileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))
-    >,
-    MainloopSchedule
-  >::CollectiveOp;
-
-using GemmKernelConvertOnly = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int,int,int,int>, // Indicates ProblemShape
-    CollectiveMainloopConvertOnly,
-    CollectiveEpilogue
->;
-
-using GemmConvertOnly = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelConvertOnly>;
-
-// =========================================================== MIXED INPUT WITH SCALES ===========================================================================
-// The Scale information must get paired with the operand that will be scaled. In this example, B is scaled so we make a tuple of B's information and the scale information.
-using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    cute::tuple<ElementB, ElementScale>, cute::tuple<LayoutB_Transpose, LayoutScale>, AlignmentB,
-    ElementA, LayoutA_Transpose, AlignmentA,
-    ElementAccumulator,
-    MmaTileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))
-    >,
-    MainloopSchedule
-  >::CollectiveOp;
-
-using GemmKernelScaleOnly = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int,int,int,int>, // Indicates ProblemShape
-    CollectiveMainloopScaleOnly,
-    CollectiveEpilogue
->;
-
-using GemmScaleOnly = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelScaleOnly>;
-
-// =========================================================== MIXED INPUT WITH SCALES AND ZEROS ==================================================================
-// We specify scale + zero elements to indicate that we require both. Scales and biases have the same format.
-using CollectiveMainloopScaleWithZeroPoint = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    cute::tuple<ElementB, ElementScale, ElementZero>, cute::tuple<LayoutB_Transpose, LayoutScale>, AlignmentB,
-    ElementA, LayoutA_Transpose, AlignmentA,
-    ElementAccumulator,
-    MmaTileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))
-    >,
-    MainloopSchedule
-  >::CollectiveOp;
-
-using GemmKernelScaleWithZeroPoint = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int,int,int,int>, // Indicates ProblemShape
-    CollectiveMainloopScaleWithZeroPoint,
-    CollectiveEpilogue
->;
-
-using GemmScaleWithZeroPoint = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelScaleWithZeroPoint>;
-// =================================================================================================================================================================
-
-using StrideA = cutlass::detail::TagToStrideA_t<LayoutA>;
-using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
-
-using StrideC = typename GemmKernelScaleOnly::StrideC;
-using StrideD = typename GemmKernelScaleOnly::StrideD;
-using StrideC_ref = cutlass::detail::TagToStrideC_t<LayoutC>;
-using StrideD_ref = cutlass::detail::TagToStrideC_t<LayoutD>;
-
-//
-// Data members
-//
-
-/// Initialization
-StrideA stride_A;
-StrideB stride_B;
-StrideC stride_C;
-StrideC_ref stride_C_ref;
-StrideD stride_D;
-StrideD_ref stride_D_ref;
-uint64_t seed;
-
-// Scale and Zero share a stride since the layout and shapes must be the same.
-using StrideS = typename cute::Stride<cute::Int<1>, int64_t, int64_t>;
-using StrideS_ref = cutlass::detail::TagToStrideB_t<LayoutScale>;
-StrideS stride_S;
-StrideS_ref stride_S_ref;
-
-cutlass::DeviceAllocation<ElementA> block_A;
-cutlass::DeviceAllocation<ElementB> block_B;
-cutlass::DeviceAllocation<MmaType> block_B_dq;
-cutlass::DeviceAllocation<ElementScale> block_scale;
-cutlass::DeviceAllocation<ElementZero> block_zero;
-cutlass::DeviceAllocation<ElementC> block_C;
-cutlass::DeviceAllocation<typename GemmScaleOnly::EpilogueOutputOp::ElementOutput> block_D;
-cutlass::DeviceAllocation<typename GemmScaleOnly::EpilogueOutputOp::ElementOutput> block_ref_D;
-
-#endif // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/// Testbed utility types
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/// GEMM setup and evaluation
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Initialize operands to be used in the GEMM and reference GEMM
-void initialize(MixedDtypeOptions const& options) {
-
-  auto shape_b = cute::make_shape(options.n, options.k, options.l);
-  stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(options.m, options.k, options.l));
-  stride_B = cutlass::make_cute_packed_stride(StrideB{}, shape_b);
-  // Reverse stride here due to swap and transpose
-  stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(options.n, options.m, options.l));
-  stride_C_ref = cutlass::make_cute_packed_stride(StrideC_ref{}, cute::make_shape(options.m, options.n, options.l));
-  // Reverse stride here due to swap and transpose
-  stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(options.n, options.m, options.l));
-  stride_D_ref = cutlass::make_cute_packed_stride(StrideD_ref{}, cute::make_shape(options.m, options.n, options.l));
-
-  layout_S = ScaleConfig::tile_atom_to_shape_scale(make_shape(options.n, options.k, options.l));
-
-  auto a_coord = cutlass::make_Coord(options.m * options.l, options.k);
-  auto b_coord = cutlass::make_Coord(options.k, options.n * options.l);
-  auto c_coord = cutlass::make_Coord(options.m * options.l, options.n);
-  auto blockscale_b_coord = cutlass::make_Coord(size(filter_zeros(layout_S)));
-
-  block_A.reset(a_coord.product());
-  block_B.reset(b_coord.product());
-  block_B_dq.reset(b_coord.product());
-  block_C.reset(c_coord.product());
-  block_D.reset(c_coord.product());
-  block_ref_D.reset(c_coord.product());
-
-  block_scale.reset(blockscale_b_coord.product());
-  block_zero.reset(blockscale_b_coord.product());
-
-  initialize_tensor(block_A, seed + 2022);
-  initialize_quant_tensor(block_B, seed + 2021);
-  initialize_tensor(block_C, seed + 2020);
-  initialize_scale<QuantType, ElementScale>(block_scale, options);
-  initialize_zero(block_zero, options);
-
-  if(options.verify){
-    auto layout_B = make_layout(shape_b, stride_B);
-    auto scale_stride = layout_S.stride();
-    auto layout_scale_zero = make_layout(
-    make_shape(size<0>(layout_S), size<1,1>(layout_S), size<2>(layout_S)), 
-      make_stride(size<0,1>(scale_stride), size<1,1>(scale_stride), size<2>(scale_stride))
-    ); //layout = (options.n, scale_k, options.l) : (_1, options.n, _0)
-    cudaStream_t stream = cudaStreamDefault;
-    cutlass::dequantize(block_B_dq.get(), block_B.get(), layout_B, block_scale.get(), block_zero.get(), layout_scale_zero, ScaleGranularityK, stream);
+/// Transposes the harness scale layout [N, G] (row-major) into the CUTLASS ScaleOnly layout, in
+/// which the scale of (n, group g) lives at g * N + n.
+__global__ void kh_scale_to_cutlass(__nv_bfloat16 const *src, __nv_bfloat16 *dst, int N, int G) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < size_t(N) * G;
+       i += size_t(gridDim.x) * blockDim.x) {
+    int g = int(i / N), n = int(i % N);
+    dst[i] = src[size_t(n) * G + g];
   }
 }
 
-/// Populates a Gemm::Arguments structure from the given commandline options
-template <class Args, cutlass::detail::ConversionMode KernelConversionMode>
-Args args_from_options(MixedDtypeOptions const& options)
-{
-// Swap the A and B tensors, as well as problem shapes here.
-  if constexpr (KernelConversionMode == cutlass::detail::ConversionMode::DirectConvert) {
-    return Args {
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {options.n, options.m, options.k, options.l},
-      {block_B.get(), stride_B, block_A.get(), stride_A},
-      {{options.alpha, options.beta}, block_C.get(), stride_C, block_D.get(), stride_D}
-    };
-  } 
-  else if constexpr(KernelConversionMode == cutlass::detail::ConversionMode::ConvertAndScale) {
-    return Args {
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {options.n, options.m, options.k, options.l},
-      {block_B.get(), stride_B, block_A.get(), stride_A, block_scale.get(), layout_S},
-      {{options.alpha, options.beta}, block_C.get(), stride_C, block_D.get(), stride_D}
-    };
-  } 
-  else if constexpr(KernelConversionMode == cutlass::detail::ConversionMode::ConvertAndScaleWithZero) {
-    return Args {
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {options.n, options.m, options.k, options.l},
-      {block_B.get(), stride_B, block_A.get(), stride_A, block_scale.get(), layout_S, block_zero.get()},
-      {{options.alpha, options.beta}, block_C.get(), stride_C, block_D.get(), stride_D}
-    };
-  } else {
-    exit(-1);
-  }
-}
+/// One prepared CUTLASS GEMM (arguments, TMA descriptors and workspace are set up in the
+/// constructor, so run() is just the kernel launch).
+struct RefGemm {
+  virtual ~RefGemm() {}
+  virtual void run() = 0;
+};
 
-bool verify(MixedDtypeOptions const& options) {
-  //
-  // Compute reference output
-  //
-  
-  // Reference uses dequantized B matrix as input. Hence we need to change alignment.
-  constexpr int AlignmentBdq = 128 / cutlass::sizeof_bits<MmaType>::value; 
-  
-  using CollectiveMainloopRef = typename cutlass::gemm::collective::CollectiveBuilder<
-      ArchTag, OperatorClass,
-      MmaType, LayoutA, AlignmentA,
-      MmaType, LayoutB, AlignmentBdq,
-      ElementAccumulator,
-      MmaTileShape, ClusterShape,
-      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-      cutlass::gemm::collective::KernelScheduleAuto
-    >::CollectiveOp;
-
-  using CollectiveEpilogueRef = typename cutlass::epilogue::collective::CollectiveBuilder<
-      ArchTag, cutlass::arch::OpClassTensorOp,
-      MmaTileShape, ClusterShape,
-      cutlass::epilogue::collective::EpilogueTileAuto,
-      ElementAccumulator, ElementAccumulator,
-      ElementC, LayoutC, AlignmentC,
-      ElementD, LayoutD, AlignmentD,
-      cutlass::epilogue::collective::EpilogueScheduleAuto
-    >::CollectiveOp;
-
-  using GemmKernelRef = cutlass::gemm::kernel::GemmUniversal<
-      Shape<int,int,int,int>, // Indicates ProblemShape
-      CollectiveMainloopRef,
-      CollectiveEpilogueRef
-  >;
-
-  using GemmRef = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelRef>;
-
-   typename GemmRef::Arguments arguments{
-    cutlass::gemm::GemmUniversalMode::kGemm,
-    {options.m, options.n, options.k, options.l},
-    {block_A.get(), stride_A, block_B_dq.get(), stride_B},
-    {{options.alpha, options.beta}, block_C.get(), stride_C_ref, block_ref_D.get(), stride_D_ref}
-  };
-
-  // Run the gemm where the scaling is performed outside of the kernel.
-  GemmRef gemm_ref;
-  size_t workspace_size = GemmRef::get_workspace_size(arguments);
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-  CUTLASS_CHECK(gemm_ref.can_implement(arguments));
-  CUTLASS_CHECK(gemm_ref.initialize(arguments, workspace.get()));
-  CUTLASS_CHECK(gemm_ref.run());
-
-  // compare_reference
-  ElementD const epsilon(1e-2f);
-  ElementD const non_zero_floor(1e-2f);
-  bool passed = cutlass::reference::device::BlockCompareRelativelyEqual(block_ref_D.get(), block_D.get(), block_D.size(), epsilon, non_zero_floor);
-  return passed;
-}
-
-#ifdef KH_TEST_SOLUTION
-// Kernel to unpack int4b_t (packed 2-per-byte) to int8_t (one per byte)
-__global__ void unpack_int4_to_int8_kernel(const uint8_t* packed, int8_t* unpacked, int count) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < count) {
-    // CUTLASS int4b_t packs two 4-bit values per byte: low nibble = even index, high nibble = odd index
-    int byte_idx = idx / 2;
-    uint8_t byte_val = packed[byte_idx];
-    int8_t val;
-    if (idx % 2 == 0) {
-      val = int8_t(byte_val & 0x0F);
-    } else {
-      val = int8_t((byte_val >> 4) & 0x0F);
-    }
-    // Sign extend from 4-bit
-    if (val & 0x08) val |= 0xF0;
-    unpacked[idx] = val;
-  }
-}
-#endif
-
-/// Execute a given example GEMM computation
-template <typename Gemm>
-int run(MixedDtypeOptions &options)
-{
-  initialize(options);
-
-  // Instantiate CUTLASS kernel depending on templates
+template <class Cfg>
+struct RefGemmImpl : RefGemm {
+  using Gemm = typename Cfg::Gemm;
   Gemm gemm;
-
-  // Create a structure of gemm kernel arguments suitable for invoking an instance of Gemm
-  auto arguments = args_from_options<typename Gemm::Arguments, Gemm::CollectiveMainloop::KernelConversionMode>(options);
-
-  // Using the arguments, query for extra workspace required for matrix multiplication computation
-  size_t workspace_size = Gemm::get_workspace_size(arguments);
-
-  // Allocate workspace memory
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-
-  // Check if the problem size is supported or not
-  CUTLASS_CHECK(gemm.can_implement(arguments));
-
-  // Initialize CUTLASS kernel with arguments and workspace pointer
-  CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
-
-  // Correctness / Warmup iteration
-  CUTLASS_CHECK(gemm.run());
-
-  // Check if output from CUTLASS kernel and reference kernel are equal or not
-  MixedDtypeResult result;
-  if(options.verify){
-    result.passed = verify(options);
-    std::cout << "  Disposition: " << (result.passed ? "Passed" : "Failed") << std::endl;
-  }
-  else{
-    result.passed = true;
-    std::cout << "  Verification: Off " << std::endl;
-  }
-  if (!result.passed) {
-    exit(-1);
-  }
-
-#ifdef KH_TEST_SOLUTION
-  // Run and verify solution
-  {
-    int M = options.m, N = options.n, K = options.k;
-    int k_groups = (K + ScaleGranularityK - 1) / ScaleGranularityK;
-
-    // Unpack int4b_t (packed) to int8_t (one per byte) for the solution
-    int B_elements = K * N * options.l;
-    int8_t *sol_B_unpacked;
-    cudaMalloc(&sol_B_unpacked, B_elements * sizeof(int8_t));
-    int threads = 256;
-    int blocks_unpack = (B_elements + threads - 1) / threads;
-    unpack_int4_to_int8_kernel<<<blocks_unpack, threads>>>(
-      reinterpret_cast<const uint8_t*>(block_B.get()), sol_B_unpacked, B_elements);
-    cudaDeviceSynchronize();
-
-    // Allocate solution output
-    __nv_bfloat16 *sol_D;
-    cudaMalloc(&sol_D, M * N * options.l * sizeof(__nv_bfloat16));
-    cudaMemset(sol_D, 0, M * N * options.l * sizeof(__nv_bfloat16));
-
-    cudaError_t sol_err = BlackwellMixedDtypeGemm(
-      M, N, K, options.alpha,
-      reinterpret_cast<const __nv_bfloat16*>(block_A.get()), K,
-      sol_B_unpacked, K,
-      reinterpret_cast<const __nv_bfloat16*>(block_scale.get()), k_groups,
-      options.beta,
-      sol_D, N);
-
-    if (sol_err != cudaSuccess) {
-      std::cerr << "Solution kernel failed: " << cudaGetErrorString(sol_err) << std::endl;
-      cudaFree(sol_B_unpacked);
-      cudaFree(sol_D);
-      exit(-1);
+  void *workspace = nullptr;
+  RefGemmImpl(int M, int N, int K, float alpha, float beta, void const *Bq, void const *A,
+              void const *scale_cutlass, void const *C, void *D) {
+    using StrideA = cutlass::detail::TagToStrideA_t<LayoutA>;
+    using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
+    using StrideC = typename Gemm::GemmKernel::StrideC;
+    using StrideD = typename Gemm::GemmKernel::StrideD;
+    StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M, K, 1));
+    StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+    // reversed because of the swap + transpose
+    StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(N, M, 1));
+    StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(N, M, 1));
+    auto layout_S = ScaleConfig::tile_atom_to_shape_scale(make_shape(N, K, 1));
+    // Pin down the assumption behind kh_scale_to_cutlass.
+    if (layout_S(make_coord(5 % N, (K / kGroup - 1) * kGroup, 0)) != size_t(K / kGroup - 1) * N + 5 % N) {
+      std::cerr << "unexpected CUTLASS scale layout" << std::endl;
+      std::exit(2);
     }
-    cudaDeviceSynchronize();
-
-    // Compare solution vs CUTLASS reference
-    ElementD const epsilon(1e-2f);
-    ElementD const non_zero_floor(1e-2f);
-    bool sol_passed = cutlass::reference::device::BlockCompareRelativelyEqual(
-      reinterpret_cast<const ElementD*>(sol_D), block_D.get(), block_D.size(), epsilon, non_zero_floor);
-
-    if (!sol_passed) {
-      std::cerr << "Solution verification failed." << std::endl;
-      cudaFree(sol_B_unpacked);
-      cudaFree(sol_D);
-      exit(-1);
-    }
-
-    cudaFree(sol_B_unpacked);
-    cudaFree(sol_D);
+    typename Gemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {N, M, K, 1},
+        {reinterpret_cast<ElementB const *>(Bq), stride_B,
+         reinterpret_cast<ElementA const *>(A), stride_A,
+         reinterpret_cast<ElementScale const *>(scale_cutlass), layout_S},
+        {{alpha, beta}, reinterpret_cast<ElementC const *>(C), stride_C,
+         reinterpret_cast<ElementD *>(D), stride_D}};
+    size_t ws = Gemm::get_workspace_size(args);
+    if (ws) KH_CHECK(cudaMalloc(&workspace, ws));
+    CUTLASS_CHECK_KH(gemm.can_implement(args));
+    CUTLASS_CHECK_KH(gemm.initialize(args, workspace));
   }
-#endif
+  ~RefGemmImpl() override { cudaFree(workspace); }
+  void run() override { CUTLASS_CHECK_KH(gemm.run()); }
+};
 
-  // Profiling
-  if (options.iterations > 0) {
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+/// vLLM Marlin as the reference for small-batch decode (see marlin_ref.h); kMarlinCfg selects it.
+constexpr int kMarlinCfg = 100;
+struct MarlinRefWrap : RefGemm {
+  MarlinRef m;
+  MarlinRefWrap(int M, int N, int K, void const *Bq, void const *A, void const *S, void *D)
+      : m(reinterpret_cast<uint8_t const *>(Bq), reinterpret_cast<__nv_bfloat16 const *>(S),
+          reinterpret_cast<__nv_bfloat16 const *>(A), reinterpret_cast<__nv_bfloat16 *>(D), M, N, K) {}
+  void run() override { m.run(); }
+};
 
-    // Warmup reference
-    for (int i = 0; i < 3; i++) {
-      CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
-      CUTLASS_CHECK(gemm.run());
-    }
-    cudaDeviceSynchronize();
-
-    // Profile reference
-    float ref_total_ms = 0, ref_min_ms = 1e30f;
-    for (int iter = 0; iter < options.iterations; ++iter) {
-      cudaEventRecord(start);
-      CUTLASS_CHECK(gemm.run());
-      cudaEventRecord(stop);
-      cudaEventSynchronize(stop);
-      float ms;
-      cudaEventElapsedTime(&ms, start, stop);
-      ref_total_ms += ms;
-      if (ms < ref_min_ms) ref_min_ms = ms;
-    }
-    fprintf(stdout, "Ref time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
-            ref_total_ms / options.iterations, options.iterations, ref_min_ms);
-
-#ifdef KH_TEST_SOLUTION
-    {
-      int M = options.m, N = options.n, K = options.k;
-      int k_groups = (K + ScaleGranularityK - 1) / ScaleGranularityK;
-
-      // Unpack B for solution profiling
-      int B_elements = K * N * options.l;
-      int8_t *sol_B_unpacked;
-      cudaMalloc(&sol_B_unpacked, B_elements * sizeof(int8_t));
-      int threads = 256;
-      int blocks_unpack = (B_elements + threads - 1) / threads;
-      unpack_int4_to_int8_kernel<<<blocks_unpack, threads>>>(
-        reinterpret_cast<const uint8_t*>(block_B.get()), sol_B_unpacked, B_elements);
-      cudaDeviceSynchronize();
-
-      __nv_bfloat16 *sol_D;
-      cudaMalloc(&sol_D, M * N * options.l * sizeof(__nv_bfloat16));
-
-      // Warmup solution
-      for (int i = 0; i < 3; i++) {
-        BlackwellMixedDtypeGemm(M, N, K, options.alpha,
-          reinterpret_cast<const __nv_bfloat16*>(block_A.get()), K,
-          sol_B_unpacked, K,
-          reinterpret_cast<const __nv_bfloat16*>(block_scale.get()), k_groups,
-          options.beta, sol_D, N);
-      }
-      cudaDeviceSynchronize();
-
-      // Profile solution
-      float sol_total_ms = 0, sol_min_ms = 1e30f;
-      for (int iter = 0; iter < options.iterations; ++iter) {
-        cudaEventRecord(start);
-        BlackwellMixedDtypeGemm(M, N, K, options.alpha,
-          reinterpret_cast<const __nv_bfloat16*>(block_A.get()), K,
-          sol_B_unpacked, K,
-          reinterpret_cast<const __nv_bfloat16*>(block_scale.get()), k_groups,
-          options.beta, sol_D, N);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        float ms;
-        cudaEventElapsedTime(&ms, start, stop);
-        sol_total_ms += ms;
-        if (ms < sol_min_ms) sol_min_ms = ms;
-      }
-      fprintf(stdout, "Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
-              sol_total_ms / options.iterations, options.iterations, sol_min_ms);
-      fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
-
-      cudaFree(sol_B_unpacked);
-      cudaFree(sol_D);
-    }
-#endif
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+static std::unique_ptr<RefGemm> make_ref(int cfg, int M, int N, int K, float alpha, float beta,
+                                         void const *Bq, void const *A, void const *S_harness,
+                                         void const *S_cutlass, void const *C, void *D) {
+  if (cfg == kMarlinCfg) return std::make_unique<MarlinRefWrap>(M, N, K, Bq, A, S_harness, D);
+#define KH_CASE(i) case i: return std::make_unique<RefGemmImpl<Cfg##i>>(M, N, K, alpha, beta, Bq, A, S_cutlass, C, D)
+  switch (cfg) {
+    KH_CASE(0); KH_CASE(1); KH_CASE(2); KH_CASE(3); KH_CASE(4);
+    default: std::cerr << "bad config" << std::endl; std::exit(2);
   }
-
-  return 0;
+#undef KH_CASE
 }
 
-#endif // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+// Tolerances (measured; D = BF16, rel. Frobenius error vs the reference, all sizes below). Both the
+// CUTLASS and the Marlin kernel dequantize int4 * scale to BF16 before the MMA, so an exact FP32
+// dequantization (the shipped baseline) differs from them by 2.4e-3 (max|err|/rms <= 3.8e-2), while a
+// solution that also rounds the dequantized weight to BF16 matches to 6e-5 .. 3.7e-4 (Marlin shapes
+// 6e-5 .. 1.9e-4). Both are correct. Bounds:
+// Frobenius 7.5e-3 (3.1x the exact-dequant error), elements 6e-2*RMS + 1.6e-2*|ref| (2x /
+// two BF16 ulps). Bad variants (all FAIL on every shape): FP16 accumulation 1.3e-2 .. 2.4e-2 (6.9e-3
+// at K = 2048), BF16 accumulation 5e-2 .. 1.8e-1, FP8 E4M3 activations 2.4e-2, FP8 scales 2.5e-2,
+// FP4 activations 2.5e-1, skipped K group / ignored scales / wrong scale layout / swapped or
+// unsigned nibbles (O(1)), half the outputs unwritten (NaN), ignoring alpha / beta.
+static KhTol kTol(6.0e-2, 7.5e-3, 1.6e-2);
 
-///////////////////////////////////////////////////////////////////////////////////////////////////
+struct Shape3 { const char *label; int M, N, K, cfg; };
 
-int main(int argc, char const **args) {
+/// Fills n bytes with random bytes (every byte = two uniformly random int4 values).
+__global__ void kh_fill_bytes(uint8_t *p, size_t n, unsigned int seed) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    p[i] = uint8_t(kh_hash64(i, seed) >> 40);
+}
 
-  // CUTLASS must be compiled with CUDA 12.8 Toolkit to run this example
-  // and must have compute capability at least 100a.
-  bool is_correct_cuda_version = (__CUDACC_VER_MAJOR__ >= 12) && (__CUDACC_VER_MINOR__ >= 8);
-  if (!is_correct_cuda_version) {
-    std::cerr << "Version is " << __CUDACC_VER_MINOR__ << "\n";
-    std::cerr << "This example requires CUDA 12.8 or newer.\n";
-    // Returning zero so this test passes on older Toolkits. Its actions are no-op.
-    return 0;
+__global__ void kh_fill_scales(__nv_bfloat16 *p, size_t n, unsigned int seed) {
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    p[i] = __float2bfloat16_rn(kh_uniform_pos(i, seed, 0.004f, 0.06f));
+}
+
+/// Returns false on failure. `timed` = also print Ref / Kernel timings.
+static bool run_case(Shape3 const &s, float alpha, float beta, bool timed, int trials) {
+  int M = s.M, N = s.N, K = s.K, G = K / kGroup;
+  size_t nA = size_t(M) * K, nB = size_t(K) * N / 2, nS = size_t(N) * G, nC = size_t(M) * N;
+  __nv_bfloat16 *A, *S, *S_cut, *C_in = nullptr, *D_ref;
+  uint8_t *B;
+  KH_CHECK(cudaMalloc(&A, nA * 2));
+  KH_CHECK(cudaMalloc(&B, nB));
+  KH_CHECK(cudaMalloc(&S, nS * 2));
+  KH_CHECK(cudaMalloc(&S_cut, nS * 2));
+  KH_CHECK(cudaMalloc(&D_ref, nC * 2));
+  kh_fill_uniform(A, nA, 11u);
+  kh_fill_bytes<<<4096, 256>>>(B, nB, 22u);
+  kh_fill_scales<<<1024, 256>>>(S, nS, 44u);
+  kh_scale_to_cutlass<<<1024, 256>>>(S, S_cut, N, G);
+  KH_CHECK(cudaGetLastError());
+  if (beta != 0.f) {
+    KH_CHECK(cudaMalloc(&C_in, nC * 2));
+    kh_fill_uniform(C_in, nC, 33u);
+  }
+  kh_poison(D_ref, nC * 2);
+  KH_CHECK(cudaDeviceSynchronize());
+
+  auto ref = make_ref(s.cfg, M, N, K, alpha, beta, B, A, S, S_cut, C_in, D_ref);
+  ref->run();
+  KH_CHECK(cudaDeviceSynchronize());
+
+  bool ok = true;
+  {
+    KhResult r = kh_compare(D_ref, D_ref, nC, kTol);
+    if (!r.pass) {
+      std::cerr << "Reference output incomplete or non-finite (non-finite = " << r.nonfinite
+                << ")" << std::endl;
+      ok = false;
+    }
   }
 
+#ifdef KH_TEST_SOLUTION
+  __nv_bfloat16 *D_sol = nullptr;
+  KH_CHECK(cudaMalloc(&D_sol, nC * 2));
+  auto reset_sol = [&] {
+    if (beta != 0.f) KH_CHECK(cudaMemcpy(D_sol, C_in, nC * 2, cudaMemcpyDeviceToDevice));
+    else kh_poison(D_sol, nC * 2);
+  };
+  auto call_sol = [&] {
+    cudaError_t e = BlackwellMixedDtypeGemm(M, N, K, alpha, A, K, B, K / 2, S, G, beta, D_sol, N);
+    if (e != cudaSuccess) {
+      std::cerr << "Solution kernel failed: " << cudaGetErrorString(e) << std::endl;
+      std::exit(1);
+    }
+  };
+  if (ok) {
+    reset_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    call_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    KhResult r = kh_compare(D_sol, D_ref, nC, kTol);
+    kh_print_result("solution", r, kTol);
+    ok = r.pass;
+  }
+#endif
+
+  // The activations are refreshed (new random values, outside the timed region) before every call
+  // of both the reference and the solution, so a result cannot be memoized across calls; the weights
+  // and scales stay fixed (a solution may repack them once, see the description).
+  unsigned seed = 1000u;
+  auto refresh_A = [&] { kh_fill_uniform(A, nA, seed++); };
+
+  if (ok && timed && trials > 0) {
+    KhTime tr = kh_time([&] { ref->run(); }, trials,
+                        [&] { kh_poison(D_ref, nC * 2); refresh_A(); });
+    kh_print_time("Ref", tr);
+#ifdef KH_TEST_SOLUTION
+    KhTime ts = kh_time(call_sol, trials, [&] { reset_sol(); refresh_A(); });
+    kh_print_time("Kernel", ts);
+    kh_print_speedup(tr, ts);
+#endif
+  }
+
+#ifdef KH_TEST_SOLUTION
+  // Re-check with yet another fresh A (runs for every case, also when timing is off): the solution
+  // must still produce the right answer from scratch, so a memoized result fails here.
+  if (ok) {
+    refresh_A();
+    kh_poison(D_ref, nC * 2);
+    ref->run();
+    KH_CHECK(cudaDeviceSynchronize());
+    reset_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    call_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    KhResult r = kh_compare(D_sol, D_ref, nC, kTol);
+    kh_print_result("solution (re-check, fresh A)", r, kTol);
+    ok = r.pass;
+  }
+#endif
+
+#ifdef KH_TEST_SOLUTION
+  cudaFree(D_sol);
+#endif
+  cudaFree(A); cudaFree(B); cudaFree(S); cudaFree(S_cut); cudaFree(D_ref);
+  if (C_in) cudaFree(C_in);
+  return ok;
+}
+
+#endif  // CUTLASS_ARCH_MMA_SM100_SUPPORTED
+
+int main(int argc, char const **argv) {
+  // Never exit 0 without having run the tests: a skipped run must not look like a pass.
+#if !defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  std::cerr << "CUTLASS SM100 support not compiled in (build with -arch sm_100a)." << std::endl;
+  return 1;
+#else
   cudaDeviceProp props;
-  int current_device_id;
-  CUDA_CHECK(cudaGetDevice(&current_device_id));
-  CUDA_CHECK(cudaGetDeviceProperties(&props, current_device_id));
-  cudaError_t error = cudaGetDeviceProperties(&props, 0);
+  KH_CHECK(cudaGetDeviceProperties(&props, 0));
   if (props.major != 10 || props.minor != 0) {
-    std::cerr
-      << "This example requires a GPU of NVIDIA's Blackwell Architecture or "
-      << "later (compute capability 100a or greater).\n";
-    return 0;
+    std::cerr << "This task requires a Blackwell sm_100 GPU (B200)." << std::endl;
+    return 1;
   }
+  int trials = kh_trials();
+  bool const keep_going = std::getenv("KH_KEEP_GOING") != nullptr;   // development aid
+  bool failed = false;
 
-  //
-  // Parse options
-  //
-
-  MixedDtypeOptions options;
-
-  options.parse(argc, args);
-
-  if (options.help) {
-    options.print_usage(std::cout) << std::endl;
-    return 0;
-  }
-
-  //
-  // Evaluate CUTLASS kernels
-  //
-
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-
-  struct TestConfig {
-    const char* label;
-    int m, n, k;
+  // Llama-3-70B weight-only INT4 (W4A16) linear layers on one B200 (hidden 8192, fused QKV
+  // 10240, FFN 28672 -> fused gate+up 57344); M = tokens: decode batches of 1..128 sequences
+  // (weight-bandwidth bound) and one 8K-token prefill chunk.
+  std::vector<Shape3> shapes = {
+      {"decode_m1_mlp_up",      1, 57344,  8192, kMarlinCfg},
+      {"decode_m16_qkv",       16, 10240,  8192, kMarlinCfg},
+      {"decode_m64_mlp_down",  64,  8192, 28672, kMarlinCfg},
+      {"decode_m128_o_proj",  128,  8192,  8192, 2},
+      {"decode_m128_mlp_up",  128, 57344,  8192, 2},
+      {"prefill_qkv",        8192, 10240,  8192, 0},
   };
 
-  bool explicit_size = (options.m != 5120 || options.n != 4096 || options.k != 4096);
-
-  std::vector<TestConfig> configs;
-
-  if (explicit_size) {
-    configs.push_back({"custom", options.m, options.n, options.k});
-  } else {
-    configs = {
-      {"small",   1024, 1024, 1024},
-      {"medium",  4096, 4096, 4096},
-      {"large",   8192, 8192, 8192},
-    };
+#ifdef KH_SWEEP
+  // Development aid: time every reference configuration on every shape.
+  for (auto s : shapes) {
+    for (int cfg = 0; cfg < kNumCfg; ++cfg) {
+      s.cfg = cfg;
+      std::printf("\n=== %s cfg=%d: M=%d, N=%d, K=%d ===\n", s.label, cfg, s.M, s.N, s.K);
+      run_case(s, 1.f, 0.f, true, 10);
+    }
+    if (s.M <= 128 && marlin_ref_supported(s.M, s.N, s.K)) {
+      s.cfg = kMarlinCfg;
+      std::printf("\n=== %s cfg=marlin: M=%d, N=%d, K=%d ===\n", s.label, s.M, s.N, s.K);
+      run_case(s, 1.f, 0.f, true, 10);
+    }
   }
-
-  // Force ScaleOnly mode and enable verification
-  options.mode = MixedDtypeGemmMode::ScaleOnly;
-  options.verify = true;
-  options.iterations = 20;
-
-  for (const auto& cfg : configs) {
-    fprintf(stdout, "\n=== %s: M=%d, N=%d, K=%d ===\n", cfg.label, cfg.m, cfg.n, cfg.k);
-
-    options.m = cfg.m;
-    options.n = cfg.n;
-    options.k = cfg.k;
-
-    run<GemmScaleOnly>(options);
-
-    std::cout << "Passed" << std::endl;
-  }
-
+  return 0;
 #endif
 
-  return 0;
-}
+  if (argc >= 4) {   // ./test M N K : single custom shape
+    Shape3 s{"custom", atoi(argv[1]), atoi(argv[2]), atoi(argv[3]), (atoi(argv[1]) <= 64 && marlin_ref_supported(atoi(argv[1]), atoi(argv[2]), atoi(argv[3]))) ? kMarlinCfg : (atoi(argv[1]) <= 64 ? 3 : (atoi(argv[1]) <= 128 ? 2 : 0))};
+    std::printf("\n=== custom: M=%d, N=%d, K=%d ===\n", s.M, s.N, s.K);
+    if (!run_case(s, 1.f, 0.f, true, trials)) { std::cout << "Incorrect" << std::endl; return 1; }
+    std::cout << "Passed" << std::endl;
+    return 0;
+  }
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
+  // alpha / beta handling (correctness only): D = 0.75 * A*dequant(B) + 0.5 * C
+  {
+    Shape3 s{"alpha_beta", 48, 1280, 8192, 3};
+    std::printf("\n--- %s: M=%d, N=%d, K=%d (alpha=0.75, beta=0.5, correctness only) ---\n",
+                s.label, s.M, s.N, s.K);
+    if (!run_case(s, 0.75f, 0.5f, false, 0)) { std::cout << "Incorrect" << std::endl; if (!keep_going) return 1; failed = true; }
+    else std::cout << "Passed" << std::endl;
+  }
+
+  for (auto const &s : shapes) {
+    std::printf("\n=== %s: M=%d, N=%d, K=%d ===\n", s.label, s.M, s.N, s.K);
+    if (!run_case(s, 1.f, 0.f, true, trials)) { std::cout << "Incorrect" << std::endl; if (!keep_going) return 1; failed = true; }
+    else std::cout << "Passed" << std::endl;
+  }
+  return failed ? 1 : 0;
+#endif
+}

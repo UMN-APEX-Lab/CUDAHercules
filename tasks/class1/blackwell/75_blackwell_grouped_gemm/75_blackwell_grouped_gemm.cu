@@ -2,76 +2,60 @@
  * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- * list of conditions and the following disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
+ * Redistribution and use in source and binary forms, with or without modification, are permitted
+ * provided that the following conditions are met: (BSD-3-Clause, see the CUTLASS LICENSE.txt)
  **************************************************************************************************/
 
+/*
+  Task 75_blackwell_grouped_gemm: pointer-array grouped GEMM, BF16 in / BF16 out, on Blackwell
+  (sm_100a / B200).
 
+  Workload: the expert GEMMs of a Qwen3-30B-A3B MoE layer (128 experts, top-8 routing, hidden 2048,
+  expert intermediate 768) with the token-to-expert assignment produced by a skewed router. Group
+  sizes are therefore uneven (a few hot experts, many small ones, some empty).
 
-/*! \file
-    \brief Grouped GEMM example using CUTLASS 3 APIs for the NVIDIA Blackwell SM100 architecture.
+  Reference: the CUTLASS 3.x Blackwell pointer-array grouped GEMM (example 75, all group scheduling
+  on the device), with one tile / cluster configuration chosen per scenario from a sweep on B200.
 
-    This example demonstrates an implementation of Grouped GEMM using a TMA + Blackwell SM100 TensorOp-based warp-specialized kernel.
-    For this example all scheduling work is performed on the device.
-    The new feature showcased in this example is device-side modification of TMA descriptors
-    to move between groups/problem_count (represented by groups).
-    https://docs.nvidia.com/cuda/cuda-c-programming-guide/#encoding-a-tensor-map-on-device
+  Solution under test (KH_TEST_SOLUTION), implemented in solution.h:
 
-    To run this example:
+    cudaError_t BlackwellGroupedGemm(int num_groups,
+        int const *Ms, int const *Ns, int const *Ks,                  // device arrays [num_groups]
+        __nv_bfloat16 const *const *A_ptrs, int const *ldas,          // device arrays
+        __nv_bfloat16 const *const *B_ptrs, int const *ldbs,
+        __nv_bfloat16 *const *D_ptrs, int const *ldds);
 
-      $ ./examples/75_blackwell_grouped_gemm/75_blackwell_grouped_gemm --m=2048 --n=2048 --k=2048 --groups=10
+    group g:  D_g[M,N] = A_g[M,K] * B_g[K,N]      (FP32 accumulation, BF16 output)
+      A_g row-major  (element (i,k) at A_g[i*lda + k],  lda = K)
+      B_g column-major (element (k,j) at B_g[k + j*ldb], ldb = K)   (an [N,K] weight matrix)
+      D_g row-major  (element (i,j) at D_g[i*ldd + j],  ldd = N)
+    M may be 0 (empty group), is otherwise arbitrary; N and K are multiples of 64 and may differ
+    from group to group.
 
-      The above example command makes all 10 groups to be sized at the given m, n, k sizes.
-      Skipping any of the problem dimensions randomizes it across the different groups.
-      Same applies for alpha and beta values that are randomized across the different groups.
-
-    To run this example for a set of problems using the benchmark option:
-
-      $ ./examples/75_blackwell_grouped_gemm/75_blackwell_grouped_gemm --benchmark=./test_benchmark.txt
-
-      Where the test_benchmark.txt may look as such:
-        0 256x512x128
-        1 256x512x512
-        2 512x256x128
-        3 256x256x128
-        4 256x512x1024
-        5 1024x512x128 and so on
+  Verification: inputs are full-mantissa random BF16; the reference and the solution write to
+  different buffers that are pre-filled with NaN; every output element must be finite and within
+  tolerance of the reference. The solution is re-checked after the timing loop.
 */
 
+#include <cstdio>
+#include <cstring>
+#include <algorithm>
+#include <cmath>
+#include <functional>
 #include <iostream>
-#include <fstream>
-#include <sstream>
+#include <memory>
+#include <numeric>
+#include <string>
 #include <vector>
-#include <float.h>
 
 #include "cutlass/cutlass.h"
 
+#ifdef KH_TEST_SOLUTION
+#include <cuda_bf16.h>
+#include "solution.h"   // must stay before kh_verify.h: the solution must not see the helpers
+#endif
+
 #include "cute/tensor.hpp"
-#include "cutlass/tensor_ref.h"
-#include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/thread/linear_combination.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
@@ -79,939 +63,490 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
-
-#include "cutlass/util/command_line.h"
-#include "cutlass/util/distribution.h"
-#include "cutlass/util/host_tensor.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "cutlass/util/tensor_view_io.h"
-#include "cutlass/util/reference/device/gemm.h"
-#include "cutlass/util/reference/device/tensor_compare.h"
-#include "cutlass/util/reference/device/tensor_fill.h"
 
-#include "helper.h"
-
-#ifdef KH_TEST_SOLUTION
-#include <cuda_fp8.h>
-#include "solution.h"
-#endif
+#include "kh_verify.h"
 
 using namespace cute;
 
-using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>; // <M,N,K> per group
-using ElementA = cutlass::float_e4m3_t;                                    // Element type for A matrix operand
-using ElementB = cutlass::float_e4m3_t;                                    // Element type for B matrix operand
-using ElementC = cutlass::half_t;                                          // Element type for C and D matrix operands
-
 #if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/// GEMM kernel configurations
-/////////////////////////////////////////////////////////////////////////////////////////////////
-// A matrix configuration
-using         LayoutA     = cutlass::layout::RowMajor;                      // Layout type for A matrix operand
-constexpr int AlignmentA  = 128 / cutlass::sizeof_bits<ElementA>::value;    // Alignment of A matrix in units of elements (up to 16 bytes)
 
-// B matrix configuration
-using         LayoutB     = cutlass::layout::ColumnMajor;                   // Layout type for B matrix operand
-constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;    // Alignment of B matrix in units of elements (up to 16 bytes)
+#define CUTLASS_CHECK_KH(status)                                                         \
+  {                                                                                      \
+    cutlass::Status error = status;                                                      \
+    if (error != cutlass::Status::kSuccess) {                                            \
+      std::cerr << "Got cutlass error: " << cutlassGetStatusString(error) << " at: "     \
+                << __LINE__ << std::endl;                                                \
+      std::exit(2);                                                                      \
+    }                                                                                    \
+  }
 
-// C/D matrix configuration
-using         LayoutC     = cutlass::layout::ColumnMajor;                   // Layout type for C and D matrix operands
-constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Alignment of C matrix in units of elements (up to 16 bytes)
+using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;  // <M,N,K> per group
+using ElementA = cutlass::bfloat16_t;
+using LayoutA = cutlass::layout::RowMajor;
+constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+using ElementB = cutlass::bfloat16_t;
+using LayoutB = cutlass::layout::ColumnMajor;
+constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+using ElementD = cutlass::bfloat16_t;
+constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+using ElementAccumulator = float;
+using ArchTag = cutlass::arch::Sm100;
+using OperatorClass = cutlass::arch::OpClassTensorOp;
+using ClusterShape = Shape<int32_t, int32_t, _1>;   // runtime (preferred / fallback) cluster
 
-// Core kernel configurations
-using ElementAccumulator  = float;                                          // Element type for internal accumulation
-using ArchTag             = cutlass::arch::Sm100;                           // Tag indicating the minimum SM that supports the intended feature
-using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
-using StageCountType = cutlass::gemm::collective::StageCountAuto;           // Stage count maximized based on the tile size
-
-// Runtime Cluster Shape
-using ClusterShape = Shape<int32_t,int32_t,_1>;
-
-// Different configs for 1SM and 2SM MMA kernel
-struct MMA1SMConfig {
-  using MmaTileShape     = Shape<_128,_256,Int<128 / sizeof(ElementA)>>;
-  using KernelSchedule   = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmSm100;   // Kernel to launch
-  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;          // Epilogue to launch
+struct Sm1 {
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmSm100;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
+};
+struct Sm2 {
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;
 };
 
-struct MMA2SMConfig {
-  using MmaTileShape     = Shape<_256,_256,Int<128 / sizeof(ElementA)>>;
-  using KernelSchedule   = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100;   // Kernel to launch
-  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;          // Epilogue to launch
-};
-
-template <typename ScheduleConfig>
-struct GivenGemmSchedule {
+// Swap == false: M-dim of the MMA = tokens (A = activations, B = weights, D row-major).
+// Swap == true : "swap-AB": M-dim of the MMA = output features (A = weights, B = activations,
+//                D column-major [N, M]), which is the same memory as the row-major [M, N] output;
+//                the small / ragged token dimension then maps to the flexible MMA N tile.
+template <class MmaTile, class SmCfg, bool Swap_ = false>
+struct GroupedCfg {
+  static constexpr bool Swap = Swap_;
+  using LayoutD = std::conditional_t<Swap_, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-    typename ScheduleConfig::MmaTileShape, ClusterShape,
-    cutlass::epilogue::collective::EpilogueTileAuto,
-    ElementAccumulator, ElementAccumulator,
-    ElementC, LayoutC *, AlignmentC,
-    ElementC, LayoutC *, AlignmentC,
-    typename ScheduleConfig::EpilogueSchedule,
-    cutlass::epilogue::fusion::LinearCombination<ElementC, ElementAccumulator>
-  >::CollectiveOp;
-
+      ArchTag, OperatorClass, MmaTile, ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
+      void, LayoutD *, AlignmentD,   // no C operand: D = A * B
+      ElementD, LayoutD *, AlignmentD, typename SmCfg::EpilogueSchedule>::CollectiveOp;
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    ArchTag, OperatorClass,
-      ElementA, LayoutA *, AlignmentA,
-      ElementB, LayoutB *, AlignmentB,
-    ElementAccumulator,
-    typename ScheduleConfig::MmaTileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    typename ScheduleConfig::KernelSchedule
-  >::CollectiveOp;
-
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-      ProblemShape,
-      CollectiveMainloop,
-      CollectiveEpilogue
-  >;
-
+      ArchTag, OperatorClass, ElementA, LayoutA *, AlignmentA, ElementB, LayoutB *, AlignmentB,
+      ElementAccumulator, MmaTile, ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      typename SmCfg::KernelSchedule>::CollectiveOp;
+  using GemmKernel =
+      cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
 
-using GemmKernel1SM = GivenGemmSchedule<MMA1SMConfig>::GemmKernel;
-using Gemm1SM = GivenGemmSchedule<MMA1SMConfig>::Gemm;
-using Gemm = Gemm1SM;
+// Reference configurations (selected per scenario below, see the KH_SWEEP build).
+using Cfg0 = GroupedCfg<Shape<_256, _256, _64>, Sm2>;
+using Cfg1 = GroupedCfg<Shape<_256, _128, _64>, Sm2>;
+using Cfg2 = GroupedCfg<Shape<_128, _256, _64>, Sm1>;
+using Cfg3 = GroupedCfg<Shape<_128, _128, _64>, Sm1>;
+using Cfg4 = GroupedCfg<Shape<_128, _64, _64>, Sm1>;
+// swap-AB variants (MMA M = output features, MMA N = tokens)
+using Cfg5 = GroupedCfg<Shape<_256, _128, _64>, Sm2, true>;
+using Cfg6 = GroupedCfg<Shape<_256, _64, _64>, Sm2, true>;
+using Cfg7 = GroupedCfg<Shape<_128, _128, _64>, Sm1, true>;
+using Cfg8 = GroupedCfg<Shape<_128, _64, _64>, Sm1, true>;
+using Cfg9 = GroupedCfg<Shape<_128, _32, _64>, Sm1, true>;
+constexpr int kNumCfg = 10;
+constexpr int kNumCluster = 5;
+// preferred cluster x,y / fallback x,y
+static const int kClusters[kNumCluster][4] = {{2, 1, 2, 1}, {4, 1, 2, 1}, {4, 2, 2, 1},
+                                              {1, 1, 1, 1}, {2, 2, 2, 1}};
 
-using GemmKernel2SM = GivenGemmSchedule<MMA2SMConfig>::GemmKernel;
-using Gemm2SM = GivenGemmSchedule<MMA2SMConfig>::Gemm;
-
-// Reference device GEMM implementation type
-using DeviceGemmReference = cutlass::reference::device::Gemm<
-  ElementA,
-  LayoutA,
-  ElementB,
-  LayoutB,
-  ElementC,
-  LayoutC,
-  ElementAccumulator,
-  ElementAccumulator>;
-
-using StrideA = typename Gemm::GemmKernel::InternalStrideA;
-using StrideB = typename Gemm::GemmKernel::InternalStrideB;
-using StrideC = typename Gemm::GemmKernel::InternalStrideC;
-using StrideD = typename Gemm::GemmKernel::InternalStrideD;
-
-// Host-side allocations
-std::vector<int64_t> offset_A;
-std::vector<int64_t> offset_B;
-std::vector<int64_t> offset_C;
-std::vector<int64_t> offset_D;
-
-std::vector<StrideA> stride_A_host;
-std::vector<StrideB> stride_B_host;
-std::vector<StrideC> stride_C_host;
-std::vector<StrideD> stride_D_host;
-
-std::vector<ElementAccumulator> alpha_host;
-std::vector<ElementAccumulator> beta_host;
-
-// Device-side allocations
-cutlass::DeviceAllocation<typename ProblemShape::UnderlyingProblemShape> problem_sizes;
-
-cutlass::DeviceAllocation<typename Gemm::ElementA> block_A;
-cutlass::DeviceAllocation<typename Gemm::ElementB> block_B;
-cutlass::DeviceAllocation<typename Gemm::ElementC> block_C;
-cutlass::DeviceAllocation<typename Gemm::EpilogueOutputOp::ElementOutput> block_D;
-cutlass::DeviceAllocation<typename Gemm::EpilogueOutputOp::ElementOutput> block_ref_D;
-
-cutlass::DeviceAllocation<const typename Gemm::ElementA *> ptr_A;
-cutlass::DeviceAllocation<const typename Gemm::ElementB *> ptr_B;
-cutlass::DeviceAllocation<const typename Gemm::ElementC *> ptr_C;
-cutlass::DeviceAllocation<typename Gemm::EpilogueOutputOp::ElementOutput *> ptr_D;
-cutlass::DeviceAllocation<typename Gemm::EpilogueOutputOp::ElementOutput *> ptr_ref_D;
-
-cutlass::DeviceAllocation<StrideA> stride_A;
-cutlass::DeviceAllocation<StrideB> stride_B;
-cutlass::DeviceAllocation<StrideC> stride_C;
-cutlass::DeviceAllocation<StrideD> stride_D;
-
-// Note, this is an array of pointers to alpha and beta scaling values per group
-cutlass::DeviceAllocation<ElementAccumulator*> alpha_device;
-cutlass::DeviceAllocation<ElementAccumulator*> beta_device;
-cutlass::DeviceAllocation<ElementAccumulator> block_alpha;
-cutlass::DeviceAllocation<ElementAccumulator> block_beta;
-
-#endif // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/// Testbed utility types
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-using RasterOrderOptions = cutlass::gemm::kernel::detail::RasterOrderOptions;
-// Command line options parsing
-struct Options {
-
-  bool help = false;
-  bool use_pdl = false;
-
-  float alpha = FLT_MAX;
-  float beta  = FLT_MAX;
-  int iterations = 10;
-  int m = 1024, n = 2048, k = 512, groups = 10;
-  dim3 cluster_shape = dim3(4,2,1);
-  dim3 cluster_shape_fallback = dim3(2,1,1);
-  RasterOrderOptions raster_order = RasterOrderOptions::AlongM;
-  char raster_char = 'M';
-  int swizzle = 1;
-  int max_sm_count = INT_MAX;
-  std::string benchmark_path;
-  std::vector<typename ProblemShape::UnderlyingProblemShape> problem_sizes_host;
-  int const tma_alignment_bits = 128;
-  int const alignment = tma_alignment_bits / cutlass::sizeof_bits<ElementA>::value;
-
-  // Parses the command line
-  void parse(int argc, char const **args) {
-    cutlass::CommandLine cmd(argc, args);
-
-    if (cmd.check_cmd_line_flag("help")) {
-      help = true;
-      return;
-    }
-    if (cmd.check_cmd_line_flag("use_pdl")) {
-      use_pdl = true;
-    }
-
-    cmd.get_cmd_line_argument("m", m);
-    cmd.get_cmd_line_argument("n", n);
-    cmd.get_cmd_line_argument("k", k);
-    cmd.get_cmd_line_argument("groups", groups);
-    cmd.get_cmd_line_argument("alpha", alpha, FLT_MAX);
-    cmd.get_cmd_line_argument("beta",  beta,  FLT_MAX);
-    cmd.get_cmd_line_argument("iterations", iterations);
-    cmd.get_cmd_line_argument("benchmark", benchmark_path);
-    cmd.get_cmd_line_argument("cluster_m", cluster_shape.x);
-    cmd.get_cmd_line_argument("cluster_n", cluster_shape.y);
-    cmd.get_cmd_line_argument("cluster_fallback_m", cluster_shape_fallback.x);
-    cmd.get_cmd_line_argument("cluster_fallback_n", cluster_shape_fallback.y);
-    cmd.get_cmd_line_argument("max_sm_count", max_sm_count, INT_MAX);
-
-    // Decide how to initialize the problems
-    if (!benchmark_path.empty()) {
-      if (!benchmark_problems()) {
-        problem_sizes_host.clear();
-        return;
-      }
-    }
-    else {
-      randomize_problems(cmd);
-    }
-
-    cmd.get_cmd_line_argument("raster", raster_char);
-
-    if (raster_char == 'N' || raster_char == 'n') {
-      raster_order = RasterOrderOptions::AlongN;
-    }
-    else if (raster_char == 'M' || raster_char == 'm') {
-      raster_order = RasterOrderOptions::AlongM;
-    }
-    cmd.get_cmd_line_argument("swizzle", swizzle, 1);
-  }
-
-  void randomize_problems(cutlass::CommandLine &cmd) {
-    int cmd_line_m = -1, cmd_line_n = -1, cmd_line_k = -1;
-    cmd.get_cmd_line_argument("m", cmd_line_m);
-    cmd.get_cmd_line_argument("n", cmd_line_n);
-    cmd.get_cmd_line_argument("k", cmd_line_k);
-
-    problem_sizes_host.reserve(groups);
-
-    for (int i = groups; i > 0; i--) {
-      int m = cmd_line_m;
-      int n = cmd_line_n;
-      int k = cmd_line_k;
-      if (m < 0) {
-        m = alignment * ((rand() % 64));
-      }
-      if (n < 0) {
-        n = alignment * ((rand() % 64));
-      }
-      if (k < 0) {
-        k = alignment * ((rand() % 64));
-      }
-      problem_sizes_host.push_back({m, n, k});
-    }
-  }
-
-  /// Load a benchmark
-  bool benchmark_problems() {
-    std::ifstream file(benchmark_path);
-    if (!file.good()) {
-      return false;
-    }
-
-    while (file.good()) {
-
-      int idx = -1;
-      std::string extent_str;
-
-      file >> idx >> extent_str;
-
-      if (idx < 0 || extent_str.empty()) {
-        break;
-      }
-
-      cutlass::gemm::GemmCoord extent;
-      std::vector<std::string> tokens;
-
-      cutlass::CommandLine::tokenize(tokens, extent_str, 'x');
-
-      for (int i = 0; i < int(tokens.size()); ++i) {
-        extent.at(i) = std::atoi(tokens.at(i).c_str());
-      }
-      problem_sizes_host.push_back({extent.m(), extent.n(), extent.k()});
-    }
-    groups = static_cast<int>(problem_sizes_host.size());
-
-    return true;
-  }
-
-  /// Prints the usage statement.
-  std::ostream & print_usage(std::ostream &out) const {
-
-    out << "75_blackwell_grouped_gemm\n\n"
-      << "  Blackwell FP8 Grouped GEMM using a Warp Specialized kernel.\n\n"
-      << "Options:\n\n"
-      << "  --help                                                       If specified, displays this usage statement\n\n"
-      << "  --m=<int>                                                    Sets the M extent of the GEMM for all groups\n"
-      << "  --n=<int>                                                    Sets the N extent of the GEMM for all groups\n"
-      << "  --k=<int>                                                    Sets the K extent of the GEMM for all groups\n"
-      << "  --groups=<int>                                               Sets the number of individual GEMM problems for Grouped GEMM\n"
-      << "  --alpha=<f32>                                                Epilogue scalar alpha\n"
-      << "  --beta=<f32>                                                 Epilogue scalar beta\n\n"
-      << "  --cluster_m=<int>          and --cluster_n=<int>             Sets the X,Y dims of the preferred cluster shape\n"
-      << "  --cluster_fallback_m=<int> and --cluster_fallback_n=<int>    Sets the X,Y dims of the fallback cluster shape\n\n"
-      << "  --raster=<char>                                              Cluster rasterization direction (N for along N, M for along M)\n"
-      << "  --swizzle=<int>                                              Cluster swizzle (swizzle up to 8 and with the nearest multiple of 2)\n\n"
-      << "  --iterations=<int>                                           Number of profiling iterations to perform\n\n"
-      << "  --benchmark=<str>                                            Executes a benchmark problem size\n"
-      << "  --max_sm_count=<int>                                         Run kernels using only these number of SMs\n"
-      << "  --use_pdl                                                    Launch kernel with PDL (Programmatic Dependent Launch) enabled\n";
-                                                                                             
-    out
-      << "\n\nExamples:\n\n"
-      << "$ " << "75_blackwell_grouped_gemm" << " --m=1024 --n=512 --k=1024 --groups=10 --alpha=2 --beta=0.707 \n\n";
-
-    return out;
-  }
-
-  /// Compute performance in GFLOP/s
-  double gflops(double runtime_s, std::vector<typename ProblemShape::UnderlyingProblemShape> problem_sizes_host) const
-  {
-    // Number of real-valued multiply-adds
-    uint64_t fmas = uint64_t();
-
-    for (auto const & problem : problem_sizes_host) {
-      fmas += static_cast<uint64_t>(get<0>(problem)) *
-              static_cast<uint64_t>(get<1>(problem)) *
-              static_cast<uint64_t>(get<2>(problem));
-    }
-    // Two flops per multiply-add
-    uint64_t flop = uint64_t(2) * uint64_t(fmas);
-    double gflop = double(flop) / double(1.0e9);
-    return gflop / runtime_s;
-  }
+/// One problem of the group.
+struct Prob {
+  int M, N, K;
+  __nv_bfloat16 const *A;   // [M,K] row-major
+  __nv_bfloat16 const *B;   // [N,K] row-major == [K,N] column-major
+  __nv_bfloat16 *D;         // [M,N] row-major
 };
 
-/// Result structure
-struct Result
-{
-  double avg_runtime_ms = 0.0;
-  double gflops = 0.0;
-  cutlass::Status status = cutlass::Status::kSuccess;
-  cudaError_t error = cudaSuccess;
-  bool passed = false;
+/// One prepared CUTLASS grouped GEMM: all device-side argument arrays and the initialization are
+/// done in the constructor, so run() is just the kernel launch.
+struct RefGrouped {
+  virtual ~RefGrouped() {}
+  virtual void run() = 0;
 };
 
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-/// GEMM setup and evaluation
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Helper to initialize a block of device data
-template <class Element>
-bool initialize_block(
-  cutlass::DeviceAllocation<Element>& block,
-  uint64_t seed=2023) {
-
-  Element scope_max, scope_min;
-  int bits_input = cutlass::sizeof_bits<Element>::value;
-
-  if (bits_input == 1) {
-    scope_max = static_cast<Element>(2);
-    scope_min = static_cast<Element>(0);
-  } else if (bits_input <= 8) {
-    scope_max = static_cast<Element>(2);
-    scope_min = static_cast<Element>(-2);
-  } else {
-    scope_max = static_cast<Element>(8);
-    scope_min = static_cast<Element>(-8);
-  }
-
-  cutlass::reference::device::BlockFillRandomUniform(
-    block.get(), block.size(), seed, scope_max, scope_min, 0);
-
-  return true;
-}
-
-/// Clear global state between test sizes
-void clear_globals() {
-  offset_A.clear();
-  offset_B.clear();
-  offset_C.clear();
-  offset_D.clear();
-  stride_A_host.clear();
-  stride_B_host.clear();
-  stride_C_host.clear();
-  stride_D_host.clear();
-  alpha_host.clear();
-  beta_host.clear();
-}
-
-/// Allocates device-side data
-void allocate(const Options &options) {
-  int64_t total_elements_A = 0;
-  int64_t total_elements_B = 0;
-  int64_t total_elements_C = 0;
-  int64_t total_elements_D = 0;
-
-  for (int32_t i = 0; i < options.groups; ++i) {
-
-    auto problem = options.problem_sizes_host.at(i);
-    auto M = get<0>(problem);
-    auto N = get<1>(problem);
-    auto K = get<2>(problem);
-
-    offset_A.push_back(total_elements_A);
-    offset_B.push_back(total_elements_B);
-    offset_C.push_back(total_elements_C);
-    offset_D.push_back(total_elements_D);
-
-    int64_t elements_A = M * K;
-    int64_t elements_B = K * N;
-    int64_t elements_C = M * N;
-    int64_t elements_D = M * N;
-
-    total_elements_A += elements_A;
-    total_elements_B += elements_B;
-    total_elements_C += elements_C;
-    total_elements_D += elements_D;
-
-    stride_A_host.push_back(cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1}));
-    stride_B_host.push_back(cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1}));
-    stride_C_host.push_back(cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1}));
-    stride_D_host.push_back(cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1}));
-
-  }
-
-  block_A.reset(total_elements_A);
-  block_B.reset(total_elements_B);
-  block_C.reset(total_elements_C);
-  block_D.reset(total_elements_D);
-  block_ref_D.reset(total_elements_D);
-  block_alpha.reset(options.groups);
-  block_beta.reset(options.groups);
-}
-
-/// Initialize operands to be used in the GEMM and reference GEMM
-void initialize(const Options &options) {
-
-  uint64_t seed = 2020;
-
-  problem_sizes.reset(options.groups);
-  problem_sizes.copy_from_host(options.problem_sizes_host.data());
-
-  //
-  // Assign pointers
-  //
-
-  std::vector<ElementA *> ptr_A_host(options.groups);
-  std::vector<ElementB *> ptr_B_host(options.groups);
-  std::vector<ElementC *> ptr_C_host(options.groups);
-  std::vector<ElementC *> ptr_D_host(options.groups);
-  std::vector<ElementAccumulator *> ptr_alpha_host(options.groups);
-  std::vector<ElementAccumulator *> ptr_beta_host(options.groups);
-
-  for (int32_t i = 0; i < options.groups; ++i) {
-    ptr_A_host.at(i) = block_A.get() + offset_A.at(i);
-    ptr_B_host.at(i) = block_B.get() + offset_B.at(i);
-    ptr_C_host.at(i) = block_C.get() + offset_C.at(i);
-    ptr_D_host.at(i) = block_D.get() + offset_D.at(i);
-    alpha_host.push_back((options.alpha == FLT_MAX) ? static_cast<ElementAccumulator>((rand() % 5) + 1) : options.alpha);
-    beta_host.push_back((options.beta == FLT_MAX) ? static_cast<ElementAccumulator>(rand() % 5) : options.beta);
-    ptr_alpha_host.at(i) = block_alpha.get() + i;
-    ptr_beta_host.at(i) = block_beta.get() + i;
-  }
-
-  ptr_A.reset(options.groups);
-  ptr_A.copy_from_host(ptr_A_host.data());
-
-  ptr_B.reset(options.groups);
-  ptr_B.copy_from_host(ptr_B_host.data());
-
-  ptr_C.reset(options.groups);
-  ptr_C.copy_from_host(ptr_C_host.data());
-
-  ptr_D.reset(options.groups);
-  ptr_D.copy_from_host(ptr_D_host.data());
-
-  stride_A.reset(options.groups);
-  stride_A.copy_from_host(stride_A_host.data());
-
-  stride_B.reset(options.groups);
-  stride_B.copy_from_host(stride_B_host.data());
-
-  stride_C.reset(options.groups);
-  stride_C.copy_from_host(stride_C_host.data());
-
-  stride_D.reset(options.groups);
-  stride_D.copy_from_host(stride_D_host.data());
-
-  alpha_device.reset(options.groups);
-  alpha_device.copy_from_host(ptr_alpha_host.data());
-  beta_device.reset(options.groups);
-  beta_device.copy_from_host(ptr_beta_host.data());
-
-  initialize_block(block_A, seed + 2023);
-  initialize_block(block_B, seed + 2022);
-  initialize_block(block_C, seed + 2021);
-  block_alpha.copy_from_host(alpha_host.data());
-  block_beta.copy_from_host(beta_host.data());
-}
-
-/// Populates a Gemm::Arguments structure from the given commandline options
-template <typename Gemm>
-typename Gemm::Arguments args_from_options(Options &options, bool host_problem_shapes_available = true)
-{
-  cutlass::KernelHardwareInfo hw_info;
-  // Change device_id to another value if you are running on a machine with multiple GPUs and wish
-  // to use a GPU other than that with device ID 0.
-  hw_info.device_id = 0;
-  hw_info.sm_count = min(cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id), options.max_sm_count);
-
-  if (!is_static_v<ClusterShape>) {
-    if (size<0>(typename Gemm::GemmKernel::CollectiveMainloop::AtomThrShapeMNK{}) == 2 &&
-        (options.cluster_shape.x < 2 || options.cluster_shape_fallback.x < 2)) {
-      std::cout << "Error: MMA2SMConfig kernel config needs cluster_dim.x >= 2" << std::endl;
-    }
-    hw_info.cluster_shape = options.cluster_shape;
-    hw_info.cluster_shape_fallback = options.cluster_shape_fallback;
-  }
-
-  typename Gemm::Arguments arguments;
-  decltype(arguments.epilogue.thread) fusion_args;
-  fusion_args.alpha_ptr = nullptr;
-  fusion_args.beta_ptr = nullptr;
-
-  // If alpha/beta are provided (via cmd line args) and are scalar, then same alpha/beta applies to all batches.
-  // If pointers to alpha/beta are provided, then alpha/beta can differ between batches/groups.
-  if (options.alpha != FLT_MAX){
-    // Single alpha for all groups
-    fusion_args.alpha = options.alpha;
-    fusion_args.alpha_ptr_array = nullptr;
-    fusion_args.dAlpha = {_0{}, _0{}, 0};
-  }
-  else {
-    fusion_args.alpha = 0;
-    fusion_args.alpha_ptr_array = alpha_device.get();
-    // Only one alpha per each group
-    fusion_args.dAlpha = {_0{}, _0{}, 1};
-  }
-  if (options.beta != FLT_MAX) {
-    // Single beta for all groups
-    fusion_args.beta = options.beta;
-    fusion_args.beta_ptr_array = nullptr;
-    fusion_args.dBeta = {_0{}, _0{}, 0};
-  }
-  else {
-    fusion_args.beta = 0;
-    fusion_args.beta_ptr_array = beta_device.get();
-    // Only one beta per each group
-    fusion_args.dBeta = {_0{}, _0{}, 1};
-  }
-
-  typename Gemm::GemmKernel::TileSchedulerArguments scheduler;
-  scheduler.raster_order = options.raster_order;
-  scheduler.max_swizzle_size = options.swizzle;
-
-  if (host_problem_shapes_available) {
-    arguments = typename Gemm::Arguments {
-      cutlass::gemm::GemmUniversalMode::kGrouped,
-      {options.groups, problem_sizes.get(), options.problem_sizes_host.data()},
-      {ptr_A.get(), stride_A.get(), ptr_B.get(), stride_B.get()},
-      {fusion_args, ptr_C.get(), stride_C.get(), ptr_D.get(), stride_D.get()},
-      hw_info, scheduler
-    };
-  }
-  else {
-    arguments = typename Gemm::Arguments {
-      cutlass::gemm::GemmUniversalMode::kGrouped,
-      {options.groups, problem_sizes.get(), nullptr},
-      {ptr_A.get(), stride_A.get(), ptr_B.get(), stride_B.get()},
-      {fusion_args, ptr_C.get(), stride_C.get(), ptr_D.get(), stride_D.get()},
-      hw_info, scheduler
-    };
-  }
-
-  return arguments;
-}
-
-bool verify(const Options &options) {
-  bool passed = true;
-  for (int32_t i = 0; i < options.groups; ++i) {
-    auto problem = options.problem_sizes_host.at(i);
-    auto M = get<0>(problem);
-    auto N = get<1>(problem);
-    auto K = get<2>(problem);
-    cutlass::TensorRef ref_A(block_A.get() + offset_A.at(i), Gemm::LayoutA::packed({M, K}));
-    cutlass::TensorRef ref_B(block_B.get() + offset_B.at(i), Gemm::LayoutB::packed({K, N}));
-    cutlass::TensorRef ref_C(block_C.get() + offset_C.at(i), Gemm::LayoutC::packed({M, N}));
-    cutlass::TensorRef ref_D(block_ref_D.get() + offset_D.at(i), Gemm::LayoutD::packed({M, N}));
-
-    //
-    // Compute reference output
-    //
-
-    // Create instantiation for device reference gemm kernel
-    DeviceGemmReference gemm_reference;
-
-    // Launch device reference gemm kernel
-    gemm_reference(
-      {M, N, K},
-      ElementAccumulator(alpha_host.at(i)),
-      ref_A,
-      ref_B,
-      ElementAccumulator(beta_host.at(i)),
-      ref_C,
-      ref_D);
-
-    // Wait for kernel to finish
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // Check if output from CUTLASS kernel and reference kernel are equal or not
-    passed &= cutlass::reference::device::BlockCompareEqual(block_ref_D.get() + offset_D.at(i), block_D.get() + offset_D.at(i), M * N);
-  }
-  return passed;
-}
-
-/// Execute a given example GEMM computation
-template <typename Gemm>
-int run(Options &options, bool host_problem_shapes_available = true)
-{
-  // Instantiate CUTLASS kernel depending on templates
+template <class Cfg>
+struct RefGroupedImpl : RefGrouped {
+  using Gemm = typename Cfg::Gemm;
+  static constexpr bool Swap = Cfg::Swap;
+  using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+  using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+  using StrideD = typename Gemm::GemmKernel::InternalStrideD;
   Gemm gemm;
+  void *workspace = nullptr;
+  Shape<int, int, int> *d_sizes = nullptr;
+  ElementA const **d_A = nullptr;
+  ElementB const **d_B = nullptr;
+  ElementD **d_D = nullptr;
+  StrideA *d_sa = nullptr;
+  StrideB *d_sb = nullptr;
+  StrideD *d_sd = nullptr;
 
-  // Create a structure of gemm kernel arguments suitable for invoking an instance of Gemm
-  auto arguments = args_from_options<Gemm>(options, host_problem_shapes_available);
-
-  // Using the arguments, query for extra workspace required for matrix multiplication computation
-  size_t workspace_size = Gemm::get_workspace_size(arguments);
-
-  // Allocate workspace memory
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-
-  // Check if the problem size is supported or not
-  CUTLASS_CHECK(gemm.can_implement(arguments));
-
-  // Initialize CUTLASS kernel with arguments and workspace pointer
-  CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
-
-  // Correctness / Warmup iteration
-  CUTLASS_CHECK(gemm.run(/* stream = */ nullptr, /* cuda_adapter = */ nullptr, /* launch_with_pdl = */ options.use_pdl));
-
-  // Check if output from CUTLASS kernel and reference kernel are equal or not
-  Result result;
-  result.passed = verify(options);
-
-  if (!result.passed) {
-    std::cout << "Incorrect" << std::endl;
-    exit(-1);
+  template <class T> static T *upload(std::vector<T> const &v) {
+    T *p;
+    KH_CHECK(cudaMalloc(&p, sizeof(T) * std::max<size_t>(v.size(), 1)));
+    KH_CHECK(cudaMemcpy(p, v.data(), sizeof(T) * v.size(), cudaMemcpyHostToDevice));
+    return p;
   }
 
-#ifdef KH_TEST_SOLUTION
-  //
-  // Run and verify LLM solution against CUTLASS reference
-  //
-
-  // Build arrays for solution interface
-  std::vector<int> Ms(options.groups), Ns(options.groups), Ks(options.groups);
-  std::vector<int> ldas(options.groups), ldbs(options.groups), ldds(options.groups);
-  std::vector<__nv_fp8_e4m3 const*> h_A_ptrs(options.groups);
-  std::vector<__nv_fp8_e4m3 const*> h_B_ptrs(options.groups);
-  std::vector<__half*> h_D_sol_ptrs(options.groups);
-
-  for (int32_t i = 0; i < options.groups; ++i) {
-    auto problem = options.problem_sizes_host.at(i);
-    int M = get<0>(problem), N = get<1>(problem), K = get<2>(problem);
-    Ms[i] = M; Ns[i] = N; Ks[i] = K;
-    ldas[i] = K;  // A is row-major
-    ldbs[i] = K;  // B is column-major (stride = K)
-    ldds[i] = M;  // D is column-major (stride = M)
-    h_A_ptrs[i] = reinterpret_cast<__nv_fp8_e4m3 const*>(block_A.get() + offset_A.at(i));
-    h_B_ptrs[i] = reinterpret_cast<__nv_fp8_e4m3 const*>(block_B.get() + offset_B.at(i));
-  }
-
-  // Allocate solution output per group
-  std::vector<cutlass::DeviceAllocation<ElementC>> sol_D_allocs(options.groups);
-  for (int32_t i = 0; i < options.groups; ++i) {
-    int M = Ms[i], N = Ns[i];
-    sol_D_allocs[i].reset(M * N);
-    cudaMemset(sol_D_allocs[i].get(), 0, sizeof(ElementC) * M * N);
-    h_D_sol_ptrs[i] = reinterpret_cast<__half*>(sol_D_allocs[i].get());
-  }
-
-  // Copy pointer arrays and scalar arrays to device
-  int *d_Ms, *d_Ns, *d_Ks, *d_ldas, *d_ldbs, *d_ldds;
-  __nv_fp8_e4m3 const **d_A_ptrs;
-  __nv_fp8_e4m3 const **d_B_ptrs;
-  __half **d_D_sol_ptrs;
-
-  cudaMalloc(&d_Ms, sizeof(int) * options.groups);
-  cudaMalloc(&d_Ns, sizeof(int) * options.groups);
-  cudaMalloc(&d_Ks, sizeof(int) * options.groups);
-  cudaMalloc(&d_ldas, sizeof(int) * options.groups);
-  cudaMalloc(&d_ldbs, sizeof(int) * options.groups);
-  cudaMalloc(&d_ldds, sizeof(int) * options.groups);
-  cudaMalloc(&d_A_ptrs, sizeof(__nv_fp8_e4m3*) * options.groups);
-  cudaMalloc(&d_B_ptrs, sizeof(__nv_fp8_e4m3*) * options.groups);
-  cudaMalloc(&d_D_sol_ptrs, sizeof(__half*) * options.groups);
-
-  cudaMemcpy(d_Ms, Ms.data(), sizeof(int) * options.groups, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_Ns, Ns.data(), sizeof(int) * options.groups, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_Ks, Ks.data(), sizeof(int) * options.groups, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_ldas, ldas.data(), sizeof(int) * options.groups, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_ldbs, ldbs.data(), sizeof(int) * options.groups, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_ldds, ldds.data(), sizeof(int) * options.groups, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_A_ptrs, h_A_ptrs.data(), sizeof(__nv_fp8_e4m3*) * options.groups, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_B_ptrs, h_B_ptrs.data(), sizeof(__nv_fp8_e4m3*) * options.groups, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_D_sol_ptrs, h_D_sol_ptrs.data(), sizeof(__half*) * options.groups, cudaMemcpyHostToDevice);
-
-  float alpha_val = (options.alpha != FLT_MAX) ? options.alpha : 1.0f;
-  float beta_val = (options.beta != FLT_MAX) ? options.beta : 0.0f;
-
-  cudaError_t sol_err = BlackwellGroupedGemm(
-    options.groups, d_Ms, d_Ns, d_Ks, alpha_val, beta_val,
-    (const __nv_fp8_e4m3 * const *)d_A_ptrs, d_ldas,
-    (const __nv_fp8_e4m3 * const *)d_B_ptrs, d_ldbs,
-    d_D_sol_ptrs, d_ldds);
-
-  if (sol_err != cudaSuccess) {
-    std::cerr << "Solution kernel failed: " << cudaGetErrorString(sol_err) << std::endl;
-    std::cout << "Incorrect" << std::endl;
-    exit(-1);
-  }
-  cudaDeviceSynchronize();
-
-  // Verify solution against CUTLASS reference
-  for (int32_t i = 0; i < options.groups; ++i) {
-    int M = Ms[i], N = Ns[i];
-    bool group_passed = cutlass::reference::device::BlockCompareEqual(
-      reinterpret_cast<ElementC*>(sol_D_allocs[i].get()),
-      block_D.get() + offset_D.at(i), M * N);
-
-    if (!group_passed) {
-      // Check with tolerance for FP8 accumulation differences
-      std::vector<ElementC> h_sol(M * N), h_ref(M * N);
-      cutlass::device_memory::copy_to_host(h_sol.data(), sol_D_allocs[i].get(), M * N);
-      cutlass::device_memory::copy_to_host(h_ref.data(), block_D.get() + offset_D.at(i), M * N);
-      int mismatches = 0;
-      for (int idx = 0; idx < M * N; ++idx) {
-        float s = float(h_sol[idx]), r = float(h_ref[idx]);
-        float diff = std::fabs(s - r);
-        float denom = std::fmax(std::fabs(r), 1e-6f);
-        if (diff / denom > 0.3f) mismatches++;
-      }
-      float mismatch_rate = float(mismatches) / float(M * N);
-      if (mismatch_rate > 0.01f) {
-        std::cerr << "Solution incorrect at group " << i
-                  << ". Mismatch rate: " << mismatch_rate << std::endl;
-        std::cout << "Incorrect" << std::endl;
-        cudaFree(d_Ms); cudaFree(d_Ns); cudaFree(d_Ks);
-        cudaFree(d_ldas); cudaFree(d_ldbs); cudaFree(d_ldds);
-        cudaFree(d_A_ptrs); cudaFree(d_B_ptrs); cudaFree(d_D_sol_ptrs);
-        exit(-1);
-      }
+  RefGroupedImpl(std::vector<Prob> const &probs, int cluster) {
+    int G = int(probs.size());
+    std::vector<Shape<int, int, int>> sizes;
+    std::vector<ElementA const *> pa;
+    std::vector<ElementB const *> pb;
+    std::vector<ElementD *> pd;
+    std::vector<StrideA> sa;
+    std::vector<StrideB> sb;
+    std::vector<StrideD> sd;
+    for (auto const &p : probs) {
+      int m = Swap ? p.N : p.M, n = Swap ? p.M : p.N;   // MMA-level M, N
+      sizes.push_back({m, n, p.K});
+      pa.push_back(reinterpret_cast<ElementA const *>(Swap ? p.B : p.A));
+      pb.push_back(reinterpret_cast<ElementB const *>(Swap ? p.A : p.B));
+      pd.push_back(reinterpret_cast<ElementD *>(p.D));
+      sa.push_back(cutlass::make_cute_packed_stride(StrideA{}, {m, p.K, 1}));
+      sb.push_back(cutlass::make_cute_packed_stride(StrideB{}, {n, p.K, 1}));
+      sd.push_back(cutlass::make_cute_packed_stride(StrideD{}, {m, n, 1}));
     }
+    d_sizes = upload(sizes); d_A = upload(pa); d_B = upload(pb); d_D = upload(pd);
+    d_sa = upload(sa); d_sb = upload(sb); d_sd = upload(sd);
+
+    cutlass::KernelHardwareInfo hw_info;
+    hw_info.device_id = 0;
+    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+    hw_info.cluster_shape = dim3(kClusters[cluster][0], kClusters[cluster][1], 1);
+    hw_info.cluster_shape_fallback = dim3(kClusters[cluster][2], kClusters[cluster][3], 1);
+
+    typename Gemm::Arguments args;
+    decltype(args.epilogue.thread) fusion_args;
+    fusion_args.alpha_ptr = nullptr;
+    fusion_args.beta_ptr = nullptr;
+    fusion_args.alpha = 1.f;
+    fusion_args.beta = 0.f;
+    fusion_args.alpha_ptr_array = nullptr;
+    fusion_args.beta_ptr_array = nullptr;
+    fusion_args.dAlpha = {_0{}, _0{}, 0};
+    fusion_args.dBeta = {_0{}, _0{}, 0};
+    typename Gemm::GemmKernel::TileSchedulerArguments scheduler;
+    args = typename Gemm::Arguments{cutlass::gemm::GemmUniversalMode::kGrouped,
+                                    {G, d_sizes, nullptr},
+                                    {d_A, d_sa, d_B, d_sb},
+                                    {fusion_args, nullptr, nullptr, d_D, d_sd},
+                                    hw_info, scheduler};
+    size_t ws = Gemm::get_workspace_size(args);
+    if (ws) KH_CHECK(cudaMalloc(&workspace, ws));
+    CUTLASS_CHECK_KH(gemm.can_implement(args));
+    CUTLASS_CHECK_KH(gemm.initialize(args, workspace));
   }
-#endif // KH_TEST_SOLUTION
-
-  std::cout << "Passed" << std::endl;
-
-  // Profiling
-  if (options.iterations > 0) {
-    int const kIterations = options.iterations;
-    cudaEvent_t ev_start, ev_stop;
-    cudaEventCreate(&ev_start);
-    cudaEventCreate(&ev_stop);
-
-    // Warmup reference
-    for (int i = 0; i < 3; i++) {
-      CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
-      CUTLASS_CHECK(gemm.run(nullptr, nullptr, options.use_pdl));
-    }
-    cudaDeviceSynchronize();
-
-    // Profile reference (per-iteration timing)
-    float ref_total_ms = 0, ref_min_ms = 1e30f;
-    for (int iter = 0; iter < kIterations; ++iter) {
-      CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
-      cudaEventRecord(ev_start);
-      CUTLASS_CHECK(gemm.run(nullptr, nullptr, options.use_pdl));
-      cudaEventRecord(ev_stop);
-      cudaEventSynchronize(ev_stop);
-      float ms;
-      cudaEventElapsedTime(&ms, ev_start, ev_stop);
-      ref_total_ms += ms;
-      if (ms < ref_min_ms) ref_min_ms = ms;
-    }
-    fprintf(stdout, "Ref time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
-            ref_total_ms / kIterations, kIterations, ref_min_ms);
-
-#ifdef KH_TEST_SOLUTION
-    // Warmup solution
-    for (int i = 0; i < 3; i++) {
-      BlackwellGroupedGemm(
-        options.groups, d_Ms, d_Ns, d_Ks, alpha_val, beta_val,
-        (const __nv_fp8_e4m3 * const *)d_A_ptrs, d_ldas,
-        (const __nv_fp8_e4m3 * const *)d_B_ptrs, d_ldbs,
-        d_D_sol_ptrs, d_ldds);
-    }
-    cudaDeviceSynchronize();
-
-    // Profile solution (per-iteration timing)
-    float sol_total_ms = 0, sol_min_ms = 1e30f;
-    for (int iter = 0; iter < kIterations; ++iter) {
-      cudaEventRecord(ev_start);
-      BlackwellGroupedGemm(
-        options.groups, d_Ms, d_Ns, d_Ks, alpha_val, beta_val,
-        (const __nv_fp8_e4m3 * const *)d_A_ptrs, d_ldas,
-        (const __nv_fp8_e4m3 * const *)d_B_ptrs, d_ldbs,
-        d_D_sol_ptrs, d_ldds);
-      cudaEventRecord(ev_stop);
-      cudaEventSynchronize(ev_stop);
-      float ms;
-      cudaEventElapsedTime(&ms, ev_start, ev_stop);
-      sol_total_ms += ms;
-      if (ms < sol_min_ms) sol_min_ms = ms;
-    }
-    fprintf(stdout, "Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
-            sol_total_ms / kIterations, kIterations, sol_min_ms);
-    fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
-
-    cudaFree(d_Ms); cudaFree(d_Ns); cudaFree(d_Ks);
-    cudaFree(d_ldas); cudaFree(d_ldbs); cudaFree(d_ldds);
-    cudaFree(d_A_ptrs); cudaFree(d_B_ptrs); cudaFree(d_D_sol_ptrs);
-#endif
-
-    cudaEventDestroy(ev_start);
-    cudaEventDestroy(ev_stop);
+  ~RefGroupedImpl() override {
+    cudaFree(workspace); cudaFree(d_sizes); cudaFree(d_A); cudaFree(d_B); cudaFree(d_D);
+    cudaFree(d_sa); cudaFree(d_sb); cudaFree(d_sd);
   }
+  void run() override { CUTLASS_CHECK_KH(gemm.run()); }
+};
 
-  return 0;
+static std::unique_ptr<RefGrouped> make_ref(int cfg, int cluster, std::vector<Prob> const &p) {
+  switch (cfg) {
+    case 0: return std::make_unique<RefGroupedImpl<Cfg0>>(p, cluster);
+    case 1: return std::make_unique<RefGroupedImpl<Cfg1>>(p, cluster);
+    case 2: return std::make_unique<RefGroupedImpl<Cfg2>>(p, cluster);
+    case 3: return std::make_unique<RefGroupedImpl<Cfg3>>(p, cluster);
+    case 4: return std::make_unique<RefGroupedImpl<Cfg4>>(p, cluster);
+    case 5: return std::make_unique<RefGroupedImpl<Cfg5>>(p, cluster);
+    case 6: return std::make_unique<RefGroupedImpl<Cfg6>>(p, cluster);
+    case 7: return std::make_unique<RefGroupedImpl<Cfg7>>(p, cluster);
+    case 8: return std::make_unique<RefGroupedImpl<Cfg8>>(p, cluster);
+    default: return std::make_unique<RefGroupedImpl<Cfg9>>(p, cluster);
+  }
 }
 
-#endif // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+// ---------------------------------------------------------------------------------------------
+// Scenarios: Qwen3-30B-A3B MoE expert GEMMs with skewed top-k routing
+// ---------------------------------------------------------------------------------------------
 
-///////////////////////////////////////////////////////////////////////////////////////////////////
+/// One set of expert GEMMs sharing (N, K): `tokens` tokens are routed to `topk` of `E` experts by a
+/// router with Zipf-skewed popularity (exponent `skew`, random expert order) plus `cold` experts
+/// that receive nothing; per token the top-k of (log-popularity + Gumbel noise) are chosen, i.e.
+/// sampling without replacement as a real top-k router does. group g has M_g = tokens routed to
+/// expert g.
+struct Segment {
+  int E, tokens, topk, N, K;
+  double skew;
+  int cold;
+  unsigned seed;
+};
 
-int main(int argc, char const **args) {
+struct Scenario {
+  char const *label;
+  std::vector<Segment> segs;
+  int cfg, cluster;   // reference configuration (from the sweep)
+};
 
-  // CUTLASS must be compiled with CUDA 12.8 Toolkit to run this example
-  if (__CUDACC_VER_MAJOR__ < 12 ||
-       ((__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ < 8)
-       )
-     ) {
-    std::cerr << "This example requires CUDA 12.8 or newer.\n";
-    return 0;
+static std::vector<int> route_counts(Segment const &s) {
+  int E = s.E;
+  auto uni = [&](unsigned long long i, unsigned salt) {   // uniform in (0,1)
+    return (double(kh_hash64(i, s.seed * 131u + salt) >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+  };
+  std::vector<int> perm(E);
+  std::iota(perm.begin(), perm.end(), 0);
+  for (int i = E - 1; i > 0; --i) std::swap(perm[i], perm[int(uni(i, 1) * (i + 1))]);
+  std::vector<double> logp(E);
+  for (int r = 0; r < E; ++r) logp[perm[r]] = -s.skew * std::log(double(r + 1));
+  std::vector<int> perm2(E);
+  std::iota(perm2.begin(), perm2.end(), 0);
+  for (int i = E - 1; i > 0; --i) std::swap(perm2[i], perm2[int(uni(i, 2) * (i + 1))]);
+  for (int c = 0; c < s.cold; ++c) logp[perm2[c]] = -1e30;
+  std::vector<int> cnt(E, 0);
+  std::vector<std::pair<double, int>> sc(E);
+  for (int t = 0; t < s.tokens; ++t) {
+    for (int e = 0; e < E; ++e)
+      sc[e] = {logp[e] - std::log(-std::log(uni(size_t(t) * E + e, 3))), e};
+    std::partial_sort(sc.begin(), sc.begin() + s.topk, sc.end(),
+                      [](auto const &a, auto const &b) { return a.first > b.first; });
+    for (int i = 0; i < s.topk; ++i) cnt[sc[i].second]++;
   }
+  return cnt;
+}
 
-  cudaDeviceProp props;
-  int current_device_id;
-  CUDA_CHECK(cudaGetDevice(&current_device_id));
-  CUDA_CHECK(cudaGetDeviceProperties(&props, current_device_id));
-  cudaError_t error = cudaGetDeviceProperties(&props, 0);
-  if (props.major != 10 || (props.minor != 0 && props.minor != 1 && props.minor != 3)) {
-    std::cerr << "This example requires a GPU with compute capability 100a|f, 101a|f, or 103a|f)." << std::endl;
-    return 0;
+struct SegBuf {
+  int E, N, K, R;
+  std::vector<int> cnt, off;
+  __nv_bfloat16 *A, *W, *Dref, *Dsol;
+  size_t nA, nW, nD;
+};
+
+/// Tolerances for the BF16 output. Every element must satisfy |x - ref| <= 1e-2 * RMS(ref) + |ref|/128
+/// (the second term is one BF16 ulp) and the relative Frobenius error must be <= 5e-4, per segment.
+/// Reference and solution accumulate exact BF16 products in FP32 in different orders and round to
+/// BF16. Measured on B200 over all scenarios (max|err|/RMS, rel. Frobenius error):
+///   plain sequential FP32 kernel (shipped naive solution):   <= 2.7e-2 (1 ulp of the largest
+///        elements, covered by the |ref|/128 term),                   <= 9.7e-5   -> bound 5x above
+///   FP16 accumulation:                         5.4e-2 .. 9.9e-2,    4.7e-3 .. 7.0e-3  (fails)
+///   inputs rounded to FP8 E4M3 / E5M2:         0.18 .. 0.20 / 0.32 .. 0.40,  3.4e-2 / 6.7e-2 (fail)
+///   skipped last 64 of K:                      0.9 .. 1.7,          0.18 .. 0.29  (fails)
+/// Structural errors (unwritten rows, wrong expert, dropped group, ragged tail, wrong group size)
+/// fail through the NaN / non-finite check or by O(1) errors.
+static KhTol kTol(1.0e-2, 5.0e-4, 1.0 / 128);
+
+/// Returns false on failure. `timed` = also print Ref / Kernel timings.
+static bool run_case(Scenario const &sc, bool timed, int trials) {
+  std::vector<SegBuf> sb;
+  std::vector<Prob> probs;
+  long long total_rows = 0;
+  int total_groups = 0, empty = 0, maxrows = 0, minrows = 1 << 30;
+  double flops = 0, bytes = 0;   // bytes: minimum DRAM traffic (weights of non-empty groups + A + D)
+  for (size_t si = 0; si < sc.segs.size(); ++si) {
+    Segment const &s = sc.segs[si];
+    SegBuf b;
+    b.E = s.E; b.N = s.N; b.K = s.K;
+    b.cnt = route_counts(s);
+    b.off.assign(s.E + 1, 0);
+    for (int e = 0; e < s.E; ++e) b.off[e + 1] = b.off[e] + b.cnt[e];
+    b.R = b.off[s.E];
+    b.nA = size_t(b.R) * s.K; b.nW = size_t(s.E) * s.N * s.K; b.nD = size_t(b.R) * s.N;
+    KH_CHECK(cudaMalloc(&b.A, b.nA * 2));
+    KH_CHECK(cudaMalloc(&b.W, b.nW * 2));
+    KH_CHECK(cudaMalloc(&b.Dref, b.nD * 2));
+    KH_CHECK(cudaMalloc(&b.Dsol, b.nD * 2));
+    kh_fill_uniform(b.A, b.nA, 11u + 100u * unsigned(si));
+    kh_fill_uniform(b.W, b.nW, 22u + 100u * unsigned(si));
+    kh_poison(b.Dref, b.nD * 2);
+    kh_poison(b.Dsol, b.nD * 2);
+    for (int e = 0; e < s.E; ++e) {
+      probs.push_back({b.cnt[e], s.N, s.K, b.A + size_t(b.off[e]) * s.K,
+                       b.W + size_t(e) * s.N * s.K, b.Dref + size_t(b.off[e]) * s.N});
+      empty += b.cnt[e] == 0;
+      maxrows = std::max(maxrows, b.cnt[e]);
+      minrows = std::min(minrows, b.cnt[e]);
+      flops += 2.0 * b.cnt[e] * s.N * s.K;
+      if (b.cnt[e] > 0) bytes += 2.0 * s.N * s.K + 2.0 * b.cnt[e] * (double(s.K) + s.N);
+    }
+    total_rows += b.R; total_groups += s.E;
+    sb.push_back(std::move(b));
   }
+  KH_CHECK(cudaDeviceSynchronize());
+  std::printf("  groups = %d (empty = %d), rows per group: min %d, mean %.1f, max %d, total %lld; "
+              "%.1f GFLOP\n", total_groups, empty, minrows, double(total_rows) / total_groups,
+              maxrows, total_rows, flops * 1e-9);
 
-  //
-  // Parse options
-  //
+  // The token matrix (A of every group) changes on every call in deployment: it is regenerated with a
+  // new seed outside the timed region before every timed call of the reference and of the solution,
+  // so outputs and input-dependent intermediates cannot be cached across calls.
+  unsigned seed_counter = 1000;
+  auto refresh_input = [&](unsigned seed) {
+    for (size_t si = 0; si < sb.size(); ++si)
+      kh_fill_uniform(sb[si].A, sb[si].nA, seed + 100u * unsigned(si));
+  };
+  auto next_input = [&] { refresh_input(++seed_counter); };
 
-  Options options;
+  auto ref = make_ref(sc.cfg, sc.cluster, probs);
+  ref->run();
+  KH_CHECK(cudaDeviceSynchronize());
 
-  options.parse(argc, args);
-
-  if (options.help) {
-    options.print_usage(std::cout) << std::endl;
-    return 0;
-  }
-
-  // Check if explicit size was provided on command line
-  bool explicit_size = false;
-  {
-    cutlass::CommandLine cmd(argc, args);
-    explicit_size = cmd.check_cmd_line_flag("m") ||
-                    cmd.check_cmd_line_flag("n") ||
-                    cmd.check_cmd_line_flag("k") ||
-                    cmd.check_cmd_line_flag("groups") ||
-                    cmd.check_cmd_line_flag("benchmark");
-  }
-
-  struct TestConfig {
-    const char* label;
-    int m, n, k, groups;
+  auto check = [&](char const *who) {
+    bool ok = true;
+    for (size_t si = 0; si < sb.size(); ++si) {
+      KhResult r = kh_compare(sb[si].Dsol, sb[si].Dref, sb[si].nD, kTol);
+      char name[96];
+      std::snprintf(name, sizeof(name), "%s [segment %zu]", who, si);
+      kh_print_result(name, r, kTol);
+      ok = ok && r.pass;
+    }
+    return ok;
   };
 
-  std::vector<TestConfig> configs;
-
-  if (explicit_size) {
-    configs.push_back({"custom", options.m, options.n, options.k, options.groups});
-  } else {
-    configs = {
-      {"small",   128,  128,  128,   4},
-      {"medium",  512,  512,  512,  16},
-      {"large",  2048, 2048, 2048,   4},
-    };
+  bool ok = true;
+  // The reference must have written every element (it was pre-filled with NaN).
+  for (auto &b : sb) {
+    KhResult r = kh_compare(b.Dref, b.Dref, b.nD, kTol);
+    if (!r.pass) {
+      std::cerr << "Reference output incomplete or non-finite (non-finite = " << r.nonfinite << ")"
+                << std::endl;
+      ok = false;
+    }
   }
 
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-  for (const auto& cfg : configs) {
-    fprintf(stdout, "\n=== %s: M=%d, N=%d, K=%d, groups=%d ===\n",
-            cfg.label, cfg.m, cfg.n, cfg.k, cfg.groups);
-
-    // Reset global state
-    clear_globals();
-
-    // Configure options for this size
-    options.m = cfg.m;
-    options.n = cfg.n;
-    options.k = cfg.k;
-    options.groups = cfg.groups;
-    options.alpha = 1.0f;
-    options.beta = 0.0f;
-
-    // Regenerate problem sizes for this configuration
-    options.problem_sizes_host.clear();
-    for (int i = 0; i < options.groups; ++i) {
-      options.problem_sizes_host.push_back({cfg.m, cfg.n, cfg.k});
+#ifdef KH_TEST_SOLUTION
+  // Device-side argument arrays for the solution (they point into the solution's own D buffers).
+  std::vector<int> hM, hN, hK, hlda, hldb, hldd;
+  std::vector<__nv_bfloat16 const *> hA, hB;
+  std::vector<__nv_bfloat16 *> hD;
+  for (auto &b : sb) {
+    for (int e = 0; e < b.E; ++e) {
+      hM.push_back(b.cnt[e]); hN.push_back(b.N); hK.push_back(b.K);
+      hlda.push_back(b.K); hldb.push_back(b.K); hldd.push_back(b.N);
+      hA.push_back(b.A + size_t(b.off[e]) * b.K);
+      hB.push_back(b.W + size_t(e) * b.N * b.K);
+      hD.push_back(b.Dsol + size_t(b.off[e]) * b.N);
     }
-
-    allocate(options);
-    initialize(options);
-
-    run<Gemm1SM>(options, false);
+  }
+  int G = int(hM.size());
+  auto up = [](auto const &v) {
+    using T = typename std::decay_t<decltype(v)>::value_type;
+    T *p;
+    KH_CHECK(cudaMalloc(&p, sizeof(T) * v.size()));
+    KH_CHECK(cudaMemcpy(p, v.data(), sizeof(T) * v.size(), cudaMemcpyHostToDevice));
+    return p;
+  };
+  int *dM = up(hM), *dN = up(hN), *dK = up(hK), *dlda = up(hlda), *dldb = up(hldb),
+      *dldd = up(hldd);
+  __nv_bfloat16 const **dA = up(hA), **dB = up(hB);
+  __nv_bfloat16 **dD = up(hD);
+  auto reset_sol = [&] { for (auto &b : sb) kh_poison(b.Dsol, b.nD * 2); };
+  auto call_sol = [&] {
+    cudaError_t e = BlackwellGroupedGemm(G, dM, dN, dK, dA, dlda, dB, dldb, dD, dldd);
+    if (e != cudaSuccess) {
+      std::cerr << "Solution kernel failed: " << cudaGetErrorString(e) << std::endl;
+      std::exit(1);
+    }
+  };
+  if (ok) {
+    call_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    ok = check("solution");
   }
 #endif
 
-  return 0;
+  if (ok && timed && trials > 0) {
+    KhTime tr = kh_time([&] { ref->run(); }, trials,
+                        [&] { next_input(); for (auto &b : sb) kh_poison(b.Dref, b.nD * 2); });
+    kh_print_time("Ref", tr);
+    std::printf("  reference: %.1f TFLOP/s, %.2f TB/s of minimum DRAM traffic\n",
+                flops / (tr.min_ms * 1e-3) * 1e-12, bytes / (tr.min_ms * 1e-3) * 1e-12);
+#ifdef KH_TEST_SOLUTION
+    KhTime ts = kh_time(call_sol, trials, [&] { next_input(); reset_sol(); });
+    kh_print_time("Kernel", ts);
+    kh_print_speedup(tr, ts);
+#endif
+  }
+
+#ifdef KH_TEST_SOLUTION
+  // Re-check with yet another fresh input (also when timing is disabled): recompute D_ref for it and
+  // make the solution produce the right answer again from a freshly poisoned buffer.
+  if (ok) {
+    refresh_input(777777u);
+    for (auto &b : sb) kh_poison(b.Dref, b.nD * 2);
+    ref->run();
+    KH_CHECK(cudaDeviceSynchronize());
+    reset_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    call_sol();
+    KH_CHECK(cudaDeviceSynchronize());
+    ok = check("solution (re-check, fresh input)");
+  }
+#endif
+
+#ifdef KH_TEST_SOLUTION
+  cudaFree(dM); cudaFree(dN); cudaFree(dK); cudaFree(dlda); cudaFree(dldb); cudaFree(dldd);
+  cudaFree(dA); cudaFree(dB); cudaFree(dD);
+#endif
+  for (auto &b : sb) { cudaFree(b.A); cudaFree(b.W); cudaFree(b.Dref); cudaFree(b.Dsol); }
+  return ok;
 }
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
+#endif  // CUTLASS_ARCH_MMA_SM100_SUPPORTED
+
+int main(int argc, char const **argv) {
+  cudaDeviceProp props;
+  KH_CHECK(cudaGetDeviceProperties(&props, 0));
+  if (props.major != 10 || props.minor != 0) {
+    std::cerr << "This task requires a Blackwell sm_100 GPU (B200)." << std::endl;
+    return 0;
+  }
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+  int trials = kh_trials();
+  bool const keep_going = std::getenv("KH_KEEP_GOING") != nullptr;   // development aid
+  bool failed = false;
+
+  // Qwen3-30B-A3B: 128 experts, top-8, hidden 2048, expert FFN 768. Fused gate+up projection:
+  // [rows, 2048] x [2048 -> 1536]; down projection: [rows, 768] x [768 -> 2048].
+  const int E = 128, H = 2048, I2 = 1536, I = 768;
+  // {E, tokens, topk, N, K, skew, cold experts, seed}
+  Segment pf8k_gu{E, 8192, 8, I2, H, 0.9, 8, 7};    // 8K-token prefill chunk: 65536 routed rows
+  Segment pf8k_dn{E, 8192, 8, H, I, 0.9, 8, 7};     // same routing
+  Segment pf2k_gu{E, 2048, 8, I2, H, 1.1, 12, 8};
+  Segment pf2k_dn{E, 2048, 8, H, I, 1.1, 12, 8};
+  Segment dec_gu{E, 128, 8, I2, H, 1.0, 0, 9};      // decode, batch 128: 1024 routed rows
+  Segment dec_dn{E, 128, 8, H, I, 1.0, 0, 9};
+  // Two-micro-batch overlap: the gate+up GEMMs of micro-batch B and the down GEMMs of micro-batch A
+  // run as one grouped launch: 256 groups with two different (N, K) and different routings.
+  Segment ovl_gu{E, 2048, 8, I2, H, 1.1, 12, 10};
+  Segment ovl_dn{E, 2048, 8, H, I, 1.1, 12, 11};
+
+  // Reference configuration per scenario (cfg, cluster) from the KH_SWEEP build on B200.
+  std::vector<Scenario> scenarios = {
+      {"prefill8k_gate_up", {pf8k_gu}, 0, 4},
+      {"prefill8k_down",    {pf8k_dn}, 0, 4},
+      {"prefill2k_gate_up", {pf2k_gu}, 2, 3},
+      {"prefill2k_down",    {pf2k_dn}, 2, 3},
+      {"overlap_mixed_nk",  {ovl_gu, ovl_dn}, 5, 0},
+      {"decode128_gate_up", {dec_gu}, 9, 1},
+      {"decode128_down",    {dec_dn}, 9, 1},
+  };
+
+  std::string only = (argc >= 2) ? argv[1] : "";   // dev aid: ./test <label substring>
+
+#ifdef KH_SWEEP
+  // Development aid: time every reference configuration on every scenario.
+  for (auto s : scenarios) {
+    if (!only.empty() && std::string(s.label).find(only) == std::string::npos) continue;
+    for (int cfg = std::getenv("KH_SWEEP_MIN") ? std::atoi(std::getenv("KH_SWEEP_MIN")) : 0; cfg < kNumCfg; ++cfg)
+      for (int cl = 0; cl < kNumCluster; ++cl) {
+        bool two_sm = cfg < 2 || cfg == 5 || cfg == 6;
+        if (two_sm && kClusters[cl][0] < 2) continue;
+        s.cfg = cfg; s.cluster = cl;
+        std::printf("\n=== %s cfg=%d cluster=%d ===\n", s.label, cfg, cl);
+        run_case(s, true, 10);
+      }
+  }
+  return 0;
+#endif
+
+  for (auto const &s : scenarios) {
+    if (!only.empty() && std::string(s.label).find(only) == std::string::npos) continue;
+    long long rows = 0;
+    for (auto const &g : s.segs) rows += (long long)g.tokens * g.topk;
+    std::printf("\n=== %s: M=%lld, N=%d, K=%d ===\n", s.label, rows, s.segs[0].N, s.segs[0].K);
+    if (!run_case(s, true, trials)) { std::cout << "Incorrect" << std::endl; if (!keep_going) return 1; failed = true; }
+    else std::cout << "Passed" << std::endl;
+  }
+  return failed ? 1 : 0;
+#endif
+  return 0;
+}

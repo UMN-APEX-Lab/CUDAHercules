@@ -2,22 +2,50 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
-// Naive BF16 GEMM: C = A * B^T
-// A is [M,K], B is [N,K] (transposed), C is [M,N]
-__global__ void naive_bf16_gemm_kernel(__nv_bfloat16 *A, __nv_bfloat16 *B, __nv_bfloat16 *C, int M, int N, int K) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < M && col < N) {
-        float acc = 0.0f;
-        for (int k = 0; k < K; k++) {
-            acc += __bfloat162float(A[row * K + k]) * __bfloat162float(B[col * K + k]);
-        }
-        C[row * N + col] = __float2bfloat16(acc);
+// Baseline BF16 GEMM, C = A * B^T (plain CUDA-core kernel: shared-memory tiling, FP32 FMA) so that
+// the harness can be exercised end to end; it is far from the tensor-core roofline.
+//   A: row-major [M, K], B: row-major [N, K], C: row-major [M, N], BF16 in / out, FP32 accumulation.
+#define TILE_M 64
+#define TILE_N 64
+#define TILE_K 16
+
+__global__ void baseline_bf16_gemm_kernel(const __nv_bfloat16 *A, const __nv_bfloat16 *B,
+                                          __nv_bfloat16 *C, int M, int N, int K) {
+  __shared__ float As[TILE_K][TILE_M + 4];
+  __shared__ float Bs[TILE_K][TILE_N + 4];
+  int tid = threadIdx.x;               // 256 threads
+  int tx = tid % 16, ty = tid / 16;
+  int row0 = blockIdx.y * TILE_M, col0 = blockIdx.x * TILE_N;
+  float acc[4][4] = {};
+  for (int k0 = 0; k0 < K; k0 += TILE_K) {
+    for (int e = 0; e < 4; ++e) {
+      int idx = tid + e * 256;
+      int r = idx / TILE_K, kk = idx % TILE_K;
+      int gk = k0 + kk;
+      As[kk][r] = (row0 + r < M && gk < K) ? __bfloat162float(A[size_t(row0 + r) * K + gk]) : 0.f;
+      Bs[kk][r] = (col0 + r < N && gk < K) ? __bfloat162float(B[size_t(col0 + r) * K + gk]) : 0.f;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < TILE_K; ++kk) {
+      float a[4], b[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) { a[i] = As[kk][ty + 16 * i]; b[i] = Bs[kk][tx + 16 * i]; }
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] += a[i] * b[j];
+    }
+    __syncthreads();
+  }
+  for (int i = 0; i < 4; ++i)
+    for (int j = 0; j < 4; ++j) {
+      int r = row0 + ty + 16 * i, c = col0 + tx + 16 * j;
+      if (r < M && c < N) C[size_t(r) * N + c] = __float2bfloat16(acc[i][j]);
     }
 }
 
 void Bf16Gemm(__nv_bfloat16 *A, __nv_bfloat16 *B, __nv_bfloat16 *C, int M, int N, int K) {
-    dim3 block(16, 16);
-    dim3 grid((N + 15) / 16, (M + 15) / 16);
-    naive_bf16_gemm_kernel<<<grid, block>>>(A, B, C, M, N, K);
+  dim3 grid((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M);
+  baseline_bf16_gemm_kernel<<<grid, 256>>>(A, B, C, M, N, K);
 }

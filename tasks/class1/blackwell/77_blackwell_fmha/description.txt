@@ -1,177 +1,103 @@
 # Task: 77_blackwell_fmha
 
 ## Target Hardware
-NVIDIA Blackwell GPU (SM100/SM120).
+NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a` and is skipped on other GPUs.
 
+Fused multi-head attention forward pass (prefill) with grouped-query attention (GQA), optional causal mask, and a log-sum-exp (LSE) output, compared against cuDNN's scaled-dot-product attention (the attention kernel that PyTorch SDPA, TensorRT-LLM and vLLM call on Blackwell), driven through the cudnn-frontend graph API.
 
-Blackwell SM100 Fused Multi-Head Attention test harness — half precision
-Based on CUTLASS example 77_blackwell_fmha
-The LLM must implement:
-  cudaError_t BlackwellFmha(int batch, int num_heads, int seq_q, int seq_k,
-      int head_dim, __half const *Q, __half const *K, __half const *V,
-      __half *O);
-Q: [batch, num_heads, seq_q, head_dim] row-major
-K: [batch, num_heads, seq_k, head_dim] row-major
-V: [batch, num_heads, seq_k, head_dim] row-major
-O: [batch, num_heads, seq_q, head_dim] row-major
-O = softmax(Q * K^T / sqrt(head_dim)) * V
-Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
-         -gencode arch=compute_100a,code=sm_100a harness.cu solution.cu -o test
+## Function Signature
 
----
-## Test Harness (harness.cu)
-
-Your solution will be compiled and linked with this test harness.
-Study it to understand the exact function signature, data types, and verification logic.
+Implement BOTH overloads in `solution.h` (one per dtype; they may share a template):
 
 ```cuda
-/*
- * Blackwell SM100 Fused Multi-Head Attention test harness — half precision
- * Based on CUTLASS example 77_blackwell_fmha
- *
- * The LLM must implement:
- *   cudaError_t BlackwellFmha(int batch, int num_heads, int seq_q, int seq_k,
- *       int head_dim, __half const *Q, __half const *K, __half const *V,
- *       __half *O);
- *
- * Q: [batch, num_heads, seq_q, head_dim] row-major
- * K: [batch, num_heads, seq_k, head_dim] row-major
- * V: [batch, num_heads, seq_k, head_dim] row-major
- * O: [batch, num_heads, seq_q, head_dim] row-major
- *
- * O = softmax(Q * K^T / sqrt(head_dim)) * V
- *
- * Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
- *          -gencode arch=compute_100a,code=sm_100a harness.cu solution.cu -o test
- */
-
+#pragma once
+#include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <iostream>
-#include <vector>
-#include <cmath>
-#include "../../include/kh_benchmark.h"
+#include <cuda_bf16.h>
 
-#define CUDA_CHECK(status)                                              \
-  {                                                                     \
-    cudaError_t error = status;                                         \
-    if (error != cudaSuccess) {                                         \
-      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
-                << " at line: " << __LINE__ << std::endl;               \
-      exit(EXIT_FAILURE);                                               \
-    }                                                                   \
-  }
+cudaError_t BlackwellFmha(
+    int batch, int num_q_heads, int num_kv_heads, int seq_q, int seq_k, int head_dim,
+    bool causal,
+    __half const *Q, __half const *K, __half const *V,
+    __half *O, float *LSE);
 
-extern cudaError_t BlackwellFmha(
-  int batch, int num_heads, int seq_q, int seq_k, int head_dim,
-  __half const *Q, __half const *K, __half const *V, __half *O);
-
-/// CPU reference: standard multi-head attention per head
-void reference_fmha(
-  int batch, int num_heads, int seq_q, int seq_k, int head_dim,
-  std::vector<float> const &Q, std::vector<float> const &K,
-  std::vector<float> const &V, std::vector<float> &O) {
-  float scale = 1.0f / sqrtf((float)head_dim);
-  int q_head_stride = seq_q * head_dim;
-  int k_head_stride = seq_k * head_dim;
-  int q_batch_stride = num_heads * q_head_stride;
-  int k_batch_stride = num_heads * k_head_stride;
-
-  for (int b = 0; b < batch; ++b)
-    for (int h = 0; h < num_heads; ++h) {
-      int q_base = b * q_batch_stride + h * q_head_stride;
-      int k_base = b * k_batch_stride + h * k_head_stride;
-      // S = Q * K^T  [seq_q x seq_k]
-      std::vector<float> S(seq_q * seq_k, 0);
-      for (int i = 0; i < seq_q; ++i)
-        for (int j = 0; j < seq_k; ++j) {
-          float dot = 0;
-          for (int d = 0; d < head_dim; ++d)
-            dot += Q[q_base + i * head_dim + d] * K[k_base + j * head_dim + d];
-          S[i * seq_k + j] = dot * scale;
-        }
-      // Softmax per row
-      for (int i = 0; i < seq_q; ++i) {
-        float max_val = -1e30f;
-        for (int j = 0; j < seq_k; ++j)
-          max_val = fmaxf(max_val, S[i * seq_k + j]);
-        float sum = 0;
-        for (int j = 0; j < seq_k; ++j) {
-          S[i * seq_k + j] = expf(S[i * seq_k + j] - max_val);
-          sum += S[i * seq_k + j];
-        }
-        for (int j = 0; j < seq_k; ++j)
-          S[i * seq_k + j] /= sum;
-      }
-      // O = S * V  [seq_q x head_dim]
-      for (int i = 0; i < seq_q; ++i)
-        for (int d = 0; d < head_dim; ++d) {
-          float acc = 0;
-          for (int j = 0; j < seq_k; ++j)
-            acc += S[i * seq_k + j] * V[k_base + j * head_dim + d];
-          O[q_base + i * head_dim + d] = acc;
-        }
-    }
-}
-
-int main() {
-  int batch = 2, num_heads = 4, seq_q = 64, seq_k = 64, head_dim = 32;
-  int total_q = batch * num_heads * seq_q * head_dim;
-  int total_k = batch * num_heads * seq_k * head_dim;
-
-  std::vector<float> fQ(total_q), fK(total_k), fV(total_k);
-  std::vector<float> fO(total_q, 0), fRef(total_q, 0);
-
-  for (int i = 0; i < total_q; ++i) fQ[i] = float((i * 16807 % 16) - 8) * 0.05f;
-  for (int i = 0; i < total_k; ++i) fK[i] = float((i * 48271 % 16) - 8) * 0.05f;
-  for (int i = 0; i < total_k; ++i) fV[i] = float((i * 12345 % 16) - 8) * 0.05f;
-
-  std::vector<__half> hQ(total_q), hK(total_k), hV(total_k), hO(total_q);
-  for (int i = 0; i < total_q; ++i) hQ[i] = __float2half(fQ[i]);
-  for (int i = 0; i < total_k; ++i) hK[i] = __float2half(fK[i]);
-  for (int i = 0; i < total_k; ++i) hV[i] = __float2half(fV[i]);
-
-  __half *dQ, *dK, *dV, *dO;
-  CUDA_CHECK(cudaMalloc(&dQ, total_q * sizeof(__half)));
-  CUDA_CHECK(cudaMalloc(&dK, total_k * sizeof(__half)));
-  CUDA_CHECK(cudaMalloc(&dV, total_k * sizeof(__half)));
-  CUDA_CHECK(cudaMalloc(&dO, total_q * sizeof(__half)));
-  CUDA_CHECK(cudaMemcpy(dQ, hQ.data(), total_q * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dK, hK.data(), total_k * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dV, hV.data(), total_k * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemset(dO, 0, total_q * sizeof(__half)));
-
-  cudaError_t r = BlackwellFmha(batch, num_heads, seq_q, seq_k, head_dim, dQ, dK, dV, dO);
-  if (r != cudaSuccess) {
-    std::cerr << "BlackwellFmha failed: " << cudaGetErrorString(r) << std::endl;
-    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
-    return -1;
-  }
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  // Benchmark (triggered by KH_BENCHMARK=N env var)
-  {
-    int _kh_trials = kh_benchmark_trials();
-    if (_kh_trials > 0 && r == cudaSuccess) {
-      kh_benchmark([&]() { BlackwellFmha(batch, num_heads, seq_q, seq_k, head_dim, dQ, dK, dV, dO); }, _kh_trials);
-    }
-  }
-
-
-  CUDA_CHECK(cudaMemcpy(hO.data(), dO, total_q * sizeof(__half), cudaMemcpyDeviceToHost));
-  cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
-
-  for (int i = 0; i < total_q; ++i) fO[i] = __half2float(hO[i]);
-  reference_fmha(batch, num_heads, seq_q, seq_k, head_dim, fQ, fK, fV, fRef);
-
-  float max_diff = 0;
-  for (int i = 0; i < total_q; ++i)
-    max_diff = fmaxf(max_diff, fabsf(fO[i] - fRef[i]));
-  // Half precision attention: moderate tolerance
-  if (max_diff > 0.05f) {
-    std::cerr << "Results incorrect. Max diff: " << max_diff << std::endl;
-    return -1;
-  }
-  std::cout << "Passed." << std::endl;
-  return 0;
-}
+cudaError_t BlackwellFmha(
+    int batch, int num_q_heads, int num_kv_heads, int seq_q, int seq_k, int head_dim,
+    bool causal,
+    __nv_bfloat16 const *Q, __nv_bfloat16 const *K, __nv_bfloat16 const *V,
+    __nv_bfloat16 *O, float *LSE);
 ```
+
+## Operation
+
+For every batch b and query head h, with kv(h) = h / (num_q_heads / num_kv_heads) (consecutive query heads share a KV head) and scale = 1 / sqrt(head_dim):
+
+    S[i, j]   = scale * dot(Q[b, i, h, :], K[b, j, kv(h), :])       (i < seq_q, j < seq_k)
+    S[i, j]   = -inf for j > i when causal                           (causal tests have seq_q == seq_k)
+    P[i, :]   = softmax(S[i, :])
+    O[b, i, h, :]  = sum_j P[i, j] * V[b, j, kv(h), :]
+    LSE[b, h, i]   = log(sum_j exp(S[i, j]))                         (natural log, FP32)
+
+## Data Types and Precision
+
+Q, K, V, O are FP16 or BF16 (per overload). LSE is FP32. Both GEMMs (Q K^T and P V) must be accumulated in FP32 and the softmax must be computed in FP32 (the probabilities may be rounded to the 16-bit input type before the P V product, as flash-attention kernels do). Lower-precision arithmetic (FP8, FP6, FP4, INT8 operands, FP16 accumulation, including tensor-core paths that use them) is not allowed even if it passed the tolerance.
+
+## Memory Layout (all row-major, contiguous, 256-byte aligned device pointers)
+
+- Q, O: `[batch, seq_q, num_q_heads, head_dim]`, element (b, i, h, d) at `((b * seq_q + i) * num_q_heads + h) * head_dim + d`.
+- K, V: `[batch, seq_k, num_kv_heads, head_dim]`, element (b, j, g, d) at `((b * seq_k + j) * num_kv_heads + g) * head_dim + d`.
+- LSE: `[batch, num_q_heads, seq_q]` FP32, element (b, h, i) at `(b * num_q_heads + h) * seq_q + i`.
+
+`head_dim` is 128 in all tests. O and LSE hold NaN on entry; every element must be written.
+
+## Build & Test
+
+```bash
+make test        # requires solution.h in the task directory
+./test           # runs every case below
+./test B Hq Hkv S causal(0|1) dtype(0=fp16, 1=bf16)    # one custom case (head_dim 128)
+```
+
+`make ref` builds the cuDNN reference alone. Build / run dependencies of the reference: cudnn-frontend headers (vendored in `reference_sources/cudnn_frontend`, found through `CUDNN_FE_DIR`, default `$CUTLASS_DIR/../cudnn_frontend`), cuDNN 9 (`cudnn.h` + `libcudnn.so.9`, found through `CUDNN_DIR`, default the `nvidia-cudnn-cu13` pip wheel of the active Python), `libnvrtc` and the CUDA driver.
+
+## Problem Sizes
+
+Llama-3-70B and Qwen3-32B share the attention geometry (64 query heads, 8 KV heads, head_dim 128); Llama-3-8B has 32 query heads. One sequence per call, prefill chunks of 8K / 16K tokens.
+
+| label                    | batch | q heads | kv heads | seq   | causal | dtype |
+|--------------------------|-------|---------|----------|-------|--------|-------|
+| prefill_8k_causal_bf16   | 1     | 64      | 8        | 8192  | yes    | BF16  |
+| prefill_16k_causal_bf16  | 1     | 64      | 8        | 16384 | yes    | BF16  |
+| prefill_8k_full_bf16     | 1     | 64      | 8        | 8192  | no     | BF16  |
+| prefill_8k_causal_fp16   | 1     | 64      | 8        | 8192  | yes    | FP16  |
+| llama8b_8k_causal_bf16   | 1     | 32      | 8        | 8192  | yes    | BF16  |
+
+Inputs are full-mantissa uniform random values: K, V in [-1, 1), Q in [-8, 8) so that the attention distribution is peaked (logit standard deviation about 2.7); skipping a key block, a wrong mask or a wrong KV head therefore changes the output visibly.
+
+## Correctness
+
+The cuDNN reference and your function read the same inputs and write to separate O / LSE buffers that are pre-filled with NaN. After your function returns, **every** element of O and of LSE is compared with the reference:
+
+- every element must be finite (NaN / Inf fail, so unwritten elements fail);
+- `|x - ref| <= max_rms * RMS(ref) + rel * |ref|` for every element, and the relative Frobenius error `||x - ref|| / ||ref|| <= fro`.
+
+| quantity   | max_rms | rel    | fro  |
+|------------|---------|--------|------|
+| O, BF16    | 6e-2    | 2.4e-2 | 7.5e-3 |
+| O, FP16    | 1.2e-2  | 4.5e-3 | 1e-3 |
+| LSE (FP32) | 5e-5    | 5e-5   | 2e-5 |
+
+Calibration (measured on B200): an exact FP32 kernel with BF16 output differs from the reference by a Frobenius error of 2.4e-3 - 2.5e-3 (FP16 output: 3.0e-4; LSE: 5e-7 - 7e-7), so the bounds are 3x above a correct kernel (and a kernel that rounds P to 16 bits is just as close). They are below the error of every deliberately wrong variant we tried: P or V rounded to FP8 (1.4e-2 - 2.4e-2), BF16 accumulation of P V (1.9e-2 - 2.6e-2), Q/K in FP8 (7e-2), denominator off by 1% (1e-2), scale off by 0.5% (1.1e-2 - 1.5e-2), a skipped KV block (0.13 - 0.21), a causal mask off by one (7e-2 - 9e-2), no causal mask (0.85), wrong KV head mapping (1.3), LSE in the wrong base or offset by 2e-3, half of the rows unwritten. The check is repeated once more at the end on freshly regenerated inputs (new seed): the reference output is recomputed for them, your output is re-poisoned, and your function must produce the right answer for the new inputs.
+
+## Performance
+
+For each case the harness times the cuDNN reference and your function with CUDA events (the L2 cache is flushed before every trial; O and LSE are re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean of the speedups over the five cases. The cuDNN graph (engine selection, plan, workspace) is built once outside the timed region; only the execute call is timed. On B200 it runs at 1.42 - 1.53 PFLOPS (0.751 / 2.94 / 1.43 / 0.773 / 0.376 ms for the five cases), the same speed as PyTorch's cuDNN SDPA backend on these shapes and on par with FlashAttention-4 (CuTe DSL; 0.73 / 2.90 / 1.70 / 0.845 / 0.427 ms). A kernel that matches the best public Blackwell attention kernels therefore scores about 1.
+
+**The inputs change on every call.** Before every timed call of the reference and of your function (outside the timed region) the harness regenerates Q, K and V with a new seed; the first correctness check and the final re-check use their own seeds as well. Outputs and input-dependent intermediates must therefore be recomputed on every call; caching or memoising results across calls produces wrong answers and fails the final check.
+
+Your function is timed as a whole call, including host-side launch setup. One-time setup (e.g. `cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics.
+
+## Rules
+
+- Solutions must be your own kernels: no cuBLAS / cuDNN (the reference itself is cuDNN, so any use of cuDNN / cudnn-frontend is rejected), no CUTLASS device / kernel / collective templates. CuTe and low-level building blocks (barriers, pipelines, layouts, `tcgen05` PTX) are allowed.
+- seq_q == seq_k in every test; the causal mask is aligned to the top-left (key j visible to query i iff j <= i).

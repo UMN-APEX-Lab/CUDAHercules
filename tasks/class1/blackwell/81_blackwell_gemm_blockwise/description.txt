@@ -1,178 +1,125 @@
 # Task: 81_blackwell_gemm_blockwise
 
 ## Target Hardware
-NVIDIA Blackwell GPU (SM100/SM120).
+NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a` and is skipped on other GPUs.
 
+FP8 (E4M3) GEMM with block-wise scaling and BF16 output -- the DeepSeek-V3 style "FP8 blockwise" recipe used for FP8
+serving: activations are scaled per token and 128-wide K group ("1x128"), weights per 128x128 block. Compared against the
+CUTLASS Blackwell blockwise-scaled GEMM (example 81).
 
-Blackwell SM100 blockwise-scaled GEMM test harness — FP8 data, float scales
-Based on CUTLASS example 81_blackwell_gemm_blockwise
-The LLM must implement:
-  cudaError_t BlackwellBlockwiseGemm(int M, int N, int K, float alpha,
-      __nv_fp8_e4m3 const *A, int lda, float const *scale_A,
-      __nv_fp8_e4m3 const *B, int ldb, float const *scale_B,
-      float beta, __nv_fp8_e4m3 *D, int ldd, int block_size);
-A is row-major [M, K] (lda = K) in FP8 E4M3, B is column-major [K, N] (ldb = K) in FP8 E4M3,
-D is column-major [M, N] (ldd = M) in FP8 E4M3.
-scale_A: [M, ceil(K/block_size)] per-block scale factors for A rows.
-scale_B: [N, ceil(K/block_size)] per-block scale factors for B columns.
-block_size determines the granularity of scaling along the K dimension.
-Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
-         -gencode arch=compute_100a,code=sm_100a harness.cu solution.cu -o test
+## Function Signature
 
----
-## Test Harness (harness.cu)
-
-Your solution will be compiled and linked with this test harness.
-Study it to understand the exact function signature, data types, and verification logic.
+Implement the following function in `solution.h`:
 
 ```cuda
-/*
- * Blackwell SM100 blockwise-scaled GEMM test harness — FP8 data, float scales
- * Based on CUTLASS example 81_blackwell_gemm_blockwise
- *
- * The LLM must implement:
- *   cudaError_t BlackwellBlockwiseGemm(int M, int N, int K, float alpha,
- *       __nv_fp8_e4m3 const *A, int lda, float const *scale_A,
- *       __nv_fp8_e4m3 const *B, int ldb, float const *scale_B,
- *       float beta, __nv_fp8_e4m3 *D, int ldd, int block_size);
- *
- * A is row-major [M, K] (lda = K) in FP8 E4M3, B is column-major [K, N] (ldb = K) in FP8 E4M3,
- * D is column-major [M, N] (ldd = M) in FP8 E4M3.
- * scale_A: [M, ceil(K/block_size)] per-block scale factors for A rows.
- * scale_B: [N, ceil(K/block_size)] per-block scale factors for B columns.
- * block_size determines the granularity of scaling along the K dimension.
- *
- * Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
- *          -gencode arch=compute_100a,code=sm_100a harness.cu solution.cu -o test
- */
-
-#include <iostream>
-#include <sstream>
-#include <vector>
-#include <cmath>
+#pragma once
+#include <cuda_runtime.h>
 #include <cuda_fp8.h>
-#include "../../include/kh_benchmark.h"
+#include <cuda_bf16.h>
 
-#define CUDA_CHECK(status)                                              \
-  {                                                                     \
-    cudaError_t error = status;                                         \
-    if (error != cudaSuccess) {                                         \
-      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
-                << " at line: " << __LINE__ << std::endl;               \
-      exit(EXIT_FAILURE);                                               \
-    }                                                                   \
-  }
-
-extern cudaError_t BlackwellBlockwiseGemm(
-  int M, int N, int K, float alpha,
-  __nv_fp8_e4m3 const *A, int lda, float const *scale_A,
-  __nv_fp8_e4m3 const *B, int ldb, float const *scale_B,
-  float beta, __nv_fp8_e4m3 *D, int ldd,
-  int block_size);
-
-/// CPU reference: dequantize FP8 with block scales, then standard GEMM
-/// A row-major, B col-major, D col-major
-void reference(int M, int N, int K, float alpha,
-  std::vector<float> const &fA, int lda,
-  std::vector<float> const &sA,
-  std::vector<float> const &fB, int ldb,
-  std::vector<float> const &sB,
-  float beta,
-  std::vector<float> &D, int ldd,
-  int block_size) {
-  int k_blocks = (K + block_size - 1) / block_size;
-  for (int i = 0; i < M; ++i)
-    for (int j = 0; j < N; ++j) {
-      float acc = 0;
-      for (int k = 0; k < K; ++k) {
-        int kb = k / block_size;
-        float a_val = fA[i * lda + k] * sA[i * k_blocks + kb];
-        float b_val = fB[k + j * ldb] * sB[j * k_blocks + kb];
-        acc += a_val * b_val;
-      }
-      D[i + j * ldd] = alpha * acc + beta * D[i + j * ldd];
-    }
-}
-
-int main(int argc, const char *arg[]) {
-  int M = 256, N = 256, K = 256;
-  int block_size = 128;
-  for (int i = 1; i < argc && i < 4; ++i) {
-    std::stringstream ss(arg[i]);
-    if (i == 1) ss >> M;
-    else if (i == 2) ss >> N;
-    else if (i == 3) ss >> K;
-  }
-
-  int lda = K, ldb = K, ldd = M;
-  float alpha = 1.0f, beta = 0.0f;
-
-  int k_blocks = (K + block_size - 1) / block_size;
-  int sA_count = M * k_blocks;
-  int sB_count = N * k_blocks;
-
-  // Generate FP8 inputs on host
-  std::vector<float> fA_raw(M * K), fB_raw(K * N);
-  for (int i = 0; i < M * K; ++i) fA_raw[i] = float((i * 16807 % 8) - 4) * 0.25f;
-  for (int i = 0; i < K * N; ++i) fB_raw[i] = float((i * 48271 % 8) - 4) * 0.25f;
-
-  std::vector<__nv_fp8_e4m3> hA(M * K), hB(K * N);
-  std::vector<float> fA(M * K), fB(K * N);
-  for (int i = 0; i < M * K; ++i) { hA[i] = __nv_fp8_e4m3(fA_raw[i]); fA[i] = float(hA[i]); }
-  for (int i = 0; i < K * N; ++i) { hB[i] = __nv_fp8_e4m3(fB_raw[i]); fB[i] = float(hB[i]); }
-
-  std::vector<float> sA(sA_count, 1.0f), sB(sB_count, 1.0f);
-
-  __nv_fp8_e4m3 *dA, *dB, *dD;
-  float *dsA, *dsB;
-  CUDA_CHECK(cudaMalloc(&dA, M * K * sizeof(__nv_fp8_e4m3)));
-  CUDA_CHECK(cudaMalloc(&dB, K * N * sizeof(__nv_fp8_e4m3)));
-  CUDA_CHECK(cudaMalloc(&dD, M * N * sizeof(__nv_fp8_e4m3)));
-  CUDA_CHECK(cudaMalloc(&dsA, sA_count * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&dsB, sB_count * sizeof(float)));
-
-  CUDA_CHECK(cudaMemcpy(dA, hA.data(), M * K * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dB, hB.data(), K * N * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dsA, sA.data(), sA_count * sizeof(float), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dsB, sB.data(), sB_count * sizeof(float), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemset(dD, 0, M * N * sizeof(__nv_fp8_e4m3)));
-
-  cudaError_t r = BlackwellBlockwiseGemm(
-    M, N, K, alpha, dA, lda, dsA, dB, ldb, dsB, beta, dD, ldd, block_size);
-  if (r != cudaSuccess) {
-    std::cerr << "BlackwellBlockwiseGemm failed: " << cudaGetErrorString(r) << std::endl;
-    cudaFree(dA); cudaFree(dB); cudaFree(dD); cudaFree(dsA); cudaFree(dsB);
-    return -1;
-  }
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  // Benchmark (triggered by KH_BENCHMARK=N env var)
-  {
-    int _kh_trials = kh_benchmark_trials();
-    if (_kh_trials > 0 && r == cudaSuccess) {
-      kh_benchmark([&]() { BlackwellBlockwiseGemm(
-    M, N, K, alpha, dA, lda, dsA, dB, ldb, dsB, beta, dD, ldd, block_size); }, _kh_trials);
-    }
-  }
-
-
-  std::vector<__nv_fp8_e4m3> hD(M * N);
-  CUDA_CHECK(cudaMemcpy(hD.data(), dD, M * N * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost));
-  cudaFree(dA); cudaFree(dB); cudaFree(dD); cudaFree(dsA); cudaFree(dsB);
-
-  std::vector<float> fD(M * N), fRef(M * N, 0);
-  for (int i = 0; i < M * N; ++i) fD[i] = float(hD[i]);
-  reference(M, N, K, alpha, fA, lda, sA, fB, ldb, sB, beta, fRef, ldd, block_size);
-
-  float max_diff = 0;
-  for (int i = 0; i < M * N; ++i)
-    max_diff = fmaxf(max_diff, fabsf(fD[i] - fRef[i]));
-  // FP8 blockwise scaling: generous tolerance due to narrow precision
-  if (max_diff > 16.0f) {
-    std::cerr << "Results incorrect. Max diff: " << max_diff << std::endl;
-    return -1;
-  }
-  std::cout << "Passed." << std::endl;
-  return 0;
-}
+cudaError_t BlackwellBlockwiseGemm(
+    int M, int N, int K,
+    __nv_fp8_e4m3 const *A, float const *SFA,   // activations [M, K] + per-(row, 128-K-block) scales
+    __nv_fp8_e4m3 const *B, float const *SFB,   // weights     [N, K] + per-(128 N x 128 K block) scales
+    __nv_bfloat16 *D);                          // output [M, N]
 ```
+
+## Operation
+
+With `KB = K / 128` scale blocks along K and `NB = ceil(N / 128)` scale blocks along N:
+
+    D[m, n] = bf16( sum_{kb = 0}^{KB-1}  SFA[kb, m] * SFB[kb, n / 128] * ( sum_{k = 128*kb}^{128*kb + 127}  A[m, k] * B[n, k] ) )
+
+i.e. each 128-wide K block is multiplied in FP8 with FP32 accumulation, the partial sum is promoted to FP32, multiplied by
+the product of the two scales and added to the FP32 accumulator. D is the FP32 accumulator rounded to BF16
+(round-to-nearest-even).
+
+## Data Types and Precision
+
+A, B: FP8 E4M3. Scales: FP32. Accumulation and scaling: FP32. Output: BF16. Lower-precision arithmetic (FP4 / FP6 / E5M2
+inputs, INT8, FP16 or BF16 accumulation, rounding scales, tensor-core kinds that cannot carry FP32 scales such as
+`mxf8f6f4`) is not allowed even if it were to pass the tolerance. Accumulating the partial sums of all K blocks without
+the per-block promotion (or ignoring either scale) gives wrong results.
+
+## Memory Layouts (exact)
+
+`K` is a multiple of 128 and `N` a multiple of 128 for every tested shape; `M` is a multiple of 4 (tested: 16, 128, 200, 8192).
+All pointers are device pointers, 256-byte aligned.
+
+- `A`: FP8 E4M3 `[M][K]`, row-major, `lda = K`. Element (m, k) at `A[m * K + k]`.
+- `B`: FP8 E4M3 `[N][K]`, K-contiguous (equivalently the column-major [K, N] matrix). Element (k, n) at `B[n * K + k]`.
+- `SFA`: FP32 `[KB][M]`, **M contiguous**: the scale of row m and K block kb is `SFA[kb * M + m]` (1x128 granularity).
+- `SFB`: FP32 `[KB][NB]`, **N-block contiguous**: the scale of the 128x128 block (n / 128, kb) is `SFB[kb * NB + n / 128]`.
+- `D`: BF16 `[M][N]`, row-major (`ldd = N`). It holds NaN on entry; every element must be written.
+
+(These are the CUTLASS `Sm100BlockwiseScaleConfig<1, 128, 128>` layouts, MN-major scale tensors.)
+
+## Build & Test
+
+```bash
+make test                    # requires solution.h in the task directory
+./test                       # runs every benchmark shape below (plus two correctness-only cases)
+./test 8192 8192 8192        # one custom shape: M N K  (K multiple of 128)
+```
+
+`make ref` builds the CUTLASS reference alone (`KH_VALIDATE_REF=1 ./ref` re-validates it against an independent kernel that
+applies the layouts above by hand; `make sweep` times all reference configurations).
+
+## Problem Sizes
+
+The linear layers of Llama-3-70B served in FP8 on one B200 (hidden 8192, 64 query / 8 KV heads of dimension 128 -> fused
+QKV 10240, FFN 28672 -> fused gate+up 57344, vocabulary 128256). A is the activation matrix (M = tokens), B the quantized
+weight (N = output features): either an 8K-token prefill chunk or one decode step of 128 sequences.
+
+| label            | M    | N      | K     | layer                        |
+|------------------|------|--------|-------|------------------------------|
+| decode_mlp_up    | 128  | 57344  | 8192  | fused gate+up projection     |
+| decode_mlp_down  | 128  | 8192   | 28672 | FFN down projection          |
+| decode_lm_head   | 128  | 128256 | 8192  | LM head                      |
+| prefill_qkv      | 8192 | 10240  | 8192  | fused QKV projection         |
+| prefill_o_proj   | 8192 | 8192   | 8192  | attention output projection  |
+| prefill_mlp_up   | 8192 | 57344  | 8192  | fused gate+up projection     |
+| prefill_mlp_down | 8192 | 8192   | 28672 | FFN down projection          |
+
+Two extra correctness-only cases (not timed): (M=200, N=1152, K=1408) and (M=16, N=2048, K=4096) check M that is not a
+multiple of the tile and tiny M. Data: FP8 values uniform in [-1, 1) rounded to E4M3 (full mantissas); scales are random
+positive FP32 values, log-uniform in [0.25, 4) with full mantissas (never all 1.0, never 0 or negative).
+
+## Correctness
+
+The CUTLASS reference and your solution write to separate buffers that are pre-filled with NaN. After your function
+returns, **every** element of D is compared (on the device) with the reference output:
+
+- every element must be finite (NaN / Inf fail, so unwritten elements fail);
+- `|D - ref| <= 1e-3 * RMS(ref) + 0.03125 * |ref|` for every element (one BF16 ulp is up to 0.0078 |ref|);
+- the relative Frobenius error `||D - ref|| / ||ref||` must be `<= 3e-4`.
+
+FP8 products and the per-block partial sums are exact in FP32, so a sequential FP32 implementation with the same block
+promotion is bit-identical to the reference, and a correct variant with a different summation order (reverse K order,
+promotion every 32 K, different scale association) measures a relative Frobenius error of 8e-7 to 5.3e-5 (3e-4 is >= 5.7x
+above). Deliberately wrong variants measure: FP16 accumulation 1.6e-3 to 3.2e-3, BF16 accumulation 4.6e-3 to 1.8e-2, last 128 K
+skipped 6e-2 to 0.26, inputs rounded to E5M2 8.2e-2, FP4 inputs 0.40, B scales per column instead of per 128x128 block 0.60,
+A scales ignored 0.64, B scales ignored 0.64, A scales read K-major 0.85: all fail on every shape. The check is repeated after the timing loop on a fresh input (see below).
+
+**Inputs change on every call.** Before every timed call of both the reference and your function the harness regenerates the activation matrix A and its scales SFA (the weights B / SFB stay fixed) with a new random seed (outside the timed region), the first correctness check and the final re-check use their own seeds, and in the final re-check the reference output is recomputed for the new input before your function is called on a freshly poisoned D. Outputs and any input-dependent intermediates must therefore be recomputed on every call; caching them across calls (memoisation) fails the re-check. Only data derived from the fixed operands may be cached.
+
+## Performance
+
+For each shape the harness times the CUTLASS reference and your function with CUDA events (L2 flushed before every trial,
+D re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The
+score is the geometric mean of the speedups over the seven shapes. The reference uses a tile / cluster configuration tuned
+per shape (prefill: 256x128 2-SM tile, cluster 2x1, rasterization swizzle 8; decode: 128x128 tile, cluster 1x2). It reaches 1.7-1.8 PFLOPS on the prefill shapes: 52-60% of cuBLAS tensor-wise-scaled FP8 GEMM (3.0-3.3 PFLOPS) and 67-75% of
+cuBLAS row-wise-scaled FP8 GEMM on the same shapes (neither does per-block promotion of the accumulator), and 108% / 84% / 114% of
+cuBLAS tensor-wise on the decode shapes (mlp_up / mlp_down / lm_head). cuBLAS (via `torch` `F.scaled_mm`) has no blockwise FP8 path
+on SM100, so there is no like-for-like library yardstick; the blockwise reference is roughly half of the dense-FP8 peak
+because the per-128-K promotion runs on CUDA cores.
+
+Your function is timed as a whole call, including any host-side launch setup. One-time setup (e.g.
+`cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics.
+
+## Rules
+
+- Solutions must be your own kernels: no cuBLAS / cuDNN, and no CUTLASS device / kernel / collective GEMM templates.
+  CuTe and low-level building blocks (barriers, pipelines, layouts, `tcgen05` PTX) are allowed.
+- The shipped `solution.h` is a deliberately simple FP32-FMA SIMT kernel; it exists to validate the harness. A real solution
+  is expected to use `tcgen05.mma` (FP8) with per-128-K-block promotion of the accumulator to FP32.

@@ -1,0 +1,757 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#pragma once
+
+#include <algorithm>
+#include <iterator>
+#include <array>
+#include <functional>
+#include <memory>
+#include <sstream>
+#include <utility>
+
+#include "cudnn_frontend_EngineConfig.h"
+#include "cudnn_frontend_Engine.h"
+#include "cudnn_frontend_utils.h"
+#include "cudnn_frontend/backend/kernel_cache.h"
+#include "cudnn_frontend/backend/device_properties.h"
+#include "cudnn_frontend/utils/cuda_graph_retention.h"
+
+namespace cudnn_frontend {
+///
+/// ExecutionPlan_v8 Class
+/// This class tells the Configuration of the Engine in terms of the knob
+/// choices
+/// Properties:
+///    - num knobs
+///    - Choice
+///    - Engine
+///
+/// Use ExecutionPlanBuilder_v8 to build this class.
+/// Describe returns a string describing the tensor class
+///
+class ExecutionPlan_v8 : public BackendDescriptor {
+   public:
+    friend class ExecutionPlanBuilder_v8;
+
+    ExecutionPlan_v8(ExecutionPlan_v8 &&from) = default;
+    ExecutionPlan_v8 &
+    operator=(ExecutionPlan_v8 &&) = default;
+
+    ~ExecutionPlan_v8() = default;
+    /** @defgroup ExecutionPlanQuery
+     *  Query individual property of ExecutionPlan_v8 class
+     *  @{
+     */
+    //! Query the workspace requirement for the given plan
+    auto
+    getWorkspaceSize(void) const -> int64_t {
+        return workSpaceSize;
+    }
+
+    std::string
+    describe() const override {
+        std::stringstream ss;
+        ss << "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR : ";
+        ss << getTag() << ", ";
+        ss << "numeric_notes:" << "[";
+        for (auto note : numeric_notes_vec) {
+            ss << cudnn_frontend::to_string(note) << ",";
+        }
+        ss << "] behavior_notes:" << "[";
+        for (auto note : behavior_notes_vec) {
+            ss << cudnn_frontend::to_string(note) << ",";
+        }
+        ss << "] workSpaceSize: " << workSpaceSize;
+        return ss.str();
+    }
+
+    std::string const &
+    getTag() const {
+        return planTag;
+    }
+
+    void
+    setExecutionTime(float time_) {
+        execution_time_ms = time_;
+    }
+
+    float
+    getExecutionTime() const {
+        return execution_time_ms;
+    }
+
+    std::vector<cudnnBackendNumericalNote_t> const &
+    getAllNumericNotes() const {
+        return numeric_notes_vec;
+    }
+
+    std::array<cudnnBackendNumericalNote_t, CUDNN_NUMERICAL_NOTE_TYPE_COUNT> const &
+    getNumericNotes() const {
+        return numeric_notes;
+    }
+
+    std::array<cudnnBackendBehaviorNote_t, CUDNN_BEHAVIOR_NOTE_TYPE_COUNT> const &
+    getBehaviorNotes() const {
+        return behavior_notes;
+    }
+    std::vector<cudnnBackendBehaviorNote_t> const &
+    getAllBehaviorNotes() const {
+        return behavior_notes_vec;
+    }
+
+    std::string
+    getJsonRepresentation() const {
+        auto status = CUDNN_STATUS_SUCCESS;
+        int64_t serializationSize;
+        std::vector<char> serialization_buf;
+        status = detail::get_attribute(pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION,
+                                       CUDNN_TYPE_CHAR,
+                                       0,
+                                       &serializationSize,
+                                       nullptr);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION Failed");
+        }
+        serialization_buf.resize(static_cast<size_t>(serializationSize));
+        status = detail::get_attribute(pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION,
+                                       CUDNN_TYPE_CHAR,
+                                       serializationSize,
+                                       &serializationSize,
+                                       serialization_buf.data());
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION Failed");
+        }
+        std::string json_string(serialization_buf.begin(), serialization_buf.end());
+        return json_string;
+    }
+
+    ExecutionPlan_v8(ExecutionPlan_v8 const &) = default;
+    ExecutionPlan_v8 &
+    operator=(ExecutionPlan_v8 const &) = default;
+
+    //! Make `graph` keep this plan's backend descriptor alive for as long as the graph, its
+    //! clones and graphExecs exist. A graph recorded from this plan keeps launching its kernels,
+    //! and cuDNN releases runtime-compiled kernel code with the plan.
+    cudaError_t
+    retain_on_cuda_graph(cudaGraph_t graph) const {
+        if (!needs_cuda_graph_retention()) {
+            return cudaSuccess;
+        }
+        return cuda_graph_retention.retain_on_graph(graph, [this] { return make_graph_retention_payload(); });
+    }
+
+    //! Same as retain_on_cuda_graph() for the graph `stream` is capturing into, if any.
+    cudaError_t
+    retain_on_capturing_stream(cudaStream_t stream) const {
+        if (!needs_cuda_graph_retention()) {
+            return cudaSuccess;
+        }
+        return cuda_graph_retention.retain_on_capturing_stream(stream,
+                                                               [this] { return make_graph_retention_payload(); });
+    }
+
+    //! Whether a CUDA graph recorded from this plan has to keep the plan alive: true for engines that
+    //! compile their kernels at runtime (CUDNN_BEHAVIOR_NOTE_RUNTIME_COMPILATION), whose code is
+    //! released with the plan. Precompiled kernels are part of the cuDNN library, so recording those
+    //! costs no retention (and no capture-status query per execute). Defaults to true until the
+    //! engine's behavior notes are known.
+    bool
+    needs_cuda_graph_retention() const {
+        return runtime_compiled && retain_for_cuda_graphs;
+    }
+
+   private:
+    // What a recorded CUDA graph has to keep alive is the plan's backend descriptor: it owns
+    // the engine and the loaded kernel code. The kernel cache the plan was built with is only
+    // consulted while the plan is finalized, so it is deliberately not retained.
+    std::shared_ptr<void>
+    make_graph_retention_payload() const {
+        return pointer;
+    }
+
+    void
+    fetchNotes(ManagedOpaqueDescriptor &extractedEngine) {
+        auto status                               = CUDNN_STATUS_SUCCESS;
+        int64_t elem_count                        = 0;
+        cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
+        status                                    = detail::get_attribute(extractedEngine_,
+                                       CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
+                                       CUDNN_TYPE_NUMERICAL_NOTE,
+                                       CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
+                                       &elem_count,
+                                       nullptr);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINE_NUMERICAL_NOTE Failed");
+            return;
+        }
+        numeric_notes_vec.resize(static_cast<size_t>(elem_count));
+        status = detail::get_attribute(extractedEngine_,
+                                       CUDNN_ATTR_ENGINE_NUMERICAL_NOTE,
+                                       CUDNN_TYPE_NUMERICAL_NOTE,
+                                       CUDNN_NUMERICAL_NOTE_TYPE_COUNT,
+                                       &elem_count,
+                                       numeric_notes_vec.data());
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINE_NUMERICAL_NOTE Failed");
+            return;
+        }
+        ptrdiff_t end =
+            static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_NUMERICAL_NOTE_TYPE_COUNT)));
+        std::copy(numeric_notes_vec.begin(), numeric_notes_vec.begin() + end, numeric_notes.begin());
+        if (static_cast<size_t>(elem_count) < numeric_notes.size())
+            std::fill_n(numeric_notes.begin() + static_cast<size_t>(elem_count),
+                        numeric_notes.size() - static_cast<size_t>(elem_count),
+                        CUDNN_NUMERICAL_NOTE_TYPE_COUNT);
+        status = detail::get_attribute(extractedEngine_,
+                                       CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
+                                       CUDNN_TYPE_BEHAVIOR_NOTE,
+                                       CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
+                                       &elem_count,
+                                       nullptr);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE Failed");
+            return;
+        }
+        behavior_notes_vec.resize(static_cast<size_t>(elem_count));
+        status = detail::get_attribute(extractedEngine_,
+                                       CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE,
+                                       CUDNN_TYPE_BEHAVIOR_NOTE,
+                                       CUDNN_BEHAVIOR_NOTE_TYPE_COUNT,
+                                       &elem_count,
+                                       behavior_notes_vec.data());
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINE_BEHAVIOR_NOTE Failed");
+            return;
+        }
+        end = static_cast<ptrdiff_t>(std::min(elem_count, static_cast<int64_t>(CUDNN_BEHAVIOR_NOTE_TYPE_COUNT)));
+        std::copy(behavior_notes_vec.begin(), behavior_notes_vec.begin() + end, behavior_notes.begin());
+        runtime_compiled = status != CUDNN_STATUS_SUCCESS ||
+                           std::find(behavior_notes_vec.begin(),
+                                     behavior_notes_vec.begin() + end,
+                                     CUDNN_BEHAVIOR_NOTE_RUNTIME_COMPILATION) != behavior_notes_vec.begin() + end;
+        if (static_cast<size_t>(elem_count) < behavior_notes.size())
+            std::fill_n(behavior_notes.begin() + static_cast<size_t>(elem_count),
+                        behavior_notes.size() - static_cast<size_t>(elem_count),
+                        CUDNN_BEHAVIOR_NOTE_TYPE_COUNT);
+    }
+
+    void
+    buildTag(ManagedOpaqueDescriptor &extractedEngine) {
+        // Compute a unique tag for execution plan:
+        auto status = CUDNN_STATUS_SUCCESS;
+        std::stringstream tag{""};
+        int64_t elemCount = 0, engineId = 0, numKnobs = 0;
+
+        std::array<ManagedOpaqueDescriptor, CUDNN_KNOB_TYPE_COUNTS> extractedKnobs{{nullptr}};
+        for (auto &knob : extractedKnobs) {
+            knob   = make_shared_backend_pointer(CUDNN_BACKEND_KNOB_CHOICE_DESCRIPTOR);
+            status = knob->get_status();
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    this, status, "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnCreate Failed when compute tag");
+            }
+        }
+
+        cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
+        std::array<cudnnBackendDescriptor_t, CUDNN_KNOB_TYPE_COUNTS> extractedKnobs_{{nullptr}};
+        for (std::uint32_t i = 0; i < extractedKnobs.size(); i++) {
+            extractedKnobs_[i] = extractedKnobs[i]->get_backend_descriptor();
+        }
+
+        status = detail::get_attribute(
+            extractedEngine_, CUDNN_ATTR_ENGINE_GLOBAL_INDEX, CUDNN_TYPE_INT64, 1, &elemCount, &engineId);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINE_GLOBAL_INDEX Failed");
+        }
+        tag << "eng" << engineId;
+
+        status = detail::get_attribute(engine_config->get_backend_descriptor(),
+                                       CUDNN_ATTR_ENGINECFG_KNOB_CHOICES,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       CUDNN_KNOB_TYPE_COUNTS,
+                                       &numKnobs,
+                                       &(extractedKnobs_[0]));
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINECFG_KNOB_CHOICES Failed");
+        }
+        if (numKnobs > CUDNN_KNOB_TYPE_COUNTS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "numKnobs exceed the CUDNN_KNOB_TYPE_COUNTS");
+        }
+        for (size_t idx = 0; idx < static_cast<size_t>(numKnobs); ++idx) {
+            const cudnnBackendDescriptor_t &knob = extractedKnobs_[idx];
+            cudnnBackendKnobType_t type          = CUDNN_KNOB_TYPE_COUNTS;
+            int64_t choice                       = -2;
+            status =
+                detail::get_attribute(knob, CUDNN_ATTR_KNOB_CHOICE_KNOB_TYPE, CUDNN_TYPE_KNOB_TYPE, 1, nullptr, &type);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(this,
+                                              status,
+                                              "computeTag CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                              "CUDNN_ATTR_KNOB_CHOICE_KNOB_TYPE Failed");
+            }
+            status =
+                detail::get_attribute(knob, CUDNN_ATTR_KNOB_CHOICE_KNOB_VALUE, CUDNN_TYPE_INT64, 1, nullptr, &choice);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(this,
+                                              status,
+                                              "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                              "CUDNN_ATTR_KNOB_CHOICE_KNOB_VALUE Failed");
+            }
+            tag << "_k" << type << "=" << choice;
+        }
+        planTag += tag.str();
+    }
+
+    void
+    computeWorkSpaceSize() {
+        auto status = detail::get_attribute(pointer->get_backend_descriptor(),
+                                            CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE,
+                                            CUDNN_TYPE_INT64,
+                                            1,
+                                            nullptr,
+                                            &workSpaceSize);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(this,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_WORKSPACE_SIZE Failed");
+        }
+        if (workSpaceSize < 0) {
+            set_error_and_throw_exception(
+                this, status, "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute Workspace Size Invalid");
+        }
+    }
+
+    ExecutionPlan_v8()                    = default;
+    ManagedOpaqueDescriptor engine_config = nullptr;
+    cudnnHandle_t handle                  = nullptr;
+    std::string planTag;
+
+    std::int64_t workSpaceSize = 0;
+    std::array<cudnnBackendNumericalNote_t, CUDNN_NUMERICAL_NOTE_TYPE_COUNT> numeric_notes;
+    std::vector<cudnnBackendNumericalNote_t> numeric_notes_vec;
+    std::array<cudnnBackendBehaviorNote_t, CUDNN_BEHAVIOR_NOTE_TYPE_COUNT> behavior_notes;
+    std::vector<cudnnBackendBehaviorNote_t> behavior_notes_vec;
+    bool runtime_compiled       = true;  // see needs_cuda_graph_retention()
+    bool retain_for_cuda_graphs = true;  // false under CudaGraphRetention_t::NONE
+
+    float execution_time_ms                   = 0.0f;
+    std::shared_ptr<KernelCache> kernel_cache = nullptr;
+    // Lends references to `pointer` to the CUDA graphs recorded from this plan.
+    mutable detail::CudaGraphRetainedResource cuda_graph_retention;
+};
+
+///
+/// ExecutionPlanBuilder_v8 Class
+/// Helper class used to build ExecutionPlan_v8 class
+class ExecutionPlanBuilder_v8 {
+   public:
+    /** @defgroup ExecutionPlanBuilder_v8
+     *  Set individual property of ExecutionPlan_v8 class
+     *  @{
+     */
+    //! Set engine for the ExecutionPlan_v8
+    auto
+    setHandle(cudnnHandle_t handle_) -> ExecutionPlanBuilder_v8 & {
+        m_execution_plan.handle = handle_;
+        return *this;
+    }
+
+    /**
+     * @brief Set device properties for handle-less plan deserialization.
+     *
+     * When device properties are set and a handle is not, loadFromJson() will use
+     * CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP instead of CUDNN_ATTR_EXECUTION_PLAN_HANDLE.
+     * Device properties are used only when a handle is not set. Requires cuDNN >= 9.8
+     * at both compile and runtime.
+     */
+    auto
+    setDeviceProperties(std::shared_ptr<const DeviceProperties> device_properties_) -> ExecutionPlanBuilder_v8 & {
+        device_properties = std::move(device_properties_);
+        return *this;
+    }
+    //! Set engine Config for the Plan
+    auto
+    setEngineConfig(EngineConfig_v8 const &engine_config_) -> ExecutionPlanBuilder_v8 & {
+        m_execution_plan.engine_config = engine_config_.get_desc();
+        m_execution_plan.planTag       = engine_config_.getTag();
+        return *this;
+    }
+
+    auto
+    setKernelCache(std::shared_ptr<KernelCache> kernel_cache) -> ExecutionPlanBuilder_v8 & {
+        m_execution_plan.kernel_cache = kernel_cache;
+        return *this;
+    }
+
+    //! How CUDA graphs recorded from the plan keep its resources alive (see CudaGraphRetention_t). Unset: the
+    //! CUDNN_CUDA_GRAPH_RETENTION environment variable decides, for the frontend and the backend alike.
+    auto
+    setCudaGraphRetention(std::optional<CudaGraphRetention_t> retention) -> ExecutionPlanBuilder_v8 & {
+        cuda_graph_retention = retention;
+        return *this;
+    }
+
+    //! Set engine Config for the Plan
+    auto
+    setEngineConfig(ManagedOpaqueDescriptor &desc, std::string const &opGraphTag_ = "") -> ExecutionPlanBuilder_v8 & {
+        m_execution_plan.engine_config = desc;
+        m_execution_plan.planTag       = opGraphTag_;
+        return *this;
+    }
+
+    auto
+    setEngineConfig(ManagedOpaqueDescriptor const &desc, std::string const &opGraphTag_ = "")
+        -> ExecutionPlanBuilder_v8 & {
+        m_execution_plan.engine_config = desc;
+        m_execution_plan.planTag       = opGraphTag_;
+        return *this;
+    }
+    /** @} */
+
+    //! constructs the Engine Config by calling the cudnn API
+    //! Throws the appropriate error message
+    ExecutionPlan_v8 &&
+    build() {
+        // NOTE: skipping the handle and device properties here which are required for plan deserialization only
+
+        if (m_execution_plan.engine_config == nullptr) {
+            set_error_and_throw_exception(
+                &m_execution_plan,
+                CUDNN_STATUS_BAD_PARAM,
+                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: Check and Set the CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG");
+            return std::move(m_execution_plan);
+        };
+
+        // Create a descriptor. Memory allocation happens here.
+        auto status = m_execution_plan.initialize_managed_backend_pointer(CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                &m_execution_plan, status, "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnCreate Failed");
+            return std::move(m_execution_plan);
+        }
+
+        status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &(m_execution_plan.engine_config->get_backend_descriptor()));
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                &m_execution_plan,
+                status,
+                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG Failed");
+            return std::move(m_execution_plan);
+        }
+
+#if (CUDNN_VERSION >= 90400)
+        if (m_execution_plan.kernel_cache) {
+            // Copy the descriptor pointer by value under the KernelCache lock. This ensures that the right pointer is
+            // passed to the backend, bypassing lazy materialization thread-safety hazards.
+            cudnnBackendDescriptor_t kc_desc = m_execution_plan.kernel_cache->get_ptr_locked();
+            status                           = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_EXECUTION_PLAN_KERNEL_CACHE,
+                                           CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                           1,
+                                           &kc_desc);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(&m_execution_plan,
+                                              status,
+                                              "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute "
+                                              "CUDNN_ATTR_EXECUTION_PLAN_KERNEL_CACHE Failed");
+                return std::move(m_execution_plan);
+            }
+        }
+#endif
+        status = apply_cuda_graph_retention_();
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION Failed");
+            return std::move(m_execution_plan);
+        }
+        // Finalizing the descriptor
+        status = detail::finalize(m_execution_plan.pointer->get_backend_descriptor());
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                &m_execution_plan, status, "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnFinalize Descriptor Failed");
+            return std::move(m_execution_plan);
+        }
+
+        ManagedOpaqueDescriptor extractedEngine = make_shared_backend_pointer(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
+        status                                  = extractedEngine->get_status();
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnCreate of "
+                                          "CUDNN_BACKEND_ENGINE_DESCRIPTOR failed when compute tag");
+            return std::move(m_execution_plan);
+        }
+        cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
+        int64_t elemCount                         = 0;
+        status = detail::get_attribute(m_execution_plan.engine_config->get_backend_descriptor(),
+                                       CUDNN_ATTR_ENGINECFG_ENGINE,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &elemCount,
+                                       &extractedEngine_);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINECFG_ENGINE Failed");
+            return std::move(m_execution_plan);
+        }
+
+        m_execution_plan.buildTag(extractedEngine);
+        m_execution_plan.fetchNotes(extractedEngine);
+        if (m_execution_plan.get_status() != CUDNN_STATUS_SUCCESS) {
+            return std::move(m_execution_plan);
+        }
+        m_execution_plan.computeWorkSpaceSize();
+
+        CUDNN_FE_LOG_LABEL_ENDL(m_execution_plan);
+        return std::move(m_execution_plan);
+    }
+
+    ExecutionPlan_v8 &&
+    loadFromJson(const std::string &json_plan) {
+        CUDNN_FRONTEND_UNUSED(json_plan);
+        auto status = CUDNN_STATUS_SUCCESS;
+
+        if (m_execution_plan.handle == nullptr && device_properties == nullptr) {
+            set_error_and_throw_exception(
+                &m_execution_plan,
+                CUDNN_STATUS_BAD_PARAM,
+                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: Set either CUDNN_ATTR_EXECUTION_PLAN_HANDLE "
+                "via setHandle() or CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP via setDeviceProperties()");
+            return std::move(m_execution_plan);
+        };
+
+        // Create a descriptor. Memory allocation happens here.
+        status = m_execution_plan.initialize_managed_backend_pointer(CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR);
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                &m_execution_plan, status, "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnCreate Failed");
+            return std::move(m_execution_plan);
+        }
+
+        std::vector<char> serialization_buf;
+        serialization_buf.assign(json_plan.begin(), json_plan.end());
+        status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION,
+                                       CUDNN_TYPE_CHAR,
+                                       serialization_buf.size(),
+                                       serialization_buf.data());
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION Failed");
+            return std::move(m_execution_plan);
+        }
+
+#if (CUDNN_VERSION >= 90800)
+        if (device_properties != nullptr && m_execution_plan.handle == nullptr) {
+            if (detail::get_backend_version() < 90800) {
+                set_error_and_throw_exception(
+                    &m_execution_plan,
+                    CUDNN_STATUS_NOT_SUPPORTED,
+                    "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP "
+                    "requires cuDNN runtime >= 9.8");
+                return std::move(m_execution_plan);
+            }
+            {
+                cudnnBackendDescriptor_t local = device_properties->get_ptr();
+                status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                               CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP,
+                                               CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                               1,
+                                               &local);
+            }
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(&m_execution_plan,
+                                              status,
+                                              "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute "
+                                              "CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP Failed");
+                return std::move(m_execution_plan);
+            }
+        } else {
+#else
+        if (device_properties != nullptr && m_execution_plan.handle == nullptr) {
+            set_error_and_throw_exception(
+                &m_execution_plan,
+                CUDNN_STATUS_NOT_SUPPORTED,
+                "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: CUDNN_ATTR_EXECUTION_PLAN_DEVICEPROP "
+                "requires cuDNN headers >= 9.8; rebuild against cuDNN 9.8+");
+            return std::move(m_execution_plan);
+        }
+        {
+#endif
+            status = detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                           CUDNN_ATTR_EXECUTION_PLAN_HANDLE,
+                                           CUDNN_TYPE_HANDLE,
+                                           1,
+                                           &m_execution_plan.handle);
+            if (status != CUDNN_STATUS_SUCCESS) {
+                set_error_and_throw_exception(
+                    &m_execution_plan,
+                    status,
+                    "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute CUDNN_ATTR_EXECUTION_PLAN_HANDLE Failed");
+                return std::move(m_execution_plan);
+            }
+        }
+
+        status = apply_cuda_graph_retention_();
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: SetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION Failed");
+            return std::move(m_execution_plan);
+        }
+        status = detail::finalize(m_execution_plan.pointer->get_backend_descriptor());
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(
+                &m_execution_plan, status, "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnFinalize Descriptor Failed");
+            return std::move(m_execution_plan);
+        }
+
+        m_execution_plan.engine_config = make_shared_backend_pointer(CUDNN_BACKEND_ENGINECFG_DESCRIPTOR);
+        status                         = m_execution_plan.engine_config->get_status();
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnCreate of "
+                                          "CUDNN_BACKEND_ENGINECFG_DESCRIPTOR failed when computing tag");
+            return std::move(m_execution_plan);
+        }
+
+        cudnnBackendDescriptor_t engCfgDesc = m_execution_plan.engine_config->get_backend_descriptor();
+        int64_t elemCount                   = 0;
+        status                              = detail::get_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                       CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &elemCount,
+                                       &engCfgDesc);
+
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_EXECUTION_PLAN_ENGINE_CONFIG Failed");
+            return std::move(m_execution_plan);
+        }
+        ManagedOpaqueDescriptor extractedEngine = make_shared_backend_pointer(CUDNN_BACKEND_ENGINE_DESCRIPTOR);
+        status                                  = extractedEngine->get_status();
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: cudnnCreate of "
+                                          "CUDNN_BACKEND_ENGINE_DESCRIPTOR failed when computing tag");
+            return std::move(m_execution_plan);
+        }
+
+        cudnnBackendDescriptor_t extractedEngine_ = extractedEngine->get_backend_descriptor();
+
+        status = detail::get_attribute(m_execution_plan.engine_config->get_backend_descriptor(),
+                                       CUDNN_ATTR_ENGINECFG_ENGINE,
+                                       CUDNN_TYPE_BACKEND_DESCRIPTOR,
+                                       1,
+                                       &elemCount,
+                                       &extractedEngine_);
+
+        if (status != CUDNN_STATUS_SUCCESS) {
+            set_error_and_throw_exception(&m_execution_plan,
+                                          status,
+                                          "CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR: GetAttribute "
+                                          "CUDNN_ATTR_ENGINECFG_ENGINE Failed");
+            return std::move(m_execution_plan);
+        }
+
+        m_execution_plan.buildTag(extractedEngine);
+        m_execution_plan.fetchNotes(extractedEngine);
+        if (m_execution_plan.get_status() != CUDNN_STATUS_SUCCESS) {
+            return std::move(m_execution_plan);
+        }
+        m_execution_plan.computeWorkSpaceSize();
+
+        CUDNN_FE_LOG_LABEL_ENDL(m_execution_plan);
+        return std::move(m_execution_plan);
+    }
+
+    explicit ExecutionPlanBuilder_v8()                       = default;
+    ~ExecutionPlanBuilder_v8()                               = default;
+    ExecutionPlanBuilder_v8(ExecutionPlanBuilder_v8 &&)      = delete;
+    ExecutionPlanBuilder_v8(ExecutionPlanBuilder_v8 const &) = delete;
+    ExecutionPlanBuilder_v8 &
+    operator=(ExecutionPlanBuilder_v8 const &) = delete;
+
+   private:
+    std::optional<CudaGraphRetention_t> cuda_graph_retention;
+
+    // Applies the retention mode to the plan: the frontend's own retention, and, when set explicitly and both the
+    // headers and the backend are cuDNN 9.28+, the backend's (CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION).
+    // Unset, the backend reads CUDNN_CUDA_GRAPH_RETENTION itself.
+    cudnnStatus_t
+    apply_cuda_graph_retention_() {
+        CudaGraphRetention_t const retention    = detail::effective_cuda_graph_retention(cuda_graph_retention);
+        m_execution_plan.retain_for_cuda_graphs = retention != CudaGraphRetention_t::NONE;
+#if (CUDNN_VERSION >= 92800)
+        if (cuda_graph_retention.has_value() && detail::get_backend_version() >= 92800) {
+            cudnnCudaGraphRetention_t backend_retention = retention == CudaGraphRetention_t::NONE
+                                                              ? CUDNN_CUDA_GRAPH_RETENTION_NONE
+                                                              : CUDNN_CUDA_GRAPH_RETENTION_PER_GRAPH;
+            return detail::set_attribute(m_execution_plan.pointer->get_backend_descriptor(),
+                                         CUDNN_ATTR_EXECUTION_PLAN_CUDA_GRAPH_RETENTION,
+                                         CUDNN_TYPE_CUDA_GRAPH_RETENTION,
+                                         1,
+                                         &backend_retention);
+        }
+#endif
+        return CUDNN_STATUS_SUCCESS;
+    }
+
+    ExecutionPlan_v8 m_execution_plan;
+    std::shared_ptr<const DeviceProperties> device_properties = nullptr;
+};
+
+using ExecutionPlan        = ExecutionPlan_v8;
+using ExecutionPlanBuilder = ExecutionPlanBuilder_v8;
+
+}  // namespace cudnn_frontend

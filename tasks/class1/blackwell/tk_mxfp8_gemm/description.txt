@@ -1,16 +1,14 @@
 # Task: tk_mxfp8_gemm
 
 ## Target Hardware
-NVIDIA Blackwell GPU (SM100/SM120).
+NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a`; on any other GPU the test exits with an error (it never reports a pass without running).
 
-
-MXFP8 (Microscaling FP8) General Matrix Multiply on B200, matching ThunderKittens Blackwell performance.
-
-Uses FP8 E4M3 data with E8M0 block scaling factors (block size = 128). The hardware MXFP8 format stores scales in a swizzled layout for efficient tensor core access.
+MXFP8 (OCP microscaling FP8) block-scaled GEMM with BF16 output (tcgen05 block-scaled MMA), compared against the
+ThunderKittens Blackwell MXFP8 GEMM.
 
 ## Function Signature
 
-Implement in solution.h:
+Implement the following function in `solution.h`:
 
 ```cuda
 #pragma once
@@ -26,22 +24,102 @@ void Mxfp8Gemm(
 
 ## Operation
 
-C = (A * diag(A_scale)) * (B * diag(B_scale))^T
+C = (A * sA) * (B * sB)^T
 
-Where:
-- A is M×K (row-major, FP8 E4M3)
-- B is N×K (to be transposed, FP8 E4M3)
-- A_scale is [M/128, K/128, 32, 16] (E8M0 block scales, swizzled layout)
-- B_scale is [N/128, K/128, 32, 16] (E8M0 block scales, swizzled layout)
-- C is M×N (row-major, BF16 output)
+A is M x K, B is N x K (stored transposed), C is M x N; A, B and C are row-major and contiguous
+(`A[i * K + k]`, `B[j * K + k]`, `C[i * N + j]`). sA / sB hold one E8M0 scale (a power of two, 2^(byte - 127))
+per **32 consecutive K elements** of a row (the OCP MX block size is 32, not 128): element (i, k) of A
+is dequantized as `float(A[i, k]) * 2^(sA[i, k / 32] - 127)`, likewise for B.
 
-Each 128-element block of data is scaled by its corresponding E8M0 scale factor.
+## Scale layout (swizzled 128x4 tiles, the layout tcgen05 and cuBLAS consume)
+
+The scales of 128 rows x 4 K-blocks (= 128 rows x 128 K elements) form one 512-byte tile; tiles are ordered
+row-block major, K-group minor. The scale of (row r, K-block kb = k / 32) of A (or of B, with its row = output column) is at byte
+
+    index = ((r / 128) * (K / 128) + kb / 4) * 512 + (r % 32) * 16 + ((r / 32) % 4) * 4 + (kb % 4)
+
+so `A_scale` has M * K / 32 bytes and `B_scale` N * K / 32 bytes (equivalently an array
+[M/128, K/128, 32, 16]).
+
+## Data Types and Precision
+
+A, B: FP8 E4M3. Scales: E8M0. Output: BF16. Products must be accumulated in FP32 and rounded to BF16 once, at
+the end. Lower-precision arithmetic (FP4 / FP6 / E5M2 / INT8 operands, FP16 or BF16 accumulation, including
+tensor-core paths that use them) is not allowed even if it were to pass the tolerance.
+
+All pointers are device pointers, 256-byte aligned. C holds NaN on entry: you must overwrite every element.
+M and N are multiples of 256, K a multiple of 128 (all tested shapes satisfy this).
 
 ## Build & Test
 
 ```bash
-make test
-./test
+make test                    # requires solution.h in the task directory
+./test                       # runs every benchmark shape below
+./test 4096 4096 4096        # one custom shape: M N K
 ```
 
-Requires B200 GPU (SM100a). ThunderKittens headers on include path.
+`make ref` builds the ThunderKittens reference alone.
+
+## Problem Sizes
+
+The linear layers of Llama-3-70B in MXFP8 on one B200 (hidden 8192, fused QKV 10240, FFN 28672 -> fused gate+up
+57344). M is the number of tokens. The reference kernel works on 256-row tiles, so the smallest batch is 256
+tokens; the others are 8K / 16K-token prefill chunks.
+
+| label                    | M     | N     | K     | layer                        |
+|--------------------------|-------|-------|-------|------------------------------|
+| decode_batch256_qkv      | 256   | 10240 | 8192  | fused QKV projection         |
+| decode_batch256_mlp_down | 256   | 8192  | 28672 | FFN down projection          |
+| prefill_qkv              | 8192  | 10240 | 8192  | fused QKV projection         |
+| prefill_o_proj           | 8192  | 8192  | 8192  | attention output projection  |
+| prefill_mlp_up           | 8192  | 57344 | 8192  | fused gate+up projection     |
+| prefill_mlp_down         | 8192  | 8192  | 28672 | FFN down projection          |
+| prefill16k_o_proj        | 16384 | 8192  | 8192  | output projection, 16K chunk |
+
+A and B hold E4M3 values from the whole finite range ([-448, 448], random mantissas); the scale bytes are random
+powers of two between 2^-3 and 2^3.
+
+## Correctness
+
+The ThunderKittens reference and your solution write to separate buffers that are pre-filled with NaN. After your
+function returns, **every** element of C is compared with the reference output:
+
+- every element must be finite (NaN / Inf fail, so unwritten elements fail);
+- `|C - ref| <= 1e-3 * RMS(ref) + 1.6e-2 * |ref|` for every element (the second term allows two BF16 rounding
+  steps), and the relative Frobenius error `||C - ref|| / ||ref||` must be `<= 1e-3`.
+
+A sequential FP32-accumulating kernel over the exact products measures 1e-4 .. 2.1e-4 against the reference
+(BF16 rounding flips); the bound is 4.7x above that. Skipped K blocks (>= 6.7e-2), BF16 accumulation (>= 6.7e-2),
+E5M2 inputs (8.9e-2), FP16 accumulation (overflow), ignored scales (0.84), a non-swizzled scale layout (1.3) or
+128-element scale blocks (1.1) all fail. The check is repeated once more after the timing loop, from a freshly
+poisoned C.
+
+**Inputs change on every call.** The activation matrix A together with its E8M0 block scales is regenerated with a new random seed before every timed call of both the
+reference and your function (outside the timed region, before the L2 flush) (data and scales are regenerated together), so outputs and any
+input-dependent intermediate must be recomputed on every call; memoizing results does not work. After the timing loop
+the harness regenerates the input once more, recomputes the reference for it, re-poisons the output and calls your
+function again; that second check must pass too. The second operand B (the weights) stays fixed, and one-time
+preprocessing of B (and its scales) into a function-local static cache keyed on the pointers and the shape is allowed, as
+is other one-time setup (see "Performance").
+
+## Performance
+
+For each shape the harness times the ThunderKittens reference and your function with CUDA events (the L2 cache is
+flushed before every trial; C is re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and
+`Speedup = ref_min / kernel_min` (minimum over the same number of trials for both). The score is the geometric mean
+of the speedups over the seven shapes. The reference's tensor maps (TMA descriptors) are built once outside the
+timed region; it launches one persistent 2-CTA-cluster kernel per call.
+
+The reference uses a template configuration chosen per shape from a sweep on B200 (3.2-3.4 PFLOPs on the 8K prefill
+GEMMs). It reaches 84-116% of cuBLAS block-scaled MXFP8 (`torch._scaled_mm` with E8M0 scales, same shapes, L2
+flushed): 95-116% on the prefill shapes, 106% / 84% on the 256-token shapes.
+
+Your function is timed as a whole call, including any host-side launch setup. One-time setup (e.g.
+`cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics.
+
+## Rules
+
+- Solutions must be your own kernels: no ThunderKittens (`kittens::` / its headers are rejected), no cuBLAS / cuDNN, and
+  no CUTLASS device / kernel / collective GEMM templates. CuTe and low-level building blocks (barriers, `tcgen05`
+  PTX, TMA) are allowed.
+- FP8 E4M3 operands with E8M0 block scales and FP32 accumulation only (see "Data Types and Precision").

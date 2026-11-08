@@ -1,6 +1,6 @@
 # CUDA-Hercules Evaluation Guide
 
-This guide covers the released 195-task benchmark tree.
+This guide covers the released 194-task benchmark tree.
 
 ## Verify The Release
 
@@ -8,7 +8,7 @@ This guide covers the released 195-task benchmark tree.
 python -c "import sys; sys.path.insert(0, 'src'); from cuda_hercules.runner import discover_tasks; print(len(discover_tasks('.')))"
 ```
 
-Expected output: `195`.
+Expected output: `194`.
 
 ## One-Shot / Pass@N
 

@@ -1,198 +1,95 @@
 # Task: 93_blackwell_low_latency_gqa
 
 ## Target Hardware
-NVIDIA Blackwell GPU (SM100/SM120).
+NVIDIA B200 (Blackwell, SM100 / `sm_100a`). The task is built with `-gencode arch=compute_100a,code=sm_100a` and is skipped on other GPUs.
 
+Decode-phase grouped-query attention (one query token per sequence) over a long KV cache, with per-sequence cache lengths, attention sinks and an optional sliding window, compared against the CUTLASS "TGV" low-latency GQA kernel (CUTLASS example 93: split-KV flash decoding inside a thread-block cluster, tcgen05 UMMA + TMEM, BF16 in / BF16 out).
 
-Blackwell SM100 Low-Latency Grouped Query Attention test harness
-Based on CUTLASS example 93_blackwell_low_latency_gqa
-The LLM must implement:
-  cudaError_t BlackwellGQA(int batch, int kv_heads, int q_heads,
-      int seq_len, int head_dim,
-      __half const *Q, __half const *K, __half const *V, __half *O);
-GQA decoding: single query position attending to seq_len KV positions.
-q_heads = kv_heads * q_heads_per_kv (each KV head serves multiple Q heads).
-Q: [batch, q_heads, 1, head_dim]
-K: [batch, kv_heads, seq_len, head_dim]
-V: [batch, kv_heads, seq_len, head_dim]
-O: [batch, q_heads, 1, head_dim]
-O = softmax(Q * K^T / sqrt(head_dim)) * V, computed per KV-head group.
-Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
-         -gencode arch=compute_100a,code=sm_100a harness.cu solution.cu -o test
+## Function Signature
 
----
-## Test Harness (harness.cu)
-
-Your solution will be compiled and linked with this test harness.
-Study it to understand the exact function signature, data types, and verification logic.
+Implement in `solution.h`:
 
 ```cuda
-/*
- * Blackwell SM100 Low-Latency Grouped Query Attention test harness
- * Based on CUTLASS example 93_blackwell_low_latency_gqa
- *
- * The LLM must implement:
- *   cudaError_t BlackwellGQA(int batch, int kv_heads, int q_heads,
- *       int seq_len, int head_dim,
- *       __half const *Q, __half const *K, __half const *V, __half *O);
- *
- * GQA decoding: single query position attending to seq_len KV positions.
- * q_heads = kv_heads * q_heads_per_kv (each KV head serves multiple Q heads).
- *
- * Q: [batch, q_heads, 1, head_dim]
- * K: [batch, kv_heads, seq_len, head_dim]
- * V: [batch, kv_heads, seq_len, head_dim]
- * O: [batch, q_heads, 1, head_dim]
- *
- * O = softmax(Q * K^T / sqrt(head_dim)) * V, computed per KV-head group.
- *
- * Compile: nvcc -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr \
- *          -gencode arch=compute_100a,code=sm_100a harness.cu solution.cu -o test
- */
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
-#include <cuda_fp16.h>
-#include <iostream>
-#include <vector>
-#include <cmath>
-#include <cstdlib>
-#include "../../include/kh_benchmark.h"
-
-#define CUDA_CHECK(status)                                              \
-  {                                                                     \
-    cudaError_t error = status;                                         \
-    if (error != cudaSuccess) {                                         \
-      std::cerr << "Got bad cuda status: " << cudaGetErrorString(error) \
-                << " at line: " << __LINE__ << std::endl;               \
-      exit(EXIT_FAILURE);                                               \
-    }                                                                   \
-  }
-
-extern cudaError_t BlackwellGQA(
-  int batch, int kv_heads, int q_heads,
-  int seq_len, int head_dim,
-  __half const *Q, __half const *K, __half const *V, __half *O);
-
-/// CPU reference: Grouped Query Attention (single query position decoding)
-void reference_gqa(
-  int batch, int kv_heads, int q_heads,
-  int seq_len, int head_dim,
-  std::vector<float> const &fQ,
-  std::vector<float> const &fK,
-  std::vector<float> const &fV,
-  std::vector<float> &fO) {
-
-  int q_per_kv = q_heads / kv_heads;
-  float scale = 1.0f / sqrtf((float)head_dim);
-
-  for (int b = 0; b < batch; ++b) {
-    for (int qh = 0; qh < q_heads; ++qh) {
-      int kvh = qh / q_per_kv;
-
-      // Q[b, qh, 0, :] — single query vector
-      int q_off = ((b * q_heads + qh) * 1) * head_dim;
-
-      // Compute attention scores: score[t] = Q . K[b, kvh, t, :] * scale
-      std::vector<float> scores(seq_len);
-      float max_score = -1e30f;
-      for (int t = 0; t < seq_len; ++t) {
-        int k_off = ((b * kv_heads + kvh) * seq_len + t) * head_dim;
-        float dot = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-          dot += fQ[q_off + d] * fK[k_off + d];
-        }
-        scores[t] = dot * scale;
-        if (scores[t] > max_score) max_score = scores[t];
-      }
-
-      // Softmax
-      float sum_exp = 0.0f;
-      for (int t = 0; t < seq_len; ++t) {
-        scores[t] = expf(scores[t] - max_score);
-        sum_exp += scores[t];
-      }
-      for (int t = 0; t < seq_len; ++t) {
-        scores[t] /= sum_exp;
-      }
-
-      // O[b, qh, 0, :] = sum_t scores[t] * V[b, kvh, t, :]
-      int o_off = ((b * q_heads + qh) * 1) * head_dim;
-      for (int d = 0; d < head_dim; ++d) {
-        float acc = 0.0f;
-        for (int t = 0; t < seq_len; ++t) {
-          int v_off = ((b * kv_heads + kvh) * seq_len + t) * head_dim;
-          acc += scores[t] * fV[v_off + d];
-        }
-        fO[o_off + d] = acc;
-      }
-    }
-  }
-}
-
-int main() {
-  int batch = 1, kv_heads = 8, q_heads = 64, seq_len = 256, head_dim = 128;
-
-  int sz_Q = batch * q_heads * 1 * head_dim;
-  int sz_K = batch * kv_heads * seq_len * head_dim;
-  int sz_V = batch * kv_heads * seq_len * head_dim;
-  int sz_O = batch * q_heads * 1 * head_dim;
-
-  // Generate float data
-  std::vector<float> fQ(sz_Q), fK(sz_K), fV(sz_V), fO(sz_O, 0.0f), fRef(sz_O, 0.0f);
-  for (int i = 0; i < sz_Q; ++i) fQ[i] = float((i * 16807 % 16) - 8) * 0.01f;
-  for (int i = 0; i < sz_K; ++i) fK[i] = float((i * 48271 % 16) - 8) * 0.01f;
-  for (int i = 0; i < sz_V; ++i) fV[i] = float((i * 12345 % 16) - 8) * 0.01f;
-
-  // Convert to half
-  std::vector<__half> hQ(sz_Q), hK(sz_K), hV(sz_V), hO(sz_O);
-  for (int i = 0; i < sz_Q; ++i) hQ[i] = __float2half(fQ[i]);
-  for (int i = 0; i < sz_K; ++i) hK[i] = __float2half(fK[i]);
-  for (int i = 0; i < sz_V; ++i) hV[i] = __float2half(fV[i]);
-
-  // Allocate device memory
-  __half *dQ, *dK, *dV, *dO;
-  CUDA_CHECK(cudaMalloc(&dQ, sz_Q * sizeof(__half)));
-  CUDA_CHECK(cudaMalloc(&dK, sz_K * sizeof(__half)));
-  CUDA_CHECK(cudaMalloc(&dV, sz_V * sizeof(__half)));
-  CUDA_CHECK(cudaMalloc(&dO, sz_O * sizeof(__half)));
-  CUDA_CHECK(cudaMemcpy(dQ, hQ.data(), sz_Q * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dK, hK.data(), sz_K * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dV, hV.data(), sz_V * sizeof(__half), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemset(dO, 0, sz_O * sizeof(__half)));
-
-  cudaError_t r = BlackwellGQA(batch, kv_heads, q_heads, seq_len, head_dim, dQ, dK, dV, dO);
-  if (r != cudaSuccess) {
-    std::cerr << "BlackwellGQA failed: " << cudaGetErrorString(r) << std::endl;
-    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
-    return -1;
-  }
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  // Benchmark (triggered by KH_BENCHMARK=N env var)
-  {
-    int _kh_trials = kh_benchmark_trials();
-    if (_kh_trials > 0 && r == cudaSuccess) {
-      kh_benchmark([&]() { BlackwellGQA(batch, kv_heads, q_heads, seq_len, head_dim, dQ, dK, dV, dO); }, _kh_trials);
-    }
-  }
-
-
-  CUDA_CHECK(cudaMemcpy(hO.data(), dO, sz_O * sizeof(__half), cudaMemcpyDeviceToHost));
-  cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
-
-  for (int i = 0; i < sz_O; ++i) fO[i] = __half2float(hO[i]);
-
-  // CPU reference
-  reference_gqa(batch, kv_heads, q_heads, seq_len, head_dim, fQ, fK, fV, fRef);
-
-  float max_diff = 0;
-  for (int i = 0; i < sz_O; ++i)
-    max_diff = fmaxf(max_diff, fabsf(fO[i] - fRef[i]));
-
-  if (max_diff > 0.1f) {
-    std::cerr << "Results incorrect. Max diff: " << max_diff << std::endl;
-    return -1;
-  }
-  std::cout << "Passed." << std::endl;
-  return 0;
-}
+cudaError_t BlackwellGQA(
+    int batch, int num_kv_heads, int num_q_heads, int max_seq_len, int head_dim,
+    int sliding_window,
+    __nv_bfloat16 const *Q, __nv_bfloat16 const *K, __nv_bfloat16 const *V,
+    int const *seq_lens, float const *sinks,
+    __nv_bfloat16 *O);
 ```
+
+## Operation
+
+For every sequence b and query head h, with kv(h) = h / (num_q_heads / num_kv_heads) (consecutive query heads share a KV head), scale = 1 / sqrt(head_dim), n = seq_lens[b] and lo = (sliding_window > 0 ? max(0, n - sliding_window) : 0):
+
+    s_j   = scale * dot(Q[b, h, :], K[b, j, kv(h), :])      for j in [lo, n)
+    m     = max(max_j s_j, sinks[h])                         (sinks == nullptr: no sink term)
+    O[b, h, :] = sum_j exp(s_j - m) * V[b, j, kv(h), :]  /  ( sum_j exp(s_j - m) + exp(sinks[h] - m) )
+
+i.e. softmax over the cached scores plus one extra "sink" logit that has no value vector (gpt-oss attention sinks). Cache positions >= seq_lens[b] and positions < lo do not take part.
+
+## Data Types and Precision
+
+Q, K, V, O are BF16, sinks is FP32. Both products must be accumulated in FP32 and the softmax computed in FP32 (the probabilities may be rounded to BF16 before the P V product, as the CUTLASS kernel does). Lower-precision arithmetic (FP8, FP6, FP4, INT8 operands, FP16 / BF16 accumulation, including tensor-core paths that use them) is not allowed even if it passed the tolerance.
+
+## Memory Layout (all row-major, contiguous, 256-byte aligned device pointers)
+
+- Q, O: `[batch, num_q_heads, head_dim]`, element (b, h, d) at `(b * num_q_heads + h) * head_dim + d`.
+- K, V: `[batch, max_seq_len, num_kv_heads, head_dim]` (the KV cache), element (b, j, g, d) at `((b * max_seq_len + j) * num_kv_heads + g) * head_dim + d`.
+- seq_lens: `[batch]` int32, `1 <= seq_lens[b] <= max_seq_len`. Cache entries at positions >= seq_lens[b] hold finite garbage (about 64x larger than valid data); they must not be used.
+- sinks: `[num_q_heads]` FP32 logits (natural-log domain), or `nullptr`.
+- sliding_window: 0 = attend to all `seq_lens[b]` positions; W > 0 = only to the last W positions `[max(0, seq_lens[b] - W), seq_lens[b])`.
+
+O holds NaN on entry; every element must be written. `head_dim` is 64 or 128; `num_q_heads / num_kv_heads` is 8 in all tests.
+
+## Build & Test
+
+```bash
+make test        # requires solution.h in the task directory
+./test           # runs every case below
+./test B kvH qH L dH window var_len sinks    # one custom case, e.g. ./test 4 8 64 4099 64 128 1 1
+```
+
+`make ref` builds the CUTLASS reference alone.
+
+## Problem Sizes
+
+gpt-oss-120b decode: 64 query heads, 8 KV heads, head_dim 64, attention sinks; its layers alternate full attention (context up to 128K tokens) and a 128-token sliding window. The last case is a Llama-3-70B style layer (head_dim 128, no sinks). "varlen": the sequence lengths are drawn uniformly from [L/2, L] (sequence 0 has length L); otherwise all equal L.
+
+| label                     | batch | max_seq_len | head_dim | window | sinks | lengths | KV bytes read |
+|---------------------------|-------|-------------|----------|--------|-------|---------|---------------|
+| b1_ctx128k                | 1     | 131072      | 64       | -      | yes   | full    | 268 MB |
+| b8_ctx32k                 | 8     | 32768       | 64       | -      | yes   | varlen  | 392 MB |
+| b32_ctx8k                 | 32    | 8192        | 64       | -      | yes   | varlen  | 399 MB |
+| b64_ctx16k                | 64    | 16384       | 64       | -      | yes   | varlen  | 1.57 GB |
+| b64_ctx32k                | 64    | 32768       | 64       | -      | yes   | varlen  | 3.19 GB |
+| b64_ctx32k_window128      | 64    | 32768       | 64       | 128    | yes   | varlen  | 17 MB |
+| llama70b_b16_ctx8k_hd128  | 16    | 8192        | 128      | -      | no    | varlen  | 399 MB |
+
+Inputs are full-mantissa uniform random BF16 values: K, V in [-1, 1), Q in [-8, 8) so that the attention distribution is peaked (logit standard deviation about 2.7). Sink logits are drawn around the typical log-sum-exp of the scores (log(length) + 3.6, +-2.5), so the sink carries 7% - 92% of the softmax mass and ignoring it is visible. Ignoring seq_lens, the window, the sinks, a skipped KV block or a wrong head mapping changes the output a lot.
+
+## Correctness
+
+The CUTLASS reference and your function read the same inputs and write to separate buffers that are pre-filled with NaN. After your function returns, **every** element of O is compared with the reference output:
+
+- every element must be finite (NaN / Inf fail, so unwritten elements fail);
+- `|O - ref| <= 6e-2 * RMS(ref) + 2.4e-2 * |ref|` for every element, and the relative Frobenius error `||O - ref|| / ||ref||` must be `<= 6e-3`.
+
+Calibration (measured on B200): an exact FP32 kernel with BF16 output differs from the reference by a Frobenius error of 0.9e-3 - 1.7e-3 (the CUTLASS kernel itself is 1.7e-3 away from an independent FP64 computation, i.e. pure BF16 output rounding), so the bound is 3.5x above a correct kernel. Deliberately wrong variants are far above it: P or V rounded to FP8 (up to 1.6e-2 / 2.4e-2), K/Q in FP8 (7e-2), BF16 PV accumulation (up to 2.7e-2), denominator off by 1% (1e-2), scale off by 0.5% (1.4e-2 - 4.2e-2), a skipped KV block (up to 0.18), ignored seq_lens (>100), ignored window (4), window off by one key (4e-2 - 8e-2), ignored or mis-scaled sinks (0.2 - 26), wrong GQA head mapping (1.3), unwritten outputs. The check is repeated once more at the end on freshly regenerated inputs (new seed): the reference output is recomputed for them, your output is re-poisoned, and your function must produce the right answer for the new inputs.
+
+## Performance
+
+For each case the harness times the CUTLASS reference and your function with CUDA events (the L2 cache is flushed before every trial; O is re-poisoned outside the timed region) and reports `Ref time`, `Kernel time` and `Speedup = ref_min / kernel_min`. The score is the geometric mean of the speedups over the seven cases. The reference configuration (split-KV factor, reduction CTAs, pipeline depth) is chosen per case from a sweep; its host-side descriptor construction is captured once in a CUDA graph outside the timed region, so only the launch is timed. It reads the KV cache at 4.2 - 6.6 TB/s, at or above a plain vectorised read kernel over the same bytes (4.4 / 5.0 / 4.9 / 6.3 / 6.7 TB/s for 268 MB / 392 MB / 399 MB / 1.6 GB / 3.2 GB) and 2.5x faster than FlashInfer's single-sequence decode kernel on b1_ctx128k (161 us vs 64 us).
+
+**The inputs change on every call.** Before every timed call of the reference and of your function (outside the timed region) the harness regenerates Q and the newest KV-cache entry of every sequence (position seq_lens[b]-1: decode appends one K/V entry per step; the rest of the cache stays fixed) with a new seed; the first correctness check and the final re-check use their own seeds as well. Outputs and input-dependent intermediates must therefore be recomputed on every call; caching or memoising results across calls produces wrong answers and fails the final check.
+
+Your function is timed as a whole call, including host-side launch setup. One-time setup (e.g. `cudaFuncSetAttribute`, tensor-map creation) may be cached in function-local statics. Decode kernels are launch-latency sensitive: keep the host path short.
+
+## Rules
+
+- Solutions must be your own kernels: no cuBLAS / cuDNN, no CUTLASS device / kernel / collective templates, and in particular no use of the CUTLASS TGV GQA example (`TGV::gqa`, `tgv_gqa.cuh`, `common.cuh` of example 93) -- including it is rejected. CuTe and low-level building blocks (barriers, pipelines, layouts, `tcgen05` PTX) are allowed.
+- Hard-coding the tested sizes (batch, lengths, head counts) is not what is being measured; the function must work for any batch / max_seq_len / seq_lens with the stated head configuration.
