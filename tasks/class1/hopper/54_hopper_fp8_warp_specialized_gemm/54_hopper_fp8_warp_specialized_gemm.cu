@@ -1,5 +1,6 @@
 // FP8 E4M3 GEMM with fp32 accumulation/output. No auxiliary epilogue work.
 #include "hopper_validation.cuh"
+#include "hopper_cublaslt_reference.cuh"
 #include <cuda_fp8.h>
 #include <cublas_v2.h>
 #include <algorithm>
@@ -60,15 +61,8 @@ void run(int M,int N,int K) {
   CHECK(cudaMalloc(&ref,nc*4)); CHECK(cudaMalloc(&oracle,nc*4)); CHECK(cudaMalloc(&sol,nc*4));
   init_fp8<<<(na+255)/256,256>>>(A,Ah,na,42);
   init_fp8<<<(nb+255)/256,256>>>(B,Bh,nb,43);
-  auto da=cutlass::make_cute_packed_stride(Kernel::StrideA{},make_shape(M,K,1));
-  auto db=cutlass::make_cute_packed_stride(Kernel::StrideB{},make_shape(N,K,1));
-  auto dc=cutlass::make_cute_packed_stride(Kernel::StrideC{},make_shape(M,N,1));
-  Gemm::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,{M,N,K,1},
-                      {A,da,B,db},{{1.0f,0.0f},ref,dc,ref,dc}};
-  Gemm gemm;
-  void* workspace; CHECK(cudaMalloc(&workspace,std::max(size_t(1),Gemm::get_workspace_size(args))));
-  CHECK(gemm.can_implement(args)); CHECK(gemm.initialize(args,workspace));
-  auto reference=[&](){CHECK(gemm.run());};
+  kh_lt_plan plan({M,N,K,K,K,M,CUDA_R_8F_E4M3,CUDA_R_8F_E4M3,CUDA_R_32F});
+  auto reference=[&](){CHECK(plan.run(A,B,ref));};
   reference(); CHECK(cudaDeviceSynchronize());
   cublasHandle_t handle; CHECK(cublasCreate(&handle));
   float alpha=1,beta=0;
@@ -96,7 +90,7 @@ void run(int M,int N,int K) {
 #endif
   puts("Passed");
   CHECK(cublasDestroy(handle));
-  for(void* p:{(void*)A,(void*)B,(void*)Ah,(void*)Bh,(void*)ref,(void*)oracle,(void*)sol,workspace}) CHECK(cudaFree(p));
+  for(void* p:{(void*)A,(void*)B,(void*)Ah,(void*)Bh,(void*)ref,(void*)oracle,(void*)sol}) CHECK(cudaFree(p));
 }
 int main(int argc,char** argv) {
   if(argc==4) run(atoi(argv[1]),atoi(argv[2]),atoi(argv[3]));

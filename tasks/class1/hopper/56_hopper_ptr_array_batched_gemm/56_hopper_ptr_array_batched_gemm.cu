@@ -68,6 +68,8 @@
 #include "cutlass/util/reference/device/tensor_fill.h"
 
 #include "helper.h"
+#include "hopper_cublaslt_reference.cuh"
+#include <cublas_v2.h>
 
 #ifdef KH_TEST_SOLUTION
 #include <cuda_fp16.h>
@@ -462,8 +464,23 @@ int run(Options &options)
   // Initialize CUTLASS kernel with arguments and workspace pointer
   CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
 
+  cublasHandle_t blas;kh_lt_check(cublasCreate(&blas));
+  auto original=[&](){CUTLASS_CHECK(gemm.run());};
+  auto vendor=[&](){float alpha=options.alpha,beta=0;
+    kh_lt_check(cublasGemmBatchedEx(blas,CUBLAS_OP_T,CUBLAS_OP_N,options.m,options.n,options.k,&alpha,
+      reinterpret_cast<const void* const*>(ptr_A.get()),CUDA_R_16F,options.k,
+      reinterpret_cast<const void* const*>(ptr_B.get()),CUDA_R_16F,options.k,&beta,
+      reinterpret_cast<void* const*>(ptr_D.get()),CUDA_R_16F,options.m,options.l,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT));};
+  bool use_vendor=options.beta==0 && kh_prefer_second_reference(original,vendor);
+  if(use_vendor) {
+    original();cutlass::DeviceAllocation<ElementC> expected(block_D.size());
+    CUDA_CHECK(cudaMemcpy(expected.get(),block_D.get(),block_D.size()*sizeof(ElementC),cudaMemcpyDeviceToDevice));
+    vendor();kh_check_device(block_D.get(),expected.get(),block_D.size(),0.01,0.01,0.002);
+  }
+  auto reference=[&](){if(use_vendor)vendor();else original();};
+
   // Correctness / Warmup iteration
-  CUTLASS_CHECK(gemm.run());
+  reference();
 
   // Check if output from CUTLASS kernel and reference kernel are equal or not
   Result result;
@@ -564,7 +581,7 @@ int run(Options &options)
 
     // Warmup reference
     for (int i = 0; i < 3; i++) {
-      CUTLASS_CHECK(gemm.run());
+      reference();
     }
     cudaDeviceSynchronize();
 
@@ -573,7 +590,7 @@ int run(Options &options)
     for (int iter = 0; iter < kIterations; ++iter) {
       kh_cold_l2();
       cudaEventRecord(ev_start);
-      CUTLASS_CHECK(gemm.run());
+      reference();
       cudaEventRecord(ev_stop);
       cudaEventSynchronize(ev_stop);
       float ms;
@@ -651,6 +668,7 @@ int run(Options &options)
     cudaEventDestroy(ev_stop);
   }
 
+  cublasDestroy(blas);
   return 0;
 }
 

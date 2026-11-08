@@ -2,8 +2,9 @@ Implement a CUDA kernel for Hopper SM90 (H200).
 
 MoE router: fp16 A row-major [M,K], B column-major [K,N], fp32 dot products, fp16 D row-major [M,N].
 For each token row, select topk=8 of N=128 logits alpha*A@B, then softmax ONLY over those eight logits;
-set all other probabilities to zero. Select and normalize before rounding the final probabilities to fp16.
-The baseline uses CUTLASS's generic top-8 reduction enabled in a task-local header.
+set all other probabilities to zero. Break equal-logit ties by smaller expert index, selecting exactly eight experts.
+Select and normalize before rounding the final probabilities to fp16. Default alpha=1/sqrt(K).
+The baseline selects a prepared CUTLASS fusion or cuBLASLt plus an adapted vLLM router, including all stages in timing.
 
 Required public API:
 cudaError_t HopperGemmTopkSoftmax(

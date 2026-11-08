@@ -5,11 +5,11 @@ NVCC_FLAGS = -O3 --use_fast_math -std=c++20 --expt-extended-lambda --expt-relaxe
 ARCH     = -gencode arch=compute_90a,code=sm_90a
 LIBS     = -lcuda -lcudadevrt -lcudart_static -lrt -lpthread -ldl
 
-ref: fp8_h100_gemm.cu
-	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_HOPPER $< -o $@ -lcublas
+ref: fp8_h100_gemm.cu hopper_cublaslt_reference.cuh
+	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_HOPPER $< -o $@ -lcublas -lcublasLt
 
-test: fp8_h100_gemm.cu solution.h
-	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_HOPPER -DKH_TEST_SOLUTION $< -o $@ -lcublas
+test: fp8_h100_gemm.cu solution.h hopper_cublaslt_reference.cuh
+	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_HOPPER -DKH_TEST_SOLUTION $< -o $@ -lcublas -lcublasLt
 
 clean:
 	rm -f ref test

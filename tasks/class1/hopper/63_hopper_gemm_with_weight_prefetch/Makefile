@@ -1,7 +1,7 @@
 CUTLASS_DIR ?= ../../../../reference_sources/cutlass
 CUTLASS_INC = -I$(CUTLASS_DIR)/include -I$(CUTLASS_DIR)/tools/util/include -I$(CUTLASS_DIR)/examples/common -I$(CUTLASS_DIR)/examples/63_hopper_gemm_with_weight_prefetch
 NVCC       ?= nvcc
-NVCC_FLAGS  = -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr
+NVCC_FLAGS  = -O3 --use_fast_math -std=c++17 --expt-relaxed-constexpr -DNDEBUG
 ARCH        = -gencode arch=compute_90a,code=sm_90a
 
 # Reference only: compile CUTLASS example (no solution needed)

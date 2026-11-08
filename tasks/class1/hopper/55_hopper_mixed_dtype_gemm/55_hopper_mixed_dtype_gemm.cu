@@ -104,6 +104,7 @@
 #include "cutlass/util/mixed_dtype_utils.hpp"
 
 #include "helper.h"
+#include "hopper_cublaslt_reference.cuh"
 #include "mixed_dtype_utils.hpp"
 
 #ifdef KH_TEST_SOLUTION
@@ -155,7 +156,8 @@ using ElementAccumulator  = float;                                          // E
 using ElementCompute      = float;                                          // Element type for epilogue computation
 using ArchTag             = cutlass::arch::Sm90;                            // Tag indicating the minimum SM that supports the intended feature
 using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
-using TileShape           = Shape<_128,_128,cute::Int<TileShapeK>>;         // Threadblock-level tile size
+template<int TileN> struct kh_config55 {
+using TileShape           = Shape<_128,cute::Int<TileN>,cute::Int<TileShapeK>>;         // Threadblock-level tile size
 using ClusterShape        = Shape<_1,_1,_1>;                                // Shape of the threadblocks in a cluster
 using KernelSchedule      = cutlass::gemm::KernelTmaWarpSpecializedCooperative;  // Kernel to launch based on the default setting in the Collective Builder
 using EpilogueSchedule    = cutlass::epilogue::TmaWarpSpecializedCooperative;
@@ -241,6 +243,23 @@ using GemmKernelScaleWithZeroPoint = cutlass::gemm::kernel::GemmUniversal<
 
 using GemmScaleWithZeroPoint = cutlass::gemm::device::GemmUniversalAdapter<GemmKernelScaleWithZeroPoint>;
 // =================================================================================================================================================================
+
+};
+using TileShape=typename kh_config55<128>::TileShape;
+using ClusterShape=typename kh_config55<128>::ClusterShape;
+using KernelSchedule=typename kh_config55<128>::KernelSchedule;
+using EpilogueSchedule=typename kh_config55<128>::EpilogueSchedule;
+using EpilogueTileType=typename kh_config55<128>::EpilogueTileType;
+using CollectiveEpilogue=typename kh_config55<128>::CollectiveEpilogue;
+using CollectiveMainloopConvertOnly=typename kh_config55<128>::CollectiveMainloopConvertOnly;
+using GemmKernelConvertOnly=typename kh_config55<128>::GemmKernelConvertOnly;
+using GemmConvertOnly=typename kh_config55<128>::GemmConvertOnly;
+using CollectiveMainloopScaleOnly=typename kh_config55<128>::CollectiveMainloopScaleOnly;
+using GemmKernelScaleOnly=typename kh_config55<128>::GemmKernelScaleOnly;
+using GemmScaleOnly=typename kh_config55<128>::GemmScaleOnly;
+using CollectiveMainloopScaleWithZeroPoint=typename kh_config55<128>::CollectiveMainloopScaleWithZeroPoint;
+using GemmKernelScaleWithZeroPoint=typename kh_config55<128>::GemmKernelScaleWithZeroPoint;
+using GemmScaleWithZeroPoint=typename kh_config55<128>::GemmScaleWithZeroPoint;
 
 using StrideA = cutlass::detail::TagToStrideA_t<LayoutA>;
 using StrideB = cutlass::detail::TagToStrideB_t<LayoutB>;
@@ -433,6 +452,15 @@ bool verify(MixedDtypeOptions const& options) {
   return passed;
 }
 
+// Coalesced public-layout dequantization; part of every vendor invocation.
+__global__ void kh_dequantize55(ElementA* out,const ElementB* input,const ElementA* scale,
+    const ElementA* zero,int N,int K,int group) {
+  for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<size_t(N)*K;i+=size_t(blockDim.x)*gridDim.x) {
+    size_t n=i/K,k=i%K,idx=n+(k/group)*N;
+    out[i]=ElementA(float(scale[idx])*float(input[i])+float(zero[idx]));
+  }
+}
+
 /// Execute a given example GEMM computation
 template <typename Gemm>
 int run(MixedDtypeOptions &options)
@@ -457,8 +485,24 @@ int run(MixedDtypeOptions &options)
   // Initialize CUTLASS kernel with arguments and workspace pointer
   CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
 
+  kh_lt_layout layout{options.m,options.n,options.k,options.k,options.k,options.n,CUDA_R_16F,CUDA_R_16F,CUDA_R_16F};
+  layout.d_row=true;kh_lt_plan plan(layout);
+  auto original=[&](){CUTLASS_CHECK(gemm.run());};
+  auto vendor=[&](){
+    // Dequantization is performed on every invocation and included in timing.
+    kh_dequantize55<<<8192,256>>>(block_B_dq.get(),block_B.get(),block_scale.get(),block_zero.get(),options.n,options.k,options.g);
+    CUDA_CHECK(plan.run(block_A.get(),block_B_dq.get(),block_D.get(),options.alpha,0));
+  };
+  bool use_vendor=options.l==1 && options.beta==0 && kh_prefer_second_reference(original,vendor);
+  if(use_vendor) {
+    original();cutlass::DeviceAllocation<ElementD> expected(block_D.size());
+    CUDA_CHECK(cudaMemcpy(expected.get(),block_D.get(),block_D.size()*sizeof(ElementD),cudaMemcpyDeviceToDevice));
+    vendor();kh_check_device(block_D.get(),expected.get(),block_D.size(),0.01,0.003,0.001);
+  }
+  auto reference=[&](){if(use_vendor)vendor();else original();};
+
   // Correctness / Warmup iteration
-  CUTLASS_CHECK(gemm.run());
+  reference();
 
   // Check if output from CUTLASS kernel and reference kernel are equal or not
   MixedDtypeResult result;
@@ -529,7 +573,7 @@ int run(MixedDtypeOptions &options)
 
     // Warmup reference
     for (int i = 0; i < 3; i++) {
-      CUTLASS_CHECK(gemm.run());
+      reference();
     }
     cudaDeviceSynchronize();
 
@@ -538,7 +582,7 @@ int run(MixedDtypeOptions &options)
     for (int iter = 0; iter < kIterations; ++iter) {
       kh_cold_l2();
       cudaEventRecord(ev_start);
-      CUTLASS_CHECK(gemm.run());
+      reference();
       cudaEventRecord(ev_stop);
       cudaEventSynchronize(ev_stop);
       float ms;
@@ -684,7 +728,8 @@ int main(int argc, char const **args) {
     options.n = cfg.n;
     options.k = cfg.k;
 
-    run<GemmScaleWithZeroPoint>(options);
+    if(options.m>=1024)run<typename kh_config55<256>::GemmScaleWithZeroPoint>(options);
+    else run<GemmScaleWithZeroPoint>(options);
   }
 #endif
 

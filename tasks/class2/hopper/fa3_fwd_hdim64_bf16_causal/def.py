@@ -28,7 +28,8 @@ TIMING_STATISTIC = 'min'
 HAS_CUDA_REFERENCE = True
 REFERENCE_EXTRA_INCLUDES = ['reference_sources/flash_attn_v3',
                            'reference_sources/flash-attention/csrc/cutlass/include']
-REFERENCE_EXTRA_CUDA_FLAGS = ['-gencode', 'arch=compute_90a,code=sm_90a']
+REFERENCE_EXTRA_CUDA_FLAGS = ['-gencode', 'arch=compute_90a,code=sm_90a', '-DNDEBUG',
+                             '-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED']
 
 
 def _blocks(q, k):

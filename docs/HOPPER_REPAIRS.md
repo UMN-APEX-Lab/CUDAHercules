@@ -1,5 +1,9 @@
 # Hopper benchmark 修复与 H200 验证
 
+后续性能 reference 检查见 [HOPPER_REFERENCE_AUDIT.md](HOPPER_REFERENCE_AUDIT.md)：
+替换弱 GEMM baseline、补齐全部 FA3 的生产 release 参数，并重新验证和发布 85 项缓存。
+该报告和 `docs/validation/hopper_reference_audit.json` 保留新旧版本来源；历史 KDA 分数没有改写。
+
 本次修复对应 `HOPPER_BLACKWELL_AUDIT.md` 中的 Hopper 部分：21 个 Class 1、64 个 Class 2，共 85 项。验证机器实际为 **H200 NVL / SM90**，并非审查时假设的 H200 SXM。Blackwell 任务文件未修改，也未在 H200 上验证。
 
 ## 判分与计时

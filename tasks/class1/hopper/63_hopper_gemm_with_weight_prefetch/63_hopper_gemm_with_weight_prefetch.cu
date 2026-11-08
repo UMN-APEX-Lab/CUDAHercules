@@ -169,7 +169,7 @@ using ElementAccumulator  = float;                                          // E
 using ElementCompute      = float;                                          // Element type for epilogue computation
 using ArchTag             = cutlass::arch::Sm90;                            // Tag indicating the minimum SM that supports the intended feature
 using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
-using TileShape           = Shape<_64,_64,_128>;                            // Threadblock-level tile size
+using TileShape           = Shape<_64,_128,_128>;                            // Threadblock-level tile size
 // Cluster_N > 1 is not supported yet.
 using ClusterShape        = Shape<_1,_1,_1>;                                // Shape of the threadblocks in a cluster
 using KernelSchedule      = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccumWithPrefetchAndSplitDMA;

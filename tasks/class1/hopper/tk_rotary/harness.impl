@@ -54,11 +54,12 @@ double efficiency(long long flop, double time) {
 // Helper to launch the TK rotary kernel
 void launch_tk_rotary(bf16 *d_o, bf16 *d_x, bf16 *d_sin_in, bf16 *d_cos_in) {
     unsigned long mem_size = (MAX_SHARED_MEMORY-2048);
-    cudaFuncSetAttribute(
+    static bool attributes_set=false;
+    if(!attributes_set) {cudaFuncSetAttribute(
         kittens::prototype::lcsf::kernel<rope_t>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         mem_size
-    );
+    );attributes_set=true;}
 
     constexpr int BATCHES_PER_BLOCK = 4;
     static rope_t::layout::seq_global Og{d_o, ATTN_B, ATTN_H, ATTN_N, nullptr};

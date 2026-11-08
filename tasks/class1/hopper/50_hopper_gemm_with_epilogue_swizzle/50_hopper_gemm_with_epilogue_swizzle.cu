@@ -61,6 +61,7 @@
 #include "cutlass/util/reference/device/tensor_fill.h"
 
 #include "helper.h"
+#include "hopper_cublaslt_reference.cuh"
 
 #ifdef KH_TEST_SOLUTION
 #include "solution.h"
@@ -175,66 +176,15 @@ cudaError_t CutlassGemm50(
   int8_t const *B, int ldb,
   int32_t beta,
   int32_t *D, int ldd) {
-
-  using StrideA_t = typename Gemm50::GemmKernel::StrideA;
-  using StrideB_t = typename Gemm50::GemmKernel::StrideB;
-  using StrideC_t = typename Gemm50::GemmKernel::StrideC;
-  using StrideD_t = typename Gemm50::GemmKernel::StrideD;
-
-  auto stride_A = cutlass::make_cute_packed_stride(StrideA_t{}, cute::make_shape(M, K, 1));
-  auto stride_B = cutlass::make_cute_packed_stride(StrideB_t{}, cute::make_shape(N, K, 1));
-  auto stride_C = cutlass::make_cute_packed_stride(StrideC_t{}, cute::make_shape(M, N, 1));
-  auto stride_D = cutlass::make_cute_packed_stride(StrideD_t{}, cute::make_shape(M, N, 1));
-
-  cutlass::KernelHardwareInfo hw_info;
-  hw_info.device_id = 0;
-  hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
-
-  // Construct arguments matching the sm90_gemm_tma_warpspecialized kernel's Arguments struct
-  typename Gemm50::GemmKernel::ProblemShape problem_shape{M, N, K, 1};
-  typename Gemm50::GemmKernel::MainloopArguments mainloop_args{A, stride_A, B, stride_B};
-  typename Gemm50::GemmKernel::EpilogueArguments epilogue_args{
-    {alpha, beta}, nullptr, stride_C, D, stride_D
-  };
-
-  typename Gemm50::GemmKernel::Arguments arguments{
-    cutlass::gemm::GemmUniversalMode::kGemm,
-    problem_shape,
-    mainloop_args,
-    epilogue_args,
-    hw_info
-  };
-
-  auto key=std::make_tuple(M,N,K,alpha,beta,A,B,D);
+  auto key=std::make_tuple(M,N,K,ldd);
   static decltype(key) previous{};
-  static bool ready=false;
-  static Gemm50 gemm;
-  size_t workspace_size = Gemm50::get_workspace_size(arguments);
-  static cutlass::device_memory::allocation<uint8_t> workspace;
-  if (!ready || key!=previous) {
-    workspace.reset(workspace_size);
-
-  cutlass::Status status = gemm.can_implement(arguments);
-  if (status != cutlass::Status::kSuccess) {
-    std::cerr << "can_implement failed" << std::endl;
-    return cudaErrorUnknown;
+  static std::unique_ptr<kh_lt_plan> plan;
+  if(!plan||key!=previous) {
+    kh_lt_layout layout{M,N,K,K,K,ldd,CUDA_R_8I,CUDA_R_8I,CUDA_R_32I};
+    layout.compute=CUBLAS_COMPUTE_32I;
+    plan=std::make_unique<kh_lt_plan>(layout);previous=key;
   }
-
-  status = gemm.initialize(arguments, workspace.get());
-  if (status != cutlass::Status::kSuccess) {
-    std::cerr << "initialize failed" << std::endl;
-    return cudaErrorUnknown;
-  }
-
-    previous=key;ready=true;
-  }
-  cutlass::Status status = gemm.run();
-  if (status != cutlass::Status::kSuccess) {
-    std::cerr << "run failed: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
-    return cudaErrorUnknown;
-  }
-
-  return cudaSuccess;
+  return plan->run_integer(A,B,D,alpha,beta);
 }
 
 #endif // defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)

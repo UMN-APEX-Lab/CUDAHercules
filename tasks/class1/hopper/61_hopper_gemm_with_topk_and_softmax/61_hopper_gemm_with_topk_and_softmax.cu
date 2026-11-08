@@ -83,6 +83,8 @@
 
 
 #include "helper.h"
+#include "hopper_cublaslt_reference.cuh"
+#include "vllm_topk_reference.cuh"
 
 #ifdef KH_TEST_SOLUTION
 #include <cuda_fp16.h>
@@ -259,7 +261,7 @@ struct Options {
   }
 
   float alpha() const {
-    return 1.f / static_cast<float>(k);
+    return 1.f / std::sqrt(static_cast<float>(k));
   }
 };
 
@@ -294,7 +296,7 @@ bool initialize_tensor(
     cutlass::TensorView<Element, Layout> view,
     uint64_t seed) {
   cutlass::reference::host::TensorFillRandomUniform(
-    view, seed, /* max = */ 1, /* min = */ -1, /* bits = */ 2);
+    view, seed, /* max = */ 1, /* min = */ -1, /* bits = */ -1);
   return true;
 }
 
@@ -460,8 +462,28 @@ int run(Options &options) {
   // Initialize CUTLASS kernel with arguments and workspace pointer
   CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
 
+  kh_lt_layout layout{options.m,options.n,options.k,options.k,options.k,options.n,CUDA_R_16F,CUDA_R_16F,CUDA_R_32F};
+  layout.d_row=true;kh_lt_plan plan(layout);
+  cutlass::DeviceAllocation<float> logits(size_t(options.m)*options.n),weights(size_t(options.m)*TopK);
+  cutlass::DeviceAllocation<int> ids(size_t(options.m)*TopK),source_rows(size_t(options.m)*TopK);
+  auto original=[&](){CUTLASS_CHECK(gemm.run());};
+  auto vendor=[&](){
+    if(plan.run(tensor_A.device_data(),tensor_B.device_data(),logits.get(),options.alpha())!=cudaSuccess)exit(1);
+    kh_vllm_reference::topkGating<4,128,4,16,32,int,float,kh_vllm_reference::SCORING_SOFTMAX>
+      <<<(options.m+3)/4,dim3(32,4)>>>(logits.get(),nullptr,weights.get(),options.m,ids.get(),source_rows.get(),TopK,0,128,true,nullptr,1.0,nullptr);
+    cudaMemsetAsync(tensor_D.device_data(),0,size_t(options.m)*options.n*2);
+    kh_scatter_router<<<(options.m*TopK+255)/256,256>>>(weights.get(),ids.get(),reinterpret_cast<__half*>(tensor_D.device_data()),options.m,options.n,TopK);
+  };
+  bool use_vendor=options.n==128 && kh_prefer_second_reference(original,vendor);
+  if(use_vendor) {
+    original();cutlass::DeviceAllocation<ElementD> expected(size_t(options.m)*options.n);
+    cudaMemcpy(expected.get(),tensor_D.device_data(),size_t(options.m)*options.n*sizeof(ElementD),cudaMemcpyDeviceToDevice);
+    vendor();kh_check_device(tensor_D.device_data(),expected.get(),size_t(options.m)*options.n,0.004,0,0.002);
+  }
+  auto reference=[&](){if(use_vendor)vendor();else original();};
+
   // Correctness / Warmup iteration
-  CUTLASS_CHECK(gemm.run());
+  reference();
 
   Result result;
   std::cout << "Passed" << std::endl;
@@ -474,7 +496,7 @@ int run(Options &options) {
 
     // Warmup
     for (int i = 0; i < 3; i++) {
-      CUTLASS_CHECK(gemm.run());
+      reference();
     }
     cudaDeviceSynchronize();
 
@@ -483,7 +505,7 @@ int run(Options &options) {
     for (int iter = 0; iter < options.iterations; ++iter) {
       kh_cold_l2();
       cudaEventRecord(start);
-      CUTLASS_CHECK(gemm.run());
+      reference();
       cudaEventRecord(stop);
       cudaEventSynchronize(stop);
       float ms;

@@ -146,9 +146,17 @@ def get_solution_cuda_flags(task_def: dict, target_sm: int) -> list[str]:
     torch's cpp_extension auto-detects a plain sm_XX target for the
     solution only, and those instructions fail in ptxas.
     """
+    reference_flags = task_def.get("REFERENCE_EXTRA_CUDA_FLAGS", [])
     if target_sm > 0:
-        return _current_arch_gencode_flags(target_sm)
-    return _extract_gencode_flags(task_def.get("REFERENCE_EXTRA_CUDA_FLAGS", []))
+        flags = _current_arch_gencode_flags(target_sm)
+    else:
+        flags = _extract_gencode_flags(reference_flags)
+    # Device assertions can serialize WGMMA pipelines. A production release
+    # reference and a submission must use the same assertion configuration.
+    for shared in ("-DNDEBUG", "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED"):
+        if shared in reference_flags:
+            flags.append(shared)
+    return flags
 
 
 def get_solution_include_dirs(root_dir: str) -> list[str]:

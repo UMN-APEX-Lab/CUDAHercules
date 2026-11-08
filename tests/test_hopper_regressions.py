@@ -122,6 +122,16 @@ def test_fa3_uses_same_minimum_statistic_for_both_timings():
     assert task['TIMING_STATISTIC']=='min'
 
 
+def test_release_flags_are_shared_with_fa3_submissions():
+    from cuda_hercules.eval import get_solution_cuda_flags
+    task=load_task_def(str(ROOT/'tasks/class2/hopper/fa3_fwd_hdim128_fp16'))
+    for target in (0,90):
+        flags=get_solution_cuda_flags(task,target)
+        assert '-DNDEBUG' in flags
+        assert '-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED' in flags
+    assert '-DNDEBUG' not in get_solution_cuda_flags({'REFERENCE_EXTRA_CUDA_FLAGS':[]},90)
+
+
 @pytest.mark.parametrize('fingerprint,expected',[('stale',2.0),('current',10.0)])
 def test_hopper_cache_is_used_only_for_matching_sources(monkeypatch,fingerprint,expected):
     cfg=load_task_config(str(next((ROOT/'tasks/class1/hopper').glob('48_*/task.yaml'))))

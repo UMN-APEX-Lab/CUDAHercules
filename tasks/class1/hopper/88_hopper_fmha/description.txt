@@ -1,6 +1,6 @@
 Implement a CUDA kernel for Hopper SM90 (H200).
 
-CUTLASS Hopper FMHA baseline, fp16 contiguous Q[B,H,Sq,D], K/V[B,H,Sk,D], O[B,H,Sq,D].
+Hopper FMHA, fp16 contiguous Q[B,H,Sq,D], K/V[B,H,Sk,D], O[B,H,Sq,D].
 Compute O=softmax(Q@K^T/sqrt(D))@V with fp32 dot products, softmax and accumulation, then round to fp16.
 The default workloads use non-causal multi-head attention (Hq=Hkv), D=128, long context.
 This ABI does not provide GQA or causal masking; those are explicitly covered by the FA3 tasks.

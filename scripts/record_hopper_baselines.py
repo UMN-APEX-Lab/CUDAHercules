@@ -5,6 +5,7 @@ Run the three Hopper validation scripts first. This command refuses incomplete,
 failed, or stale results. It does not run kernels or modify task definitions.
 """
 import argparse
+import ctypes
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -101,6 +102,23 @@ def main():
         gpu_execution="serialized with .cache/hopper_gpu.lock",
         coverage="active Makefile targets plus 60 generated FA3 tasks; Blackwell excluded",
     )
+    # cuBLASLt algorithm IDs and heuristics depend on the installed library.
+    # Also record vendored source fingerprints so a reproduced experiment can
+    # distinguish a task change from a dependency/toolchain change.
+    blas = ctypes.CDLL("libcublasLt.so")
+    blas.cublasLtGetVersion.restype = ctypes.c_size_t
+    metadata["reference_libraries"] = dict(
+        cublaslt_version=int(blas.cublasLtGetVersion()),
+        source_hashes={name: task_source_hash(ROOT / path) for name, path in {
+            "cutlass": "reference_sources/cutlass/include",
+            "fa3": "reference_sources/flash_attn_v3",
+            "fa3_cutlass": "reference_sources/flash-attention/csrc/cutlass/include",
+            "thunderkittens": "reference_sources/ThunderKittens/include",
+            "deepgemm": "reference_sources/deep_gemm/deep_gemm",
+        }.items()},
+    )
+    metadata["release_flags"] = dict(make=["-DNDEBUG"],
+        fa3=["-DNDEBUG", "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED"])
     cache = ROOT / "reference_benchmarks" / (gpu.replace(" ", "_") + ".json")
     cache.parent.mkdir(exist_ok=True)
     cache.write_text(json.dumps(dict(metadata=metadata, benchmarks=benchmarks), indent=2) + "\n")

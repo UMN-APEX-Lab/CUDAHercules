@@ -1,6 +1,6 @@
 {
   "metadata": {
-    "recorded_at_utc": "2026-11-08T02:25:25.065062+00:00",
+    "recorded_at_utc": "2026-11-08T06:01:38.371830+00:00",
     "gpu": "NVIDIA H200 NVL",
     "device_capability": [
       9,
@@ -16,343 +16,362 @@
       "fa3": 268435456
     },
     "gpu_execution": "serialized with .cache/hopper_gpu.lock",
-    "coverage": "active Makefile targets plus 60 generated FA3 tasks; Blackwell excluded"
+    "coverage": "active Makefile targets plus 60 generated FA3 tasks; Blackwell excluded",
+    "reference_libraries": {
+      "cublaslt_version": 130100,
+      "source_hashes": {
+        "cutlass": "666eb506088ad49193db900c022af05522854c598a783706c5cc943ccecb923d",
+        "fa3": "3b640529ccea8b6e1f2b954a0bc2800a78698f37feab8ed066e44543c5a8e16c",
+        "fa3_cutlass": "d204284c0186da0c106283a086d3c6b998cb03bdb7efdaae15008df26642c7c7",
+        "thunderkittens": "0125a85f5645ba5ca468ef7085cce75e5a09427288cd1f6c3b71eb4ddbcc8363",
+        "deepgemm": "a50186c0dd1a849f5b45828c26f401348e5ec5e90c0fc3ad572ce9f574cb49f0"
+      }
+    },
+    "release_flags": {
+      "make": [
+        "-DNDEBUG"
+      ],
+      "fa3": [
+        "-DNDEBUG",
+        "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED"
+      ]
+    }
   },
   "benchmarks": {
     "class1/hopper/48_hopper_warp_specialized_gemm": {
-      "source_hash": "6f180e3917d0547af33b7e46fc13f48306899d0f3c892df16af90277bf15c12d",
+      "source_hash": "17f2f7a64ef8d2a268be00dae04be46fbf6ca4ad31f1ec0c85028e7b92d2ea44",
       "per_size": [
         {
           "name": "decode: M=128, N=8192, K=8192",
-          "ref_min_ms": 0.3907
+          "ref_min_ms": 0.0914
         },
         {
           "name": "prefill: M=8192, N=8192, K=8192",
-          "ref_min_ms": 4.222
+          "ref_min_ms": 3.0173
         },
         {
           "name": "mlp: M=8192, N=28672, K=8192",
-          "ref_min_ms": 16.0631
+          "ref_min_ms": 11.5825
         }
       ]
     },
     "class1/hopper/49_hopper_gemm_with_collective_builder": {
-      "source_hash": "52cec4a2d7edc59bd5f2b264a0448ce4e3bfefa2e423c595d38641e9378dea2c",
+      "source_hash": "1cbc65a53226c31d53c7b6f04b2e2064f864beab24b8608c8b356da7b0dd2c99",
       "per_size": [
         {
           "name": "decode: M=128, N=8192, K=8192",
-          "ref_min_ms": 0.0777
+          "ref_min_ms": 0.0488
         },
         {
           "name": "prefill: M=8192, N=8192, K=8192",
-          "ref_min_ms": 2.2481
+          "ref_min_ms": 1.6533
         },
         {
           "name": "mlp: M=8192, N=28672, K=8192",
-          "ref_min_ms": 8.6449
+          "ref_min_ms": 6.2252
         }
       ]
     },
     "class1/hopper/50_hopper_gemm_with_epilogue_swizzle": {
-      "source_hash": "a89818b847ee718a572570a34e7467f230bccc7bb0fa5c35de03585898c52293",
+      "source_hash": "e90fca6bbf1138450cf18454cd580f5edececa2210fa1d74b586ad5d534fad33",
       "per_size": [
         {
           "name": "decode: M=128, N=8192, K=8192",
-          "ref_min_ms": 0.0585
+          "ref_min_ms": 0.0325
         },
         {
           "name": "prefill: M=8192, N=8192, K=8192",
-          "ref_min_ms": 2.8587
+          "ref_min_ms": 0.8157
         },
         {
           "name": "mlp: M=8192, N=28672, K=8192",
-          "ref_min_ms": 9.8811
+          "ref_min_ms": 3.0579
         }
       ]
     },
     "class1/hopper/51_hopper_gett": {
-      "source_hash": "17f831139d247b6a729d7a844626489e23a6c353c05b9a57bccf10e51f15d2e7",
+      "source_hash": "9b11c75517a858560556cdf48a6aa423b69182b2afbc2b5c6ff2ce5e83f658ba",
       "per_size": [
         {
           "name": "decode: M=128, N=8192, K=8192",
-          "ref_min_ms": 0.0896
+          "ref_min_ms": 0.0734
         },
         {
           "name": "prefill: M=8192, N=8192, K=8192",
-          "ref_min_ms": 2.6905
+          "ref_min_ms": 2.331
         },
         {
           "name": "mlp: M=8192, N=28672, K=8192",
-          "ref_min_ms": 9.3727
+          "ref_min_ms": 8.1274
         }
       ]
     },
     "class1/hopper/52_hopper_gather_scatter_fusion": {
-      "source_hash": "9456929ba99d979172b2f988f7fe499745bfa7c1ca100850c6df1cfd73f9c4eb",
+      "source_hash": "616ebb4781fc57519e13af798bd936d63c9891b90295a83ea0862162330a0ed0",
       "per_size": [
         {
           "name": "moe_decode: M=1536, N_orig=4096, K=2048, index_size=2048",
-          "ref_min_ms": 0.07904
+          "ref_min_ms": 0.053888
         },
         {
           "name": "moe_prefill: M=1536, N_orig=32768, K=2048, index_size=16384",
-          "ref_min_ms": 0.44368
+          "ref_min_ms": 0.337216
         },
         {
           "name": "moe_down: M=2048, N_orig=16384, K=1536, index_size=8192",
-          "ref_min_ms": 0.2512
+          "ref_min_ms": 0.172992
         }
       ]
     },
     "class1/hopper/54_hopper_fp8_warp_specialized_gemm": {
-      "source_hash": "30680bde868f68bc57f515cad8ecd5d91da3114d484e2c11a0a8f973d318b4f8",
+      "source_hash": "e0a2c13058f6e0a969764b48c023bbc44cf63a20aebde315e74899ad011eae48",
       "per_size": [
         {
           "name": "fp8_linear: M=128, N=8192, K=8192",
-          "ref_min_ms": 0.046432
+          "ref_min_ms": 0.031936
         },
         {
           "name": "fp8_linear: M=8192, N=8192, K=8192",
-          "ref_min_ms": 1.248288
+          "ref_min_ms": 0.871488
         },
         {
           "name": "fp8_linear: M=8192, N=28672, K=8192",
-          "ref_min_ms": 4.226976
+          "ref_min_ms": 3.008192
         }
       ]
     },
     "class1/hopper/55_hopper_mixed_dtype_gemm": {
-      "source_hash": "9e192138f0a9db9131a4db8c9c6179e5280f937ed488d2b932f391ca75f4b59e",
+      "source_hash": "300cf28546df2f87f84181974117e6dceaf35b5972363776174ec994129a614d",
       "per_size": [
         {
           "name": "decode: M=128, N=8192, K=8192",
-          "ref_min_ms": 0.0965
+          "ref_min_ms": 0.0661
         },
         {
           "name": "prefill: M=8192, N=8192, K=8192",
-          "ref_min_ms": 2.9058
+          "ref_min_ms": 1.8639
         },
         {
           "name": "mlp: M=8192, N=28672, K=8192",
-          "ref_min_ms": 11.2957
+          "ref_min_ms": 7.1633
         }
       ]
     },
     "class1/hopper/56_hopper_ptr_array_batched_gemm": {
-      "source_hash": "5bdf8f869cc21b8473383360b0a3d77f8166d757e952915f80a40ab9c8f5c5c2",
+      "source_hash": "aca77cd5e0b56cdb40b6a396f0bff5c00620cd058d5154736a93d4ad84074362",
       "per_size": [
         {
           "name": "expert_decode: M=128, N=1536, K=2048, batch=128",
-          "ref_min_ms": 0.3877
+          "ref_min_ms": 0.2537
         },
         {
           "name": "expert_prefill: M=1024, N=1536, K=2048, batch=128",
-          "ref_min_ms": 1.5021
+          "ref_min_ms": 1.2815
         },
         {
           "name": "expert_large: M=2048, N=1536, K=2048, batch=32",
-          "ref_min_ms": 0.8331
+          "ref_min_ms": 0.6319
         }
       ]
     },
     "class1/hopper/57_hopper_grouped_gemm": {
-      "source_hash": "64ef36660ae4c44aa41605122fa32fd929056ca6db0497b429a1674bb0bdb9bb",
+      "source_hash": "2dc2bd2d908299767bae68f513294cc9334d608491785c865a45bbb2b3b46541",
       "per_size": [
         {
           "name": "moe_decode: M=128, N=1536, K=2048, groups=16",
-          "ref_min_ms": 0.1013
+          "ref_min_ms": 0.0975
         },
         {
           "name": "moe_prefill: M=1024, N=1536, K=2048, groups=32",
-          "ref_min_ms": 0.5335
+          "ref_min_ms": 0.5536
         },
         {
           "name": "moe_large: M=2048, N=1536, K=2048, groups=16",
-          "ref_min_ms": 0.4955
+          "ref_min_ms": 0.5052
         }
       ]
     },
     "class1/hopper/61_hopper_gemm_with_topk_and_softmax": {
-      "source_hash": "1789b8a95702a284421de5c2be17dea1a947931a71010dba5de9152b9f33d574",
+      "source_hash": "78e0fd9883cd95e2f16e619f3385e7e72a6a4c27c08c912ed4a5a0ee7e284775",
       "per_size": [
         {
           "name": "router_prefill: M=8192, N=128, K=2048",
-          "ref_min_ms": 0.0628
+          "ref_min_ms": 0.0424
         },
         {
           "name": "router_long: M=16384, N=128, K=2048",
-          "ref_min_ms": 0.1194
+          "ref_min_ms": 0.0684
         },
         {
           "name": "router_large: M=16384, N=128, K=5120",
-          "ref_min_ms": 0.1578
+          "ref_min_ms": 0.0996
         }
       ]
     },
     "class1/hopper/62_hopper_sparse_gemm": {
-      "source_hash": "aacdbbf446c5b940f1d7236433e07864ff8afcc284ea644bbc7813cae87740d1",
+      "source_hash": "12d8f92d95a03462eb592f09cfa31c905e5f66c27100dbde7e3d8fcc20d18b75",
       "per_size": [
         {
           "name": "decode: M=128, N=8192, K=8192",
-          "ref_min_ms": 0.0513
+          "ref_min_ms": 0.0514
         },
         {
           "name": "prefill: M=8192, N=8192, K=8192",
-          "ref_min_ms": 1.5707
+          "ref_min_ms": 1.7105
         },
         {
           "name": "mlp: M=8192, N=28672, K=8192",
-          "ref_min_ms": 4.6398
+          "ref_min_ms": 4.735
         }
       ]
     },
     "class1/hopper/63_hopper_gemm_with_weight_prefetch": {
-      "source_hash": "c344299fa93ddca6c3d4c57a9293c450b655c3fb3479a64cd72a3973883561bf",
+      "source_hash": "78c4a22332096a9de77526390b415c654200f52e2451a25aa1cba8efde103787",
       "per_size": [
         {
           "name": "decode_16: M=16, N=8192, K=8192",
-          "ref_min_ms": 0.0372
+          "ref_min_ms": 0.0342
         },
         {
           "name": "decode_64: M=64, N=28672, K=8192",
-          "ref_min_ms": 0.1046
+          "ref_min_ms": 0.0791
         },
         {
           "name": "decode_128: M=128, N=8192, K=28672",
-          "ref_min_ms": 0.1752
+          "ref_min_ms": 0.0937
         }
       ]
     },
     "class1/hopper/67_hopper_fp8_warp_specialized_gemm_with_blockwise_scaling": {
-      "source_hash": "22ab4de4da712c49cdeeb258c2d848724b1f33bcab197a7c6c8f99913cc8f738",
+      "source_hash": "bc3d6b1dcc59c10a3ab2f9628598501763dc4626acd20dcec72750ead42b7e16",
       "per_size": [
         {
           "name": "decode: M=128, N=8192, K=8192",
-          "ref_min_ms": 0.0498
+          "ref_min_ms": 0.0451
         },
         {
           "name": "prefill: M=8192, N=8192, K=8192",
-          "ref_min_ms": 1.3304
+          "ref_min_ms": 1.1774
         },
         {
           "name": "mlp: M=8192, N=28672, K=8192",
-          "ref_min_ms": 4.5403
+          "ref_min_ms": 3.9577
         }
       ]
     },
     "class1/hopper/68_hopper_fp8_warp_specialized_grouped_gemm_with_blockwise_scaling": {
-      "source_hash": "51ff0d7f715cd7d84b793d365cada5f2ac7b4fecaa904cfea068717e5dc294cc",
+      "source_hash": "959d45449dca2b3ef1a65c2bb4b657c195227abe32df0acf5cde3a51f1a25fbb",
       "per_size": [
         {
           "name": "moe_decode: M=128, N=1536, K=2048, groups=16",
-          "ref_min_ms": 0.036
+          "ref_min_ms": 0.0335
         },
         {
           "name": "moe_prefill: M=1024, N=1536, K=2048, groups=32",
-          "ref_min_ms": 0.2748
+          "ref_min_ms": 0.2145
         },
         {
           "name": "moe_large: M=2048, N=1536, K=2048, groups=16",
-          "ref_min_ms": 0.2439
+          "ref_min_ms": 0.1928
         }
       ]
     },
     "class1/hopper/69_hopper_mixed_dtype_grouped_gemm": {
-      "source_hash": "e3da74676493ec00f30d9536f9f7245f94d190d404677744b213761d03698e6c",
+      "source_hash": "bbdcce0afd34b5d1ed77207287a1f5ebc70c4732c963c225d3bbc2cb85ce91f1",
       "per_size": [
         {
           "name": "moe_decode: M=128, N=2048, K=2048, groups=16",
-          "ref_min_ms": 0.1841
+          "ref_min_ms": 0.0584
         },
         {
           "name": "moe_prefill: M=1024, N=2048, K=2048, groups=16",
-          "ref_min_ms": 1.3324
+          "ref_min_ms": 0.225
         },
         {
           "name": "moe_large: M=2048, N=2048, K=4096, groups=8",
-          "ref_min_ms": 2.4343
+          "ref_min_ms": 0.3837
         }
       ]
     },
     "class1/hopper/88_hopper_fmha": {
-      "source_hash": "a7c5ef15d26ff133fb7ac10baa0c9006494096e52bd75cd8b4809ab18f42393e",
+      "source_hash": "80079a49222715cc4af455b831d67c6ae8ef9c6377b910114d574e294b49c7c1",
       "per_size": [
         {
           "name": "vision_prefill: batch=1, heads=16, seq_q=8192, seq_k=8192, hdim=128",
-          "ref_min_ms": 1.16
+          "ref_min_ms": 0.8334
         },
         {
           "name": "cross_attention: batch=1, heads=32, seq_q=4096, seq_k=8192, hdim=128",
-          "ref_min_ms": 1.1541
+          "ref_min_ms": 0.8395
         },
         {
           "name": "long_prefill: batch=1, heads=16, seq_q=16384, seq_k=16384, hdim=128",
-          "ref_min_ms": 4.5686
+          "ref_min_ms": 3.4908
         }
       ]
     },
     "class1/hopper/deepgemm_mqa_logits": {
-      "source_hash": "5b1692b0c6cd452387e1a3c1b3d59d783c081f6203d05138283efdc3bd282930",
+      "source_hash": "631293a4845b40c457a6792ee3f3dae86c6477517ca8515aec7c64f9a647a830",
       "per_size": [
         {
           "name": "S=4096,SKV=32768",
-          "ref_min_ms": 2.4809
+          "ref_min_ms": 2.492
         },
         {
           "name": "S=8192,SKV=32768",
-          "ref_min_ms": 4.6336
+          "ref_min_ms": 4.6459
         },
         {
           "name": "S=8192,SKV=65536",
-          "ref_min_ms": 9.78
+          "ref_min_ms": 10.193
         }
       ]
     },
     "class1/hopper/tk_bf16_gemm": {
-      "source_hash": "53492fb031bf4fb8d61fc61c79dfd1e3838d9b693774b38f9308821381ef0789",
+      "source_hash": "dbda466654b57765554cb218f2475e21e3aabe6c36466adf6b9639e9c9ec963a",
       "per_size": [
         {
           "name": "qwen_decode: M=128, N=5120, K=5120",
-          "ref_min_ms": 0.0608
+          "ref_min_ms": 0.0295
         },
         {
           "name": "qwen_prefill: M=8192, N=27648, K=5120",
-          "ref_min_ms": 3.2871
+          "ref_min_ms": 3.3336
         }
       ]
     },
     "class1/hopper/tk_fp8_gemm": {
-      "source_hash": "6b177a439afe54baa24faea2a42bdeca870efe5545e425be52bdbcf9db2c82de",
+      "source_hash": "a9cec8613d3b79e53678fdc55f42366d74822af8d5a4b175f647ef0a9c676660",
       "per_size": [
         {
           "name": "fp8_decode: M=128, N=8192, K=8192",
-          "ref_min_ms": 0.1702
+          "ref_min_ms": 0.0312
         },
         {
           "name": "fp8_prefill: M=8192, N=28672, K=8192",
-          "ref_min_ms": 9.3913
+          "ref_min_ms": 3.5805
         }
       ]
     },
     "class1/hopper/tk_fp8_gemm_scaled": {
-      "source_hash": "c2a6ffbedf79d66c897d37ac466cbdfed54215af98c2fbdf5c1c4b19c7d46059",
+      "source_hash": "7d25574d8f408e1e3a62a062ccdf2a84396cb4a66cbf706ac029403896668850",
       "per_size": [
         {
           "name": "fp8_scaled_decode: M=128, N=8192, K=8192",
-          "ref_min_ms": 0.0504
+          "ref_min_ms": 0.0373
         },
         {
           "name": "fp8_scaled_prefill: M=8192, N=28672, K=8192",
-          "ref_min_ms": 4.7917
+          "ref_min_ms": 4.0638
         }
       ]
     },
     "class1/hopper/tk_rotary": {
-      "source_hash": "b78860bebd36ae5331f692b8c93046c992b29a02d723cc5f2c7232bc90961910",
+      "source_hash": "2c6ec2fe9ffe8d2bd6cfe933f08c026a60a608b46fd0f6a8a0b9eda0bd51025a",
       "per_size": [
         {
           "name": "rotary: B=1, H=72, N=16384, D=128",
-          "ref_min_ms": 0.17312
+          "ref_min_ms": 0.173344
         }
       ]
     },
@@ -393,304 +412,304 @@
       ]
     },
     "class2/hopper/fa3_bwd_hdim128_bf16": {
-      "source_hash": "00ec4af0e40e5a97c4730c3da49e3096723adc5fc87c6069f4eac2aad9041f20",
-      "ref_min_ms": 1.3923200368881226,
-      "ref_mean_ms": 1.393561601638794
+      "source_hash": "e95936086b3ee3dcf4cdcef2688eba29a7c8185ad25a30075bbafe8164d13b23",
+      "ref_min_ms": 0.6333439946174622,
+      "ref_mean_ms": 0.6348191499710083
     },
     "class2/hopper/fa3_bwd_hdim128_bf16_causal": {
-      "source_hash": "b83eb50a8528e79fb228372fbce974e3377d99b684b75817399766dfeb3148fa",
-      "ref_min_ms": 0.44358399510383606,
-      "ref_mean_ms": 0.44519996643066406
+      "source_hash": "1bdd74975b2d9a2ef5f23898a85ffe5b16a4c9cdbbbe8f929bf5354c29b49a1d",
+      "ref_min_ms": 0.3548479974269867,
+      "ref_mean_ms": 0.35614079236984253
     },
     "class2/hopper/fa3_bwd_hdim128_fp16": {
-      "source_hash": "06cf293ba8dc8462b8a13132ad64430ae2baeb585f41c98865567cf64cf67e93",
-      "ref_min_ms": 1.394271969795227,
-      "ref_mean_ms": 1.3952256441116333
+      "source_hash": "84d92bd00f802b0e180037e1c979a0b4ed80de37ea8db4a235c504277284dc43",
+      "ref_min_ms": 0.6414399743080139,
+      "ref_mean_ms": 0.6437311768531799
     },
     "class2/hopper/fa3_bwd_hdim128_fp16_causal": {
-      "source_hash": "0a2f3a00177be4cae1fb059f63cdda5c548d135e822a663d41fb63ac1f16e23b",
-      "ref_min_ms": 0.44470399618148804,
-      "ref_mean_ms": 0.4476095736026764
+      "source_hash": "ae7a30a37f007dbfdb4146ed600d4c32c8ab1ea6b18e37c353efb4d2eabafeb7",
+      "ref_min_ms": 0.3612479865550995,
+      "ref_mean_ms": 0.3622431755065918
     },
     "class2/hopper/fa3_bwd_hdim192_bf16": {
-      "source_hash": "481092093440d206089465b44e0d1bb0e7c8aff926a7070604940ce5f65b4b1d",
-      "ref_min_ms": 1.3743679523468018,
-      "ref_mean_ms": 1.3764896392822266
+      "source_hash": "84fdf75264d86eafc50582637ce8566e321dce655f8387beaaa0855ff9b468d8",
+      "ref_min_ms": 1.1723840236663818,
+      "ref_mean_ms": 1.1761889457702637
     },
     "class2/hopper/fa3_bwd_hdim192_bf16_causal": {
-      "source_hash": "03d8aac961383f345e90c736eb74134f1eb2dffb50517fae9a78ba898b87bc2d",
-      "ref_min_ms": 0.7157760262489319,
-      "ref_mean_ms": 0.7188704013824463
+      "source_hash": "f0369a42089a07d7b51af7cdd834e8212148302f95b22c7f376c106ca41f6510",
+      "ref_min_ms": 0.6133120059967041,
+      "ref_mean_ms": 0.6168255805969238
     },
     "class2/hopper/fa3_bwd_hdim192_fp16": {
-      "source_hash": "65ceaf8c0cb0b03727d4f5fe9bd1400af373fbda646b363914cf2840ee92f28f",
-      "ref_min_ms": 1.3736000061035156,
-      "ref_mean_ms": 1.3752415180206299
+      "source_hash": "4fc4292dd63bfc8f064278838f69baa5fccd2cf32cee4d3c69c5bdd16f7ff906",
+      "ref_min_ms": 1.1783679723739624,
+      "ref_mean_ms": 1.1802144050598145
     },
     "class2/hopper/fa3_bwd_hdim192_fp16_causal": {
-      "source_hash": "ac9ebe3d85247f2adb76cfced1c05379fd8e8d917c71d8162ec44eeee7c5c432",
-      "ref_min_ms": 0.7171519994735718,
-      "ref_mean_ms": 0.7200671434402466
+      "source_hash": "a295cb6a29c03082a342f1da2fbb0e02b78fe8e7c460ecf39eff958b920be3d5",
+      "ref_min_ms": 0.6178879737854004,
+      "ref_mean_ms": 0.6206368207931519
     },
     "class2/hopper/fa3_bwd_hdim256_bf16": {
-      "source_hash": "cd4a41319fdf3ccdd77529c84510b3648a7ecb649f8150670517581ab59718d2",
-      "ref_min_ms": 4.528992176055908,
-      "ref_mean_ms": 4.53530216217041
+      "source_hash": "6517fd8d4c064f54c7df766a117188032fc4008ba4392aa31711428740d2b0a9",
+      "ref_min_ms": 1.7871040105819702,
+      "ref_mean_ms": 1.7902719974517822
     },
     "class2/hopper/fa3_bwd_hdim256_bf16_causal": {
-      "source_hash": "1b582a46cb330f36d203bd13a8dfa4029c10b4a263517a450026a88a00e02495",
-      "ref_min_ms": 2.2198400497436523,
-      "ref_mean_ms": 2.2235264778137207
+      "source_hash": "08c0cba5e16dc14e352ad8eabfbace2b61ea97f989ac3cd082be752d480ac7cc",
+      "ref_min_ms": 0.894432008266449,
+      "ref_mean_ms": 0.898054301738739
     },
     "class2/hopper/fa3_bwd_hdim256_fp16": {
-      "source_hash": "1ffb887aeb238ab7d1ce43ddbe15b154e808bec44df07948f0c7adf1efcd0c06",
-      "ref_min_ms": 4.534463882446289,
-      "ref_mean_ms": 4.537199974060059
+      "source_hash": "842758a3b0e8685f4209dd0be0d8b7009638c4375b3d7ca612b237684296b0a2",
+      "ref_min_ms": 1.7911360263824463,
+      "ref_mean_ms": 1.7953217029571533
     },
     "class2/hopper/fa3_bwd_hdim256_fp16_causal": {
-      "source_hash": "92c741854aa1a08221d21a5082e10a90ccf741fe55f578c660b0762cbfa17b94",
-      "ref_min_ms": 2.2197439670562744,
-      "ref_mean_ms": 2.2277374267578125
+      "source_hash": "bb64ccf2fdb516a4ea24ef9f49c0df747195aa0bac87e40bbbad3f6429d97a41",
+      "ref_min_ms": 0.8972799777984619,
+      "ref_mean_ms": 0.9009151458740234
     },
     "class2/hopper/fa3_bwd_hdim64_bf16": {
-      "source_hash": "f7d45c020fd257d20d3ab52d180767ee9eff62416f84b7c678960170fc5fb05d",
-      "ref_min_ms": 0.481440007686615,
-      "ref_mean_ms": 0.4830079972743988
+      "source_hash": "b60b4f6fdbe8d24c8abcd01a002074257815a892cc8f66e1aa4dd99827561019",
+      "ref_min_ms": 0.3741439878940582,
+      "ref_mean_ms": 0.37588801980018616
     },
     "class2/hopper/fa3_bwd_hdim64_bf16_causal": {
-      "source_hash": "b4fe3ed360862fb9c867d18f8eb384992d5f1de8a343543cc2d34c0a65de5df5",
-      "ref_min_ms": 0.2818560004234314,
-      "ref_mean_ms": 0.2825344204902649
+      "source_hash": "a3199ee8c7fc5cac7d3a67bb5815bb9b37c974009e72278a5a8a57d58b2d3f69",
+      "ref_min_ms": 0.21129600703716278,
+      "ref_mean_ms": 0.21234241127967834
     },
     "class2/hopper/fa3_bwd_hdim64_fp16": {
-      "source_hash": "b49fd88da309bf35369aa723a2141ebce3afb987da4162a578e83f835fcffa1f",
-      "ref_min_ms": 0.4818879961967468,
-      "ref_mean_ms": 0.4837152063846588
+      "source_hash": "1b628ecc0fb312be62a60bfdc2ffbb6536e364538969700e812723b911c737ce",
+      "ref_min_ms": 0.37327998876571655,
+      "ref_mean_ms": 0.37531524896621704
     },
     "class2/hopper/fa3_bwd_hdim64_fp16_causal": {
-      "source_hash": "5434677ab4de7f015ac2dc1812bb78e32faf94e35dff8b48884d17b6a6cb8ad8",
-      "ref_min_ms": 0.2828480005264282,
-      "ref_mean_ms": 0.283846378326416
+      "source_hash": "b7ca0dde9a8226264511b461c7ad87c4c59c1e9d0559a8c7e9d10e625f76418e",
+      "ref_min_ms": 0.2123199999332428,
+      "ref_mean_ms": 0.21385280787944794
     },
     "class2/hopper/fa3_bwd_hdim96_bf16": {
-      "source_hash": "0062bf3f9e687fa18b10e720073033da6a1fad184b57e1a319d2f6ffe941df7c",
-      "ref_min_ms": 0.8096640110015869,
-      "ref_mean_ms": 0.8114463686943054
+      "source_hash": "72cfa30126fb6472b7e1d3fb6cef521b2acf706d334a17b45f0883486217e406",
+      "ref_min_ms": 0.5394880175590515,
+      "ref_mean_ms": 0.5412128567695618
     },
     "class2/hopper/fa3_bwd_hdim96_bf16_causal": {
-      "source_hash": "47c53c1532cb2a0b9366812a9c09b88758529c50f4bbd49d9de581ff7508db2e",
-      "ref_min_ms": 0.4429759979248047,
-      "ref_mean_ms": 0.4441471993923187
+      "source_hash": "1e22845a54301fc179e65f2c18c8ac6c68996c246c9b882dc677b15f6437acb3",
+      "ref_min_ms": 0.3036800026893616,
+      "ref_mean_ms": 0.30434560775756836
     },
     "class2/hopper/fa3_bwd_hdim96_fp16": {
-      "source_hash": "229d595ac90f57cfab03a7738686cce200a6158f66fc0f209b27ca3a3cd0a985",
-      "ref_min_ms": 0.8065919876098633,
-      "ref_mean_ms": 0.8089472055435181
+      "source_hash": "c510e0038ab671e938e256ea0cc4f60acf8863e8d6c619d191228801bea680eb",
+      "ref_min_ms": 0.5388479828834534,
+      "ref_mean_ms": 0.5419647693634033
     },
     "class2/hopper/fa3_bwd_hdim96_fp16_causal": {
-      "source_hash": "12f76d7e0ca8aff59068c103d0b9c7b1996835100cdfeb1274b6cb01ebb817d9",
-      "ref_min_ms": 0.4445759952068329,
-      "ref_mean_ms": 0.4457951486110687
+      "source_hash": "8f41be6ed1045647ac038b8a0f9e77a65c41d0f70817e8d72f58cccbe492da5a",
+      "ref_min_ms": 0.3036479949951172,
+      "ref_mean_ms": 0.30568641424179077
     },
     "class2/hopper/fa3_fwd_hdim128_bf16": {
-      "source_hash": "1767e7e1a640eee0dbe663789cb3812dbaa5e7c702cc26a0c92a23c2166e4e32",
-      "ref_min_ms": 12.858528137207031,
-      "ref_mean_ms": 12.869120597839355
+      "source_hash": "e8ece73228be73f123c4a6d75907c96d9c518b85fbd94e1efb9a1a402eef79e4",
+      "ref_min_ms": 3.1272640228271484,
+      "ref_mean_ms": 3.1377408504486084
     },
     "class2/hopper/fa3_fwd_hdim128_bf16_causal": {
-      "source_hash": "e74e509e48caf97df05cd9f4521eb8edb0a15ad67189eb4fec7bd0ee8ee8f31f",
-      "ref_min_ms": 2.964576005935669,
-      "ref_mean_ms": 2.9668800830841064
+      "source_hash": "dc82d8e2af3fdf824cd53f1655061c427b70d8755905ca54aa84afa36e0db53b",
+      "ref_min_ms": 1.6249920129776,
+      "ref_mean_ms": 1.6397920846939087
     },
     "class2/hopper/fa3_fwd_hdim128_fp16": {
-      "source_hash": "5b1d667f13060c27cc8cb7b3af2f1e35b1dccb0795d514d35b57b383c3701285",
-      "ref_min_ms": 12.865568161010742,
-      "ref_mean_ms": 12.882741928100586
+      "source_hash": "455416a55b367682f22e67d0d7d51f92d08b96c2b2c926b81b0df33c8b27f14e",
+      "ref_min_ms": 3.2304320335388184,
+      "ref_mean_ms": 3.2693729400634766
     },
     "class2/hopper/fa3_fwd_hdim128_fp16_causal": {
-      "source_hash": "c818a0e43984afd5c297a32420ecd86bda2321c732bc2784f272c653c27819c3",
-      "ref_min_ms": 2.966752052307129,
-      "ref_mean_ms": 2.9675779342651367
+      "source_hash": "69386760ea65d62c775cef2c1a3a51e201beab837dd4782566ed2b9441594271",
+      "ref_min_ms": 1.6848640441894531,
+      "ref_mean_ms": 1.6945568323135376
     },
     "class2/hopper/fa3_fwd_hdim192_bf16": {
-      "source_hash": "23e89ee68b94e5e4b7720e3ca8037dc5e0b7480bab63ea7bb1ddddd5cedf6def",
-      "ref_min_ms": 5.978303909301758,
-      "ref_mean_ms": 5.984857559204102
+      "source_hash": "98e14bdf19185c323f49bc6d3c7e71dfd0ebb7ece275e3b6134ca25a828eba45",
+      "ref_min_ms": 2.2616000175476074,
+      "ref_mean_ms": 2.2713980674743652
     },
     "class2/hopper/fa3_fwd_hdim192_bf16_causal": {
-      "source_hash": "cc3f33f437b4ac5a54fcbfb94b0cf470bc42e861716bfc0a5f0a1d6e9218bc50",
-      "ref_min_ms": 2.728127956390381,
-      "ref_mean_ms": 2.72886061668396
+      "source_hash": "55aa498b989999b932f604fc8fd24a0ac333488b0b6b904229157ed99604b6eb",
+      "ref_min_ms": 1.1577919721603394,
+      "ref_mean_ms": 1.1642177104949951
     },
     "class2/hopper/fa3_fwd_hdim192_fp16": {
-      "source_hash": "137469301c749a11ffd17e57c5e2773666fe5880c1287ee279979610d86112c6",
-      "ref_min_ms": 5.974976062774658,
-      "ref_mean_ms": 5.989737510681152
+      "source_hash": "af49745196197be887a0a96624c42fc12b14038c1c9613203216378e7dab32b7",
+      "ref_min_ms": 2.4377601146698,
+      "ref_mean_ms": 2.449100971221924
     },
     "class2/hopper/fa3_fwd_hdim192_fp16_causal": {
-      "source_hash": "85b8d61c22dd039806dc3c117a97f6a32406693cc1c940a0c1075668f4b30c25",
-      "ref_min_ms": 2.7238399982452393,
-      "ref_mean_ms": 2.7262942790985107
+      "source_hash": "c3ed36c746309460dcd139d59bb81068dd2efca57c3b8b84201a9538f7151240",
+      "ref_min_ms": 1.1978559494018555,
+      "ref_mean_ms": 1.2064703702926636
     },
     "class2/hopper/fa3_fwd_hdim256_bf16": {
-      "source_hash": "95bc82ae3a4865683481135a75f2988f75dcb8b599f9ba362043a7825aad6e2c",
-      "ref_min_ms": 7.640736103057861,
-      "ref_mean_ms": 7.650931358337402
+      "source_hash": "0f781b01a158ac7f8a62737a418779eed9f9bf9087f92896224152dcdb6f9239",
+      "ref_min_ms": 2.9757440090179443,
+      "ref_mean_ms": 3.007692813873291
     },
     "class2/hopper/fa3_fwd_hdim256_bf16_causal": {
-      "source_hash": "51271638b318ba881d053aabcded2fa0f6810e0ccdd72a543770e9ee1032acef",
-      "ref_min_ms": 3.607583999633789,
-      "ref_mean_ms": 3.610860824584961
+      "source_hash": "04022b5e9ae693b8bdebbcc9d6a125e4abfd877251ecb57ba131f5535154105c",
+      "ref_min_ms": 1.54585599899292,
+      "ref_mean_ms": 1.5543296337127686
     },
     "class2/hopper/fa3_fwd_hdim256_fp16": {
-      "source_hash": "f8c779576c168a03feb9edd1ab8dc76ebda171795ef09b314332128a77a521eb",
-      "ref_min_ms": 7.645440101623535,
-      "ref_mean_ms": 7.649644374847412
+      "source_hash": "424a3c74116ed8b9786f067fb54896e30d1ae92e5a968e899407648a6e446b49",
+      "ref_min_ms": 3.0806400775909424,
+      "ref_mean_ms": 3.0918784141540527
     },
     "class2/hopper/fa3_fwd_hdim256_fp16_causal": {
-      "source_hash": "71b4156b6bbdc35811e4e13f2e32dd79b607e999b53d09b86d2700bfe7ca4d26",
-      "ref_min_ms": 3.6091840267181396,
-      "ref_mean_ms": 3.610966444015503
+      "source_hash": "e9b45392541d549f42eef8da0598aca0897bd2303cd3e2f0d2c8d3ad9bb0b229",
+      "ref_min_ms": 1.6021440029144287,
+      "ref_mean_ms": 1.6140254735946655
     },
     "class2/hopper/fa3_fwd_hdim64_bf16": {
-      "source_hash": "2d72fa559b451164aacc9d70e549dac2f7748bc2c4f78b3231fcd3ab2f40ca0c",
-      "ref_min_ms": 1.7442560195922852,
-      "ref_mean_ms": 1.74844491481781
+      "source_hash": "f301769225de8dc6762504de8fa82224adad87c99808408e61230c320c8dda55",
+      "ref_min_ms": 1.100767970085144,
+      "ref_mean_ms": 1.1083838939666748
     },
     "class2/hopper/fa3_fwd_hdim64_bf16_causal": {
-      "source_hash": "f94b82b27961fa4916e3c43f199fab790e9bafcfbc7313e462c447da7c8d5a6f",
-      "ref_min_ms": 0.9473599791526794,
-      "ref_mean_ms": 0.9482560157775879
+      "source_hash": "f31e0087c4da30285fabef7fb19925ec8fac37ba8c11c69ce8cbca38a28cd1ef",
+      "ref_min_ms": 0.5679680109024048,
+      "ref_mean_ms": 0.5714400410652161
     },
     "class2/hopper/fa3_fwd_hdim64_fp16": {
-      "source_hash": "8910c689f5b6072985ed5ea56759f40f0cb8267d5bb2d3044724baec39847245",
-      "ref_min_ms": 1.7415679693222046,
-      "ref_mean_ms": 1.7466976642608643
+      "source_hash": "92563f7169f610c0dd6d0807a031ca0231aeea4418e3ff0ac527c057d0b39775",
+      "ref_min_ms": 1.1076480150222778,
+      "ref_mean_ms": 1.1143743991851807
     },
     "class2/hopper/fa3_fwd_hdim64_fp16_causal": {
-      "source_hash": "2e9a6e014a36ecd02401f0877c0edc535588852855b950643d0fbf4c3c8db3bb",
-      "ref_min_ms": 0.9476799964904785,
-      "ref_mean_ms": 0.9497024416923523
+      "source_hash": "2015b4fb2d789cb064b83bdbb149e181673e496313e856b21a85d184d6ec1baf",
+      "ref_min_ms": 0.5708159804344177,
+      "ref_mean_ms": 0.5734016299247742
     },
     "class2/hopper/fa3_fwd_hdim96_bf16": {
-      "source_hash": "bfbc076cb6f892ab2bac8e86a458627bb332e0be3437add3f5b445c23e43baaa",
-      "ref_min_ms": 5.447360038757324,
-      "ref_mean_ms": 5.4570112228393555
+      "source_hash": "a7878b0d1a28d0eed3fb710f7bed564ca0ae720a54d1533792d3ab10b3d72411",
+      "ref_min_ms": 1.3684159517288208,
+      "ref_mean_ms": 1.379696011543274
     },
     "class2/hopper/fa3_fwd_hdim96_bf16_causal": {
-      "source_hash": "f22ba11b95b0c4694100f8e983a7005db3afa8c5a1b8050802d45d63e14dcc42",
-      "ref_min_ms": 2.71014404296875,
-      "ref_mean_ms": 2.71065616607666
+      "source_hash": "39515bac68ce26ed3e9f72783dbaa87b94b45eeb030f121965a4133b94adf9ee",
+      "ref_min_ms": 0.7025600075721741,
+      "ref_mean_ms": 0.7054815888404846
     },
     "class2/hopper/fa3_fwd_hdim96_fp16": {
-      "source_hash": "ee17424f0aa5cb132a2860cb63e20e0af9d8eaef2c0164a2bff3aae3bd380618",
-      "ref_min_ms": 5.45030403137207,
-      "ref_mean_ms": 5.457190036773682
+      "source_hash": "bf34d84ea411ac8c728ab8f56e6ca8af6887693894db82511a8709be56e8958f",
+      "ref_min_ms": 1.4096640348434448,
+      "ref_mean_ms": 1.421996831893921
     },
     "class2/hopper/fa3_fwd_hdim96_fp16_causal": {
-      "source_hash": "9a631b05d0ca3069bbf40d337e414f48c0450fca65ff0764111ae20982f4acfe",
-      "ref_min_ms": 2.711168050765991,
-      "ref_mean_ms": 2.7120606899261475
+      "source_hash": "a255bd81ca6d4ecea845b699aa853cd9ad24845e79c50ab0319b562437e74fd0",
+      "ref_min_ms": 0.7200319766998291,
+      "ref_mean_ms": 0.7225407361984253
     },
     "class2/hopper/fa3_fwd_split_hdim128_bf16": {
-      "source_hash": "decb675d1dc15b439b6cba0d08517861f39d7f8aca67b9fbb720e91b6950bbb5",
-      "ref_min_ms": 0.4368000030517578,
-      "ref_mean_ms": 0.4374496042728424
+      "source_hash": "524a69d3d4dec90db4f6acd4f522a76c1812d0820889e488f72839769f0a5385",
+      "ref_min_ms": 0.1472959965467453,
+      "ref_mean_ms": 0.1538304090499878
     },
     "class2/hopper/fa3_fwd_split_hdim128_bf16_causal": {
-      "source_hash": "b7210eaeadfb400ff3f491c77400cc656fd52c70464bc8a692d23a1b7f85aab5",
-      "ref_min_ms": 0.20838400721549988,
-      "ref_mean_ms": 0.21024639904499054
+      "source_hash": "1109919b6c9d0931297779e22f4fb5e5394a2d2343bf61305517caa9942c8e61",
+      "ref_min_ms": 0.14790399372577667,
+      "ref_mean_ms": 0.1536320149898529
     },
     "class2/hopper/fa3_fwd_split_hdim128_fp16": {
-      "source_hash": "0652d4ff408ee04448dc99657651eacca3fa9f4357a177fa4f256b7ecae01a30",
-      "ref_min_ms": 0.4368320107460022,
-      "ref_mean_ms": 0.4384896159172058
+      "source_hash": "2b0b0e52851d5ee60fffb56586a3811e5a287bf40f99a865508ceded3f1a87f2",
+      "ref_min_ms": 0.14716799557209015,
+      "ref_mean_ms": 0.15442879498004913
     },
     "class2/hopper/fa3_fwd_split_hdim128_fp16_causal": {
-      "source_hash": "176e8bcffc1073be95dcf92b4d4d1b1644e647f09b5870e5ca6ef57ea771aba8",
-      "ref_min_ms": 0.2091519981622696,
-      "ref_mean_ms": 0.21075519919395447
+      "source_hash": "af4567243eaecb5cdd50f8c6949106d9af4edbc3035d48e300a63c075305bd75",
+      "ref_min_ms": 0.14771200716495514,
+      "ref_mean_ms": 0.15432320535182953
     },
     "class2/hopper/fa3_fwd_split_hdim192_bf16": {
-      "source_hash": "c4ee17c484de1fa7bc0fee39de9a6293163d8223ba953a3c332818b0a9d3b636",
-      "ref_min_ms": 0.19830399751663208,
-      "ref_mean_ms": 0.19973120093345642
+      "source_hash": "a4ff96f133d5c98de2665fa163f82b0f72372716fefc26e77da40b874b8ebc42",
+      "ref_min_ms": 0.12064000219106674,
+      "ref_mean_ms": 0.12506240606307983
     },
     "class2/hopper/fa3_fwd_split_hdim192_bf16_causal": {
-      "source_hash": "9efe72fe32a6ab44f8263e97ada9c85d24894ea7343d2cc7679150a1523036ea",
-      "ref_min_ms": 0.19017599523067474,
-      "ref_mean_ms": 0.19130879640579224
+      "source_hash": "31c7932ae2d40a7098f60b74a0933edb20efab9ea7a543edae8e608d4710e0b4",
+      "ref_min_ms": 0.12080000340938568,
+      "ref_mean_ms": 0.12528319656848907
     },
     "class2/hopper/fa3_fwd_split_hdim192_fp16": {
-      "source_hash": "4a0d68ab3fd059a126ec7e744ab42e0cc25076c8a5b9b66120e68cebda35489c",
-      "ref_min_ms": 0.1979839950799942,
-      "ref_mean_ms": 0.19889599084854126
+      "source_hash": "27f2d09ab97bbf4595273a656db8f8e7283b409425899c6881fc6863c021e3b8",
+      "ref_min_ms": 0.11990399658679962,
+      "ref_mean_ms": 0.12519040703773499
     },
     "class2/hopper/fa3_fwd_split_hdim192_fp16_causal": {
-      "source_hash": "766d4c4518177328d37b704498ec0e9bca7d35de455687183c85b87744886bab",
-      "ref_min_ms": 0.1902720034122467,
-      "ref_mean_ms": 0.19205120205879211
+      "source_hash": "b322933ccacd8a86514788b3c4d42173a1fe7513feb5c7295ec4280e6359cbda",
+      "ref_min_ms": 0.12012799829244614,
+      "ref_mean_ms": 0.1250815987586975
     },
     "class2/hopper/fa3_fwd_split_hdim256_bf16": {
-      "source_hash": "a9fa4a1fee6963e6f96e3edea22a8ff54856cfb8e7b30d7c3eed633d058a41f6",
-      "ref_min_ms": 0.25382399559020996,
-      "ref_mean_ms": 0.25499197840690613
+      "source_hash": "f28217b26c88ac8e7fd777c5ec0b4b536434519f24a577bd18f49c3dfae573a0",
+      "ref_min_ms": 0.152319997549057,
+      "ref_mean_ms": 0.16154879331588745
     },
     "class2/hopper/fa3_fwd_split_hdim256_bf16_causal": {
-      "source_hash": "adf505afb08397aa61df821afa2fbf325b19664b07233554502b2b79b9629b77",
-      "ref_min_ms": 0.2489600032567978,
-      "ref_mean_ms": 0.2500768005847931
+      "source_hash": "b84151060b2c7c732f468511c3fbc21ddc8fd644fed5ef3acd991bb20272a9f1",
+      "ref_min_ms": 0.15244799852371216,
+      "ref_mean_ms": 0.1610303819179535
     },
     "class2/hopper/fa3_fwd_split_hdim256_fp16": {
-      "source_hash": "2e7a0cc2f1be76896a263f3454c8a20e6ef062f9fad00c16462cd3803b9fe110",
-      "ref_min_ms": 0.2534399926662445,
-      "ref_mean_ms": 0.2552351951599121
+      "source_hash": "72c726c7c31d7340bf2eae7871662ca0acf848d58f8864c1df40fd944d961ea0",
+      "ref_min_ms": 0.1531199961900711,
+      "ref_mean_ms": 0.16126081347465515
     },
     "class2/hopper/fa3_fwd_split_hdim256_fp16_causal": {
-      "source_hash": "6a978d9a70453f2485e8014f916a9ab6e14b0f0e46db3b3af2059daaa2b6dcc8",
-      "ref_min_ms": 0.2500160038471222,
-      "ref_mean_ms": 0.25053438544273376
+      "source_hash": "03e6c8a7b172e84a3079ba3621d5088773a19735b2315a048640a58ba746840d",
+      "ref_min_ms": 0.15353600680828094,
+      "ref_mean_ms": 0.16136640310287476
     },
     "class2/hopper/fa3_fwd_split_hdim64_bf16": {
-      "source_hash": "40fbfaeb87a83494803eb61ad358d5f7c557e5fb52ab994be0261592990d9db6",
-      "ref_min_ms": 0.10153599828481674,
-      "ref_mean_ms": 0.10200001299381256
+      "source_hash": "0edf351d108bf96ccdeed269ea7ba357ae5156595363e48aa85c0b02707084a8",
+      "ref_min_ms": 0.07231999933719635,
+      "ref_mean_ms": 0.07356799393892288
     },
     "class2/hopper/fa3_fwd_split_hdim64_bf16_causal": {
-      "source_hash": "7b7208c3b3d965b0892eaed213246e0c42c4c494ea1cb3d2fb19ea99995430c2",
-      "ref_min_ms": 0.10675200074911118,
-      "ref_mean_ms": 0.1073664054274559
+      "source_hash": "c63322647f46adf861128b7a70f8e7832655dee43b5dc496f68cfcea33f2dcc9",
+      "ref_min_ms": 0.0700799971818924,
+      "ref_mean_ms": 0.07181759923696518
     },
     "class2/hopper/fa3_fwd_split_hdim64_fp16": {
-      "source_hash": "602bc4ece85c12e83113d08014b5f159cc432a4e51fd7a1280bb16353d0a041e",
-      "ref_min_ms": 0.10105600208044052,
-      "ref_mean_ms": 0.10193920135498047
+      "source_hash": "d4bcb164dd9cce15598f7262ac6fdb7d2b54334e19c808d03dbccee04021534d",
+      "ref_min_ms": 0.0721919983625412,
+      "ref_mean_ms": 0.07303360849618912
     },
     "class2/hopper/fa3_fwd_split_hdim64_fp16_causal": {
-      "source_hash": "b835e0c89eb14b1ee4079b4613ea2013c85c8c3a9e19339c19688c07f819dbe4",
-      "ref_min_ms": 0.10601600259542465,
-      "ref_mean_ms": 0.10662078857421875
+      "source_hash": "1946a05db40ed24c7da8305a7997c3f027c7f188db028adda94702bf98f51ab6",
+      "ref_min_ms": 0.06995200365781784,
+      "ref_mean_ms": 0.07153280079364777
     },
     "class2/hopper/fa3_fwd_split_hdim96_bf16": {
-      "source_hash": "b73f38d8c634a29f9b41e3b564611087cf76e058c40e8b3692f7731f0f872a57",
-      "ref_min_ms": 0.26604801416397095,
-      "ref_mean_ms": 0.267577588558197
+      "source_hash": "051950faf535659d4a9b3918f8545bcbe87eba27dde1cb3a2a2eb2d9843fa73c",
+      "ref_min_ms": 0.08582399785518646,
+      "ref_mean_ms": 0.0874176025390625
     },
     "class2/hopper/fa3_fwd_split_hdim96_bf16_causal": {
-      "source_hash": "ee38bd314928da676155b8f584b42fb64792c2cf62b62cedbe025d9e4419a7f8",
-      "ref_min_ms": 0.2699199914932251,
-      "ref_mean_ms": 0.27142399549484253
+      "source_hash": "fb530063dfd4b0ec317c9451b877ee59ccfd39dc77fd4f0608478066c3651919",
+      "ref_min_ms": 0.08476799726486206,
+      "ref_mean_ms": 0.08628160506486893
     },
     "class2/hopper/fa3_fwd_split_hdim96_fp16": {
-      "source_hash": "f2f157b6b2c58b9cf9fef0e1362fd04f1180592eacded67326b1d6e52007ed05",
-      "ref_min_ms": 0.26425600051879883,
-      "ref_mean_ms": 0.265529602766037
+      "source_hash": "732a24de53151bf92b4cf5fb08bb5dcbfd274385b6caf430e87c176b9f8cb4ef",
+      "ref_min_ms": 0.08595199882984161,
+      "ref_mean_ms": 0.08736960589885712
     },
     "class2/hopper/fa3_fwd_split_hdim96_fp16_causal": {
-      "source_hash": "ec7f0147a580dd9444f80ebe64c9828e056ad4598a870895abef073ef4716c0d",
-      "ref_min_ms": 0.2685120105743408,
-      "ref_mean_ms": 0.2693279981613159
+      "source_hash": "26cfb7f5c7217ecbf01af69c13d7dde311397cbf1e7e3190df285860beaffdf4",
+      "ref_min_ms": 0.08611200004816055,
+      "ref_mean_ms": 0.08800961077213287
     }
   }
 }

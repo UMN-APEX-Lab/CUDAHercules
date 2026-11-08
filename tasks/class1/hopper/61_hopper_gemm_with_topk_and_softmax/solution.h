@@ -33,6 +33,7 @@ __global__ void naive_gemm_topk_softmax_kernel(
 
   // Step 2: Find top-K values using insertion sort
   // Store top-K values and indices
+  int topk_ids[64];
   float topk_vals[64]; // max topk=64
   int topk_count = 0;
 
@@ -44,16 +45,16 @@ __global__ void naive_gemm_topk_softmax_kernel(
       for (int t = 0; t < topk_count; ++t) {
         if (val > topk_vals[t]) { pos = t; break; }
       }
-      for (int t = topk_count; t > pos; --t) topk_vals[t] = topk_vals[t-1];
-      topk_vals[pos] = val;
+      for (int t = topk_count; t > pos; --t) {topk_vals[t] = topk_vals[t-1];topk_ids[t]=topk_ids[t-1];}
+      topk_vals[pos] = val;topk_ids[pos]=n;
       topk_count++;
     } else if (val > topk_vals[topk - 1]) {
       int pos = topk - 1;
       for (int t = 0; t < topk - 1; ++t) {
         if (val > topk_vals[t]) { pos = t; break; }
       }
-      for (int t = topk - 1; t > pos; --t) topk_vals[t] = topk_vals[t-1];
-      topk_vals[pos] = val;
+      for (int t = topk - 1; t > pos; --t) {topk_vals[t] = topk_vals[t-1];topk_ids[t]=topk_ids[t-1];}
+      topk_vals[pos] = val;topk_ids[pos]=n;
     }
   }
 
@@ -65,15 +66,8 @@ __global__ void naive_gemm_topk_softmax_kernel(
   }
 
   // Step 4: Apply to output - zero non-top-K, softmax top-K
-  float threshold = topk_vals[topk - 1];
-  for (int n = 0; n < N; ++n) {
-    float val = logits[n];
-    if (val >= threshold) {
-      D[m * ldd + n] = __float2half(expf(val - max_val) / sum_exp);
-    } else {
-      D[m * ldd + n] = __float2half(0.0f);
-    }
-  }
+  for(int n=0;n<N;++n)D[m*ldd+n]=__float2half(0.f);
+  for(int t=0;t<topk;++t)D[m*ldd+topk_ids[t]]=__float2half(expf(topk_vals[t]-max_val)/sum_exp);
 }
 
 cudaError_t HopperGemmTopkSoftmax(

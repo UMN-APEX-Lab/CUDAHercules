@@ -66,6 +66,8 @@
 #include "cutlass/util/reference/device/tensor_fill.h"
 
 #include "helper.h"
+#include "hopper_cublaslt_reference.cuh"
+#include "hopper_tf32_validation.cuh"
 
 #ifdef KH_TEST_SOLUTION
 #include "solution.h"
@@ -133,61 +135,18 @@ using StrideB = typename Gemm::GemmKernel::StrideB;
 using StrideC = typename Gemm::GemmKernel::StrideC;
 using StrideD = typename Gemm::GemmKernel::StrideD;
 
-/// Run CUTLASS GEMM: A row-major, B col-major, C col-major
-cudaError_t CutlassGemm48(
-  int M, int N, int K,
-  float alpha,
-  float const *A, int lda,
-  float const *B, int ldb,
-  float beta,
-  float *C, int ldc) {
-
-  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
-  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
-  auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {M, N, 1});
-  auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
-
-  int device_id = 0;
-  auto hw_info = cutlass::KernelHardwareInfo::make_kernel_hardware_info<Gemm::GemmKernel>(device_id);
-
-  typename Gemm::Arguments arguments{
-    cutlass::gemm::GemmUniversalMode::kGemm,
-    {M, N, K},
-    {A, stride_A, B, stride_B},
-    {{alpha, beta}, C, stride_C, C, stride_D},
-    hw_info
-  };
-
-  auto key = std::make_tuple(M,N,K,alpha,beta,A,B,C);
-  static decltype(key) previous_key{};
-  static bool ready=false;
-  static Gemm gemm;
-  size_t workspace_size = Gemm::get_workspace_size(arguments);
-  static cutlass::device_memory::allocation<uint8_t> workspace;
-  if (!ready || key != previous_key) {
-    workspace.reset(workspace_size);
-
-  cutlass::Status status = gemm.can_implement(arguments);
-  if (status != cutlass::Status::kSuccess) {
-    std::cerr << "can_implement failed" << std::endl;
-    return cudaErrorUnknown;
+// Cached production-library TF32 reference; preparation precedes timed calls.
+cudaError_t kh_tf32_reference48(int M,int N,int K,float alpha,const float* A,int lda,
+    const float* B,int ldb,float beta,float* C,int ldc) {
+  auto key=std::make_tuple(M,N,K,lda,ldb,ldc);
+  static decltype(key) previous{};
+  static std::unique_ptr<kh_lt_plan> plan;
+  if(!plan||key!=previous) {
+    kh_lt_layout layout{M,N,K,lda,ldb,ldc,CUDA_R_32F,CUDA_R_32F,CUDA_R_32F};
+    layout.compute=CUBLAS_COMPUTE_32F_FAST_TF32;
+    plan=std::make_unique<kh_lt_plan>(layout);previous=key;
   }
-
-  status = gemm.initialize(arguments, workspace.get());
-  if (status != cutlass::Status::kSuccess) {
-    std::cerr << "initialize failed" << std::endl;
-    return cudaErrorUnknown;
-  }
-
-    previous_key=key; ready=true;
-  }
-  cutlass::Status status = gemm.run();
-  if (status != cutlass::Status::kSuccess) {
-    std::cerr << "run failed: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
-    return cudaErrorUnknown;
-  }
-
-  return cudaSuccess;
+  return plan->run(A,B,C,alpha,beta);
 }
 
 #endif // defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
@@ -265,80 +224,20 @@ cudaError_t ReferenceGemm(
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-cudaError_t TestCorrectness(int M, int N, int K, float alpha, float beta) {
-  int lda = K, ldb = K, ldc = M;
-  size_t sizeof_C = sizeof(float) * M * N;
-
-  float *A, *B, *C_cutlass, *C_reference;
-
-  AllocateMatrix(&A, M * K, 0, K);
-  AllocateMatrix(&B, K * N, 17, K);
-  AllocateMatrix(&C_cutlass, M * N, 101);
-  AllocateMatrix(&C_reference, M * N, 101);
-
-  bool cutlass_ok = true;
-  if(CutlassGemm48(M,N,K,alpha,A,lda,B,ldb,beta,C_cutlass,ldc)!=cudaSuccess) return cudaErrorUnknown;
-  kh_sample_gemm(M,N,K,alpha,A,B,beta,C_reference,C_cutlass,0.04f,0.002f);
+cudaError_t TestCorrectness(int M,int N,int K,float alpha,float beta) {
+  float *A,*B,*initial,*reference;
+  AllocateMatrix(&A,M*K,0,K);AllocateMatrix(&B,K*N,17,K);
+  AllocateMatrix(&initial,M*N,101);AllocateMatrix(&reference,M*N,101);
+  kh_tf32_contract oracle(M,N,K,alpha,A,B,beta,initial);
+  if(kh_tf32_reference48(M,N,K,alpha,A,K,B,K,beta,reference,M)!=cudaSuccess)return cudaErrorUnknown;
+  oracle.check(reference);
 #ifdef KH_TEST_SOLUTION
-  float *C_solution;
-  AllocateMatrix(&C_solution, M * N, 101);
-  kh_poison(C_solution,sizeof_C);
-
-  cudaError_t sol_result = HopperGemm(M, N, K, alpha, A, lda, B, ldb, beta, C_solution, ldc);
-  if (sol_result != cudaSuccess) {
-    std::cerr << "Solution kernel failed: " << cudaGetErrorString(sol_result) << std::endl;
-    cudaFree(C_solution); cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(B); cudaFree(A);
-    return sol_result;
-  }
-  cudaDeviceSynchronize();
-
-  // Compare solution vs the best available reference (CUTLASS if available, else naive)
-  std::vector<float> host_solution(M * N);
-  std::vector<float> host_ref(M * N);
-  cudaMemcpy(host_solution.data(), C_solution, sizeof_C, cudaMemcpyDeviceToHost);
-  if (cutlass_ok) {
-    cudaMemcpy(host_ref.data(), C_cutlass, sizeof_C, cudaMemcpyDeviceToHost);
-  } else {
-    cudaMemcpy(host_ref.data(), C_reference, sizeof_C, cudaMemcpyDeviceToHost);
-  }
-
-  kh_compare_outputs(host_solution,host_ref,0.03,0.003,0.001);
-  float sol_max_diff = 0.0f;
-  for (int i = 0; i < M * N; ++i) {
-    sol_max_diff = fmaxf(sol_max_diff, kh_abs(host_solution[i] - host_ref[i]));
-  }
-  // Use absolute tolerance for exact match against naive, or relative for CUTLASS/TF32
-  float tol = 1.0f;
-  bool check_rel = cutlass_ok;
-  if (check_rel) {
-    float sol_max_rel = 0.0f;
-    for (int i = 0; i < M * N; ++i) {
-      float ref_val = host_ref[i];
-      float diff = kh_abs(host_solution[i] - ref_val);
-      float rel = diff / (0.025f + 0.002f*kh_abs(ref_val));
-      sol_max_rel = std::fmax(sol_max_rel, rel);
-    }
-    if (sol_max_rel > tol) {
-      std::cerr << "Solution incorrect. Max rel diff vs reference: " << sol_max_rel << std::endl;
-      cudaFree(C_solution); cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(B); cudaFree(A);
-      return cudaErrorUnknown;
-    }
-  } else {
-    if (sol_max_diff > tol) {
-      std::cerr << "Solution incorrect. Max diff vs reference: " << sol_max_diff << std::endl;
-      cudaFree(C_solution); cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(B); cudaFree(A);
-      return cudaErrorUnknown;
-    }
-  }
-
-  cudaFree(C_solution);
+  float* candidate;AllocateMatrix(&candidate,M*N,101);
+  if(beta==0)kh_poison(candidate,size_t(M)*N*4);
+  if(HopperGemm(M,N,K,alpha,A,K,B,K,beta,candidate,M)!=cudaSuccess)return cudaErrorUnknown;
+  oracle.check(candidate);cudaFree(candidate);
 #endif
-
-  cudaFree(C_reference);
-  cudaFree(C_cutlass);
-  cudaFree(B);
-  cudaFree(A);
-  return cudaSuccess;
+  cudaFree(reference);cudaFree(initial);cudaFree(B);cudaFree(A);return cudaSuccess;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -359,10 +258,10 @@ void Profile(int M, int N, int K, float alpha, float beta, int iterations) {
   bool ref_ok = false;
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
   // Try warmup -- may fail on non-SM90
-  if (CutlassGemm48(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc) == cudaSuccess) {
+  if (kh_tf32_reference48(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc) == cudaSuccess) {
     cudaDeviceSynchronize();
     for (int i = 0; i < 2; i++) {
-      CutlassGemm48(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+      kh_tf32_reference48(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
     }
     cudaDeviceSynchronize();
 
@@ -370,7 +269,7 @@ void Profile(int M, int N, int K, float alpha, float beta, int iterations) {
     for (int iter = 0; iter < iterations; ++iter) {
       kh_cold_l2();
       cudaEventRecord(start);
-      CutlassGemm48(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+      kh_tf32_reference48(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
       cudaEventRecord(stop);
       cudaEventSynchronize(stop);
       float ms;
@@ -399,12 +298,10 @@ void Profile(int M, int N, int K, float alpha, float beta, int iterations) {
   HopperGemm(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
   cudaDeviceSynchronize();
 
-  if (ref_ok && C_ref_saved) {
-    std::vector<float> h_sol(M * N), h_ref(M * N);
-    cudaMemcpy(h_sol.data(), C, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ref.data(), C_ref_saved, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
+  if(ref_ok&&C_ref_saved) {
+    // Formal cases have beta=0, so validation is independent of timed history.
+    if(beta==0){kh_tf32_contract oracle(M,N,K,alpha,A,B,0,C_ref_saved);oracle.check(C);}
     cudaFree(C_ref_saved);
-    kh_compare_outputs(h_sol,h_ref,0.03,0.003,0.001);
   }
 
   // Warmup solution

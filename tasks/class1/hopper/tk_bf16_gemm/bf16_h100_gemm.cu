@@ -9,6 +9,8 @@
 #include "solution.h"
 #endif
 
+void kh_small_bf16_reference(void*,void*,void*,int,int,int);
+
 using namespace kittens;
 using namespace kittens::prototype;
 using namespace kittens::prototype::lcf;
@@ -111,6 +113,8 @@ struct matmul_template {
 
 template<typename mmt>
 void inner_run(bf16 *d_A, bf16 *d_B, bf16 *d_C, size_t M, size_t N, size_t K, dim3 grid, dim3 block) {
+    if(M<=128){kh_small_bf16_reference(d_A,d_B,d_C,int(M),int(N),int(K));return;}
+
     using global_layout = typename mmt::layout::global_layout;
     using globals  = typename mmt::layout::globals;
     auto key=std::make_tuple(d_A,d_B,d_C,M,N,K);

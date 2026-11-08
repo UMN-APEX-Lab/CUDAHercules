@@ -4,6 +4,7 @@
 #include "kittens.cuh"
 #include "prototype.cuh"
 #include "common.cuh"
+#include "hopper_cublaslt_reference.cuh"
 
 #ifdef KH_TEST_SOLUTION
 #include "solution.h"
@@ -119,22 +120,14 @@ struct matmul_template {
 
 template<typename mmt>
 void inner_run(fp8e4m3 *d_A, fp8e4m3 *d_B, bf16 *d_C, size_t M, size_t N, size_t K, dim3 grid, dim3 block) {
-    using a_layout = typename mmt::layout::a_layout;
-    using b_layout = typename mmt::layout::b_layout;
-    using c_layout = typename mmt::layout::c_layout;
-    using globals  = typename mmt::layout::globals;
-    auto key=std::make_tuple(d_A,d_B,d_C,M,N,K);
-    static std::map<decltype(key),globals> descriptors;
-    auto it=descriptors.find(key);
-    if(it==descriptors.end()) {
-    a_layout Ag{d_A, nullptr, nullptr, M, K};
-    b_layout Bg{d_B, nullptr, nullptr, N, K};
-    c_layout Cg{d_C, nullptr, nullptr, M, N};
-    globals G{Ag, Bg, Cg};
-      it=descriptors.emplace(key,G).first;
+    auto key=std::make_tuple(M,N,K);
+    static decltype(key) previous{};
+    static std::unique_ptr<kh_lt_plan> plan;
+    if(!plan||key!=previous) {
+        kh_lt_layout layout{int(M),int(N),int(K),int(K),int(K),int(N),CUDA_R_8F_E4M3,CUDA_R_8F_E4M3,CUDA_R_16BF};
+        layout.d_row=true;plan=std::make_unique<kh_lt_plan>(layout);previous=key;
     }
-    globals const& G=it->second;
-    prototype::lcf::kernel<mmt><<<grid, block, MAX_SHARED_MEMORY-1024>>>(G);
+    if(plan->run(d_A,d_B,d_C)!=cudaSuccess)exit(1);
 }
 
 #ifdef TK_COMPILE_FP8_GEMM

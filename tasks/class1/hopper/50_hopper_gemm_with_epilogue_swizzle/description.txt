@@ -1,7 +1,7 @@
 Implement a CUDA kernel for Hopper SM90 (H200).
 
 INT8 GEMM with INT32 output/accumulation. A row-major [M,K], B column-major [K,N], D column-major [M,N].
-D = alpha*A@B + beta*D. Results must be exact. This task measures integer GEMM with a CUTLASS epilogue-swizzle baseline;
+D = alpha*A@B + beta*D. Results must be exact. This task measures integer GEMM with a cached cuBLASLt baseline;
 there is no requirement to reproduce a particular internal swizzle. beta=0 means D is output-only.
 
 Required public API:

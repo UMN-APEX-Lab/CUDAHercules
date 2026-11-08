@@ -14,7 +14,7 @@ exercise the FP32/TF32 exponent range while keeping dot products well scaled. be
 '49_':'''FP16 GEMM, fp32 accumulation, fp16 output. A row-major [M,K], B column-major [K,N], D column-major [M,N].
 D = alpha*A@B + beta*D. beta=0 means D is output-only.''',
 '50_':'''INT8 GEMM with INT32 output/accumulation. A row-major [M,K], B column-major [K,N], D column-major [M,N].
-D = alpha*A@B + beta*D. Results must be exact. This task measures integer GEMM with a CUTLASS epilogue-swizzle baseline;
+D = alpha*A@B + beta*D. Results must be exact. This task measures integer GEMM with a cached cuBLASLt baseline;
 there is no requirement to reproduce a particular internal swizzle. beta=0 means D is output-only.''',
 '51_':'''Generalized tensor contraction, fp16 A/B/C, fp32 output/accumulation.
 Contract over two K modes d=128 and h=K/128; K is a multiple of 128.
@@ -46,8 +46,9 @@ Ms,Ns,Ks,ldas,ldbs,ldds and pointer arrays are on device. Each group may have a 
 lda=ldb=K_g, ldd=M_g. Every output must be written; zero-row groups, when supplied, require no work.''',
 '61_':'''MoE router: fp16 A row-major [M,K], B column-major [K,N], fp32 dot products, fp16 D row-major [M,N].
 For each token row, select topk=8 of N=128 logits alpha*A@B, then softmax ONLY over those eight logits;
-set all other probabilities to zero. Select and normalize before rounding the final probabilities to fp16.
-The baseline uses CUTLASS's generic top-8 reduction enabled in a task-local header.''',
+set all other probabilities to zero. Break equal-logit ties by smaller expert index, selecting exactly eight experts.
+Select and normalize before rounding the final probabilities to fp16. Default alpha=1/sqrt(K).
+The baseline selects a prepared CUTLASS fusion or cuBLASLt plus an adapted vLLM router, including all stages in timing.''',
 '62_':'''Structured 2:4 sparse GEMM. A_compressed is fp16 row-major [M,K/2]; metadata is uint16 row-major [M,K/16].
 Each metadata word contains four nibbles. Nibble g stores idx0 | (idx1<<2) for a group of four dense K elements;
 0<=idx0<idx1<4. The two compressed values for group q are at m*(K/2)+2*q and +1.
@@ -76,7 +77,7 @@ B_ptrs to signed INT8 column-major [K_g,N_g], D_ptrs to fp16 row-major [M_g,N_g]
 Ms,Ns,Ks,ldas,ldbs,ldds and pointer arrays are DEVICE arrays. lda=ldb=K_g, ldd=N_g.
 D=half(alpha*sum_k float(A)*float(B)), fp32 accumulation, beta=0. There are no weight scales in this ConvertOnly variant.
 Reference validation and timing use these exact same inputs and operation; do not reinterpret FP8 bytes as int8.''',
-'88_':'''CUTLASS Hopper FMHA baseline, fp16 contiguous Q[B,H,Sq,D], K/V[B,H,Sk,D], O[B,H,Sq,D].
+'88_':'''Hopper FMHA, fp16 contiguous Q[B,H,Sq,D], K/V[B,H,Sk,D], O[B,H,Sq,D].
 Compute O=softmax(Q@K^T/sqrt(D))@V with fp32 dot products, softmax and accumulation, then round to fp16.
 The default workloads use non-causal multi-head attention (Hq=Hkv), D=128, long context.
 This ABI does not provide GQA or causal masking; those are explicitly covered by the FA3 tasks.

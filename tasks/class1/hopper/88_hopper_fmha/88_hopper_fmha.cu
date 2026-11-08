@@ -1,4 +1,6 @@
 #include "hopper_validation.cuh"
+#include "hopper_cublaslt_reference.cuh"
+extern "C" void kh_launch_fa3_reference88(const void*,const void*,const void*,void*,float*,int,int,int,int,int,int,float,cudaStream_t);
 /***************************************************************************************************
  * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -427,8 +429,25 @@ struct FwdRunner {
       return example_result;
     }
 
+    auto original=[&](){if(op.run()!=cutlass::Status::kSuccess)exit(1);};
+    auto fa3=[&](){
+      kh_launch_fa3_reference88(block_Q.get(),block_K.get(),block_V.get(),block_O.get(),
+        reinterpret_cast<float*>(block_LSE.get()),options.b,options.h,options.h,options.q,options.k,
+        options.d,1.f/sqrtf(float(options.d)),nullptr);
+    };
+    bool use_fa3=false;
+    if(options.d==128 && sizeof(Element)==2) {
+      original();cudaDeviceSynchronize();
+      cutlass::DeviceAllocation<Element> saved(block_O.size());
+      cudaMemcpy(saved.get(),block_O.get(),block_O.size()*sizeof(Element),cudaMemcpyDeviceToDevice);
+      fa3();cudaDeviceSynchronize();
+      kh_check_device(block_O.get(),saved.get(),block_O.size(),0.0008,0.01,0.002);
+      use_fa3=kh_prefer_second_reference(original,fa3);
+    }
+    auto reference=[&](){if(use_fa3)fa3();else original();return cutlass::Status::kSuccess;};
+
     // Run CUTLASS reference
-    status = op.run();
+    status = reference();
     if (status != cutlass::Status::kSuccess) {
       std::cerr << "Failed to launch the CUTLASS kernel. Last CUDA error is: "
                 << cudaGetErrorString(cudaGetLastError()) << std::endl;
@@ -492,7 +511,7 @@ struct FwdRunner {
 
     // Warmup reference
     for (int i = 0; i < 3; i++) {
-      op.run();
+      reference();
     }
     cudaDeviceSynchronize();
 
@@ -501,7 +520,7 @@ struct FwdRunner {
     for (int iter = 0; iter < kIterations; ++iter) {
       kh_cold_l2();
       cudaEventRecord(start);
-      op.run();
+      reference();
       cudaEventRecord(stop);
       cudaEventSynchronize(stop);
       float ms;

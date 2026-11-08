@@ -37,6 +37,7 @@
 #include "cutlass/util/reference/device/tensor_fill.h"
 
 #include "helper.h"
+#include "hopper_cublaslt_reference.cuh"
 
 #ifdef KH_TEST_SOLUTION
 #include "solution.h"
@@ -92,34 +93,15 @@ using SD49 = typename G49::GemmKernel::StrideD;
 
 cudaError_t CutlassGemm49(int M, int N, int K, float alpha,
   cutlass::half_t const *A, cutlass::half_t const *B, float beta, cutlass::half_t *D, int ldd) {
-  int lda = K, ldb = K;
-  auto sA = cutlass::make_cute_packed_stride(SA49{}, {M, K, 1});
-  auto sB = cutlass::make_cute_packed_stride(SB49{}, {N, K, 1});
-  auto sC = cutlass::make_cute_packed_stride(SC49{}, {M, N, 1});
-  auto sD = cutlass::make_cute_packed_stride(SD49{}, {M, N, 1});
-
-  cutlass::KernelHardwareInfo hw; hw.device_id = 0;
-  hw.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
-
-  typename G49::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm, {M,N,K,1},
-    {A, sA, B, sB}, {{}, nullptr, sC, D, sD}, hw};
-  args.epilogue.thread.alpha = alpha;
-  args.epilogue.thread.beta = beta;
-
-  auto key=std::make_tuple(M,N,K,alpha,beta,A,B,D);
+  auto key=std::make_tuple(M,N,K,ldd);
   static decltype(key) previous{};
-  static bool ready=false;
-  static G49 gemm;
-  size_t ws = G49::get_workspace_size(args);
-  static cutlass::device_memory::allocation<uint8_t> workspace;
-  if (!ready || key!=previous) {
-    workspace.reset(ws);
-  if (gemm.can_implement(args) != cutlass::Status::kSuccess) return cudaErrorUnknown;
-  if (gemm.initialize(args, workspace.get()) != cutlass::Status::kSuccess) return cudaErrorUnknown;
-    previous=key;ready=true;
+  static std::unique_ptr<kh_lt_plan> plan;
+  if(!plan||key!=previous) {
+    kh_lt_layout layout{M,N,K,K,K,ldd,CUDA_R_16F,CUDA_R_16F,CUDA_R_16F};
+    layout.compute=CUBLAS_COMPUTE_32F;
+    plan=std::make_unique<kh_lt_plan>(layout);previous=key;
   }
-  if (gemm.run() != cutlass::Status::kSuccess) return cudaErrorUnknown;
-  return cudaSuccess;
+  return plan->run(A,B,D,alpha,beta);
 }
 #endif
 

@@ -44,6 +44,7 @@
 #include "cutlass/util/tensor_view_io.h"
 
 #include "helper.h"
+#include "hopper_cublaslt_reference.cuh"
 #include "gather_gemm.hpp"
 #include "gather_kernel.cuh"
 #include "scatter_epilogue.hpp"
@@ -426,11 +427,25 @@ using Runner52 = example::ExampleRunner<
     cutlass::half_t,cutlass::layout::ColumnMajor,IndexedGather,
     cutlass::half_t,cutlass::layout::ColumnMajor,NoGather,
     cutlass::half_t,cutlass::layout::ColumnMajor,IndexedGather,float,float>;
+__global__ void kh_gather52(const __half* b,__half* compact,const int* indices,int N,int K) {
+  for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<size_t(N)*K;i+=size_t(blockDim.x)*gridDim.x)
+    compact[i]=b[(i%K)+size_t(indices[i/K])*K];
+}
+__global__ void kh_scatter52(const __half* compact,__half* d,const int* indices,int M,int N) {
+  for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<size_t(M)*N;i+=size_t(blockDim.x)*gridDim.x)
+    d[(i%M)+size_t(indices[i/M])*M]=compact[i];
+}
 struct Prepared52 {
+  int m,n,k;float alpha_value;__half *a,*b,*d;int *g,*scatter_indices;
+  cutlass::DeviceAllocation<__half> compact_b,compact_d;
+  kh_lt_plan plan;bool use_vendor=false;
   Runner52::Gemm gemm;
   cutlass::device_memory::allocation<uint8_t> workspace;
   Prepared52(int M,int N,int K,float alpha,__half* A,__half* B,int* gather,
-             float beta,__half* D,int* scatter) {
+             float beta,__half* D,int* scatter)
+      :m(M),n(N),k(K),alpha_value(alpha),a(A),b(B),d(D),g(gather),scatter_indices(scatter),
+       compact_b(size_t(N)*K),compact_d(size_t(M)*N),
+       plan({M,N,K,K,K,M,CUDA_R_16F,CUDA_R_16F,CUDA_R_16F}) {
     using G=Runner52::Gemm; using GK=typename G::GemmKernel;
     auto da=cutlass::make_cute_packed_stride(typename GK::StrideA{},make_shape(M,K,1));
     auto db=cutlass::make_cute_packed_stride(typename GK::StrideB{},make_shape(N,K,1));
@@ -441,8 +456,19 @@ struct Prepared52 {
        NoGather{},IndexedGather{scatter}}, {}, {}, NoGather{},IndexedGather{gather}};
     workspace.reset(G::get_workspace_size(args));
     CUTLASS_CHECK(gemm.can_implement(args)); CUTLASS_CHECK(gemm.initialize(args,workspace.get()));
+    use_vendor=beta==0 && kh_prefer_second_reference([&](){CUTLASS_CHECK(gemm.run());},[&](){vendor();});
+    if(use_vendor) {
+      cutlass::DeviceAllocation<__half> expected(size_t(M)*N);
+      CUTLASS_CHECK(gemm.run());kh_gather52<<<4096,256>>>(d,expected.get(),scatter_indices,n,m);
+      vendor();kh_check_device(compact_d.get(),expected.get(),size_t(M)*N,0.02,0.003,0.001);
+    }
   }
-  void run() {CUTLASS_CHECK(gemm.run());}
+  void vendor() {
+    kh_gather52<<<4096,256>>>(b,compact_b.get(),g,n,k);
+    CUDA_CHECK(plan.run(a,compact_b.get(),compact_d.get(),alpha_value));
+    kh_scatter52<<<4096,256>>>(compact_d.get(),d,scatter_indices,m,n);
+  }
+  void run() {if(use_vendor)vendor();else {CUTLASS_CHECK(gemm.run());}}
 };
 
 cudaError_t TestCorrectness(int M, int N_orig, int K, int index_size, float alpha, float beta) {
