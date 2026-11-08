@@ -35,7 +35,7 @@
 #include <fstream>
 #include <stdexcept>
 
-#include "../55_hopper_mixed_dtype_gemm/mixed_dtype_utils.hpp"
+#include "mixed_dtype_utils.hpp"
 
 template<class QuantType>
 class GroupedMixedDtypeOptions : public MixedDtypeOptions {

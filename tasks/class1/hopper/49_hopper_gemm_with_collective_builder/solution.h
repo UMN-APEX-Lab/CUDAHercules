@@ -15,7 +15,7 @@ __global__ void naive_collective_gemm_kernel(
     for (int k = 0; k < K; ++k) {
       acc += __half2float(A[i * lda + k]) * __half2float(B[k + j * ldb]);
     }
-    float old = beta * __half2float(D[i + j * ldd]);
+    float old = (beta == 0 ? 0.0f : beta * __half2float(D[i + j * ldd]));
     D[i + j * ldd] = __float2half(alpha * acc + old);
   }
 }

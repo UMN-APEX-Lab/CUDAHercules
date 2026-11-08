@@ -50,8 +50,8 @@ __device__ inline void softmax_featuremap_inplace(RT &tile) {
 #define ATTN_F 128
 #define HALF_ATTN_F 64
 
-struct hedgehog_globals { 
-    // shapes    
+struct hedgehog_globals {
+    // shapes
     using q_tile = st_bf<CHUNK_SIZE, ATTN_F>;
     using k_tile = st_bf<CHUNK_SIZE, ATTN_F>;
     using v_tile = st_bf<CHUNK_SIZE, ATTN_D>;
@@ -80,7 +80,7 @@ struct hedgehog_globals {
     kv_state_gl kv_state;
     o_gl o;
 
-    float *alphas; 
+    float *alphas;
     float *betas;
 };
 
@@ -117,7 +117,7 @@ void hedgehog_linear_attention_smd (
     qk_map_tile (&kf_map) = al.allocate<qk_map_tile>(); // 16k, for fusing featuremap computation
 
     // norm stuff
-    st_bf<CHUNK_SIZE, ATTN_F> (&kv_smem)[2] = al.allocate<st_bf<CHUNK_SIZE, ATTN_F>, 2>(); // 32k, 64x128 featurized 
+    st_bf<CHUNK_SIZE, ATTN_F> (&kv_smem)[2] = al.allocate<st_bf<CHUNK_SIZE, ATTN_F>, 2>(); // 32k, 64x128 featurized
     row_vec<st_fl<CHUNK_SIZE,4*16>> (&cumsum_k_smem)[2] = al.allocate<row_vec<st_fl<CHUNK_SIZE,4*16>>, 2>(); // smol
     col_vec<st_fl<CHUNK_SIZE,4*16>> (&norm_exchange)[2] = al.allocate<col_vec<st_fl<CHUNK_SIZE,4*16>>, 2>(); // smol
     st_bf<CHUNK_SIZE, 4*16> (*k_scratch_smem)     = reinterpret_cast<st_bf<CHUNK_SIZE, 4*16>*>(&kv_smem[0].data[0]);
@@ -132,9 +132,9 @@ void hedgehog_linear_attention_smd (
     __shared__ semaphore qkv_semaphore;
     if (warpid == 0 && laneid() == 0) {
         init_semaphore(qkv_semaphore, 0, 1);
-        tma::expect_bytes(qkv_semaphore, 
-            size_bytes<typeof(q_smem[0])> + 
-            size_bytes<typeof(k_smem[0])> + 
+        tma::expect_bytes(qkv_semaphore,
+            size_bytes<typeof(q_smem[0])> +
+            size_bytes<typeof(k_smem[0])> +
             size_bytes<typeof(v_smem[0])> +
             // we need qk maps to be loaded on this first iter, too.
             size_bytes<typeof(qf_map)> +
@@ -164,12 +164,12 @@ void hedgehog_linear_attention_smd (
 
         if (warpid == 0 && laneid() == 0 && block < blocks-1) {
             tma::expect_bytes(qkv_semaphore,
-                size_bytes<typeof(q_smem[0])> + 
-                size_bytes<typeof(k_smem[0])> + 
+                size_bytes<typeof(q_smem[0])> +
+                size_bytes<typeof(k_smem[0])> +
                 size_bytes<typeof(v_smem[0])>
             );
-            tma::load_async(q_smem[toc],           g.q, {batch, head, block+1, 0}, qkv_semaphore); 
-            tma::load_async(k_smem[(ring_id+2)%3], g.k, {batch, head, block+1, 0}, qkv_semaphore); 
+            tma::load_async(q_smem[toc],           g.q, {batch, head, block+1, 0}, qkv_semaphore);
+            tma::load_async(k_smem[(ring_id+2)%3], g.k, {batch, head, block+1, 0}, qkv_semaphore);
             tma::load_async(v_smem[(ring_id+2)%3], g.v, {batch, head, block+1, 0}, qkv_semaphore);
         }
         __syncthreads();
@@ -183,7 +183,7 @@ void hedgehog_linear_attention_smd (
         warp::zero(sliding_norm_vec);
         if(warpgroupid == 0) {
 
-            // ******* sliding window attn ******* // 
+            // ******* sliding window attn ******* //
             rt_fl<1*16, 4*16> att_block[2];
             rt_bf<1*16, 4*16> att_block_bf[2];
             rt_fl<1*16, 4*16>::col_vec max_vec;
@@ -238,7 +238,7 @@ void hedgehog_linear_attention_smd (
             warp::zero(linear_o);
         }
         else { // if not in at least the second block, no need for linear attention.
-            // ******* linear attn ******** // 
+            // ******* linear attn ******** //
 
             // matmul to generate linear_q before softmax
             rt_fl<1*16, 4*16> linear_q;
@@ -273,7 +273,7 @@ void hedgehog_linear_attention_smd (
             warp::mma_ABt(norm_tile, linear_q_bf, cumsum_k_reg_tile, norm_tile);
             warp::row_max(linear_norm_vec, norm_tile); // technically any column slice would work but this is EZ
             // ^ note this incorporates alpha since it was premultiplied onto linear_q!
-            
+
             // now accumulate KV onto the matmul for the future.
             rt_fl<1*16, 4*16> linear_k;
 
@@ -346,7 +346,7 @@ hedgehog_globals hedgehog_init(
     float *d_alphas, float *d_betas,
     int ATTN_B, int ATTN_H, int ATTN_N
 ) {
-    // global pointers. 
+    // global pointers.
     using q_tile = st_bf<CHUNK_SIZE, ATTN_F>;
     using k_tile = st_bf<CHUNK_SIZE, ATTN_F>;
     using v_tile = st_bf<CHUNK_SIZE, ATTN_D>;
@@ -354,7 +354,7 @@ hedgehog_globals hedgehog_init(
     using kv_state_tile = st_fl<ATTN_F, ATTN_D>;
     using k_state_vec = sv_fl<ATTN_D>;
     using qk_map_tile = st_bf<ATTN_D, HALF_ATTN_F>;
-    
+
     using q_global = gl<bf16, -1, -1, -1, -1, q_tile>;
     using k_global = gl<bf16, -1, -1, -1, -1, k_tile>;
     using v_global = gl<bf16, -1, -1, -1, -1, v_tile>;
@@ -363,7 +363,7 @@ hedgehog_globals hedgehog_init(
     using k_state_global = gl<float, -1, -1, -1, -1, k_state_vec>;
     using qmap_global = gl<bf16, -1, -1, -1, -1, qk_map_tile>;
     using kmap_global = gl<bf16, -1, -1, -1, -1, qk_map_tile>;
-    
+
     using globals = hedgehog_globals;
     q_global q_arg{d_q, ATTN_B, ATTN_H, ATTN_N, ATTN_F};
     k_global k_arg{d_k, ATTN_B, ATTN_H, ATTN_N, ATTN_F};
@@ -375,7 +375,7 @@ hedgehog_globals hedgehog_init(
     k_state_global k_state_arg{d_k_state, ATTN_B, ATTN_H, 1, ATTN_D};
 
     globals g{
-        q_arg, k_arg, v_arg, 
+        q_arg, k_arg, v_arg,
         qmap_arg, kmap_arg,
         k_state_arg, kv_state_arg,
         o_arg, d_alphas, d_betas
@@ -383,118 +383,4 @@ hedgehog_globals hedgehog_init(
     return g;
 }
 
-#ifdef TK_COMPILE_HEDGEHOG
-#include "pyutils/torchutils.cuh"
-#include <ATen/Functions.h>
-#include <iostream>
-void dispatch_hedgehog( 
-    bf16 *d_q, bf16 *d_k, bf16 *d_v, bf16 *d_o,
-    bf16 *d_qmap, bf16 *d_kmap,
-    float *d_k_state, float *d_kv_state,
-    float *d_alphas, float *d_betas,
-    int ATTN_B, int ATTN_H, int ATTN_N
-){
-    hedgehog_globals g = hedgehog_init(
-        d_q, d_k, d_v, d_o,
-        d_qmap, d_kmap,
-        d_k_state, d_kv_state,
-        d_alphas, d_betas,
-        ATTN_B, ATTN_H, ATTN_N
-    );
-
-    // launch
-    unsigned long mem_size = kittens::MAX_SHARED_MEMORY - 1024;
-    cudaFuncSetAttribute(
-        hedgehog_linear_attention_smd,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        mem_size
-    );
-    dim3 grid(ATTN_H, ATTN_B);
-    hedgehog_linear_attention_smd<<<grid,NUM_THREADS,mem_size>>>(g, ATTN_N);
-    CHECK_CUDA_ERROR(cudaGetLastError());
-}
-
-std::tuple<at::Tensor, at::Tensor, at::Tensor> hedgehog(
-    const at::Tensor q, 
-    const at::Tensor k,
-    const at::Tensor v,
-    const at::Tensor qmap,
-    const at::Tensor kmap,
-    const at::Tensor d_alphas,
-    const at::Tensor d_betas
-) {
-    CHECK_INPUT(q);
-    CHECK_INPUT(k);
-    CHECK_INPUT(v);
-    CHECK_INPUT(qmap);
-    CHECK_INPUT(kmap);
-    CHECK_INPUT(d_alphas);
-    CHECK_INPUT(d_betas);
-
-    int B = q.size(0);
-    int H = q.size(1);
-    int N = q.size(2);
-    int DV = v.size(3);
-    int FD = qmap.size(1);
-
-    // checks
-    TORCH_CHECK(k.size(0) == B, "k batch?");
-    TORCH_CHECK(k.size(1) == H, "k heads?");
-    TORCH_CHECK(k.size(2) == N, "k length?");
-
-    TORCH_CHECK(v.size(0) == B, "v batch?");
-    TORCH_CHECK(v.size(1) == H, "v heads?");
-    TORCH_CHECK(v.size(2) == N, "v length?");
-
-    TORCH_CHECK(qmap.size(0) == H, "qmap heads?");
-    TORCH_CHECK(qmap.size(1) == FD, "qmap length?");
-    TORCH_CHECK(qmap.size(2) == 64, "qmap length?");
-
-    TORCH_CHECK(kmap.size(0) == H, "kmap heads?");
-    TORCH_CHECK(kmap.size(1) == FD, "kmap length?");
-    TORCH_CHECK(kmap.size(2) == 64, "kmap length?");
-
-    TORCH_CHECK(d_alphas.size(0) == H, "alphas heads?");
-    TORCH_CHECK(d_betas.size(0) == H, "betas heads?");
-
-    // allocate outputs
-    at::Tensor out = at::empty({B, H, N, DV}, v.options());
-    at::Tensor kv_state = at::empty({B, H, FD, DV}, at::dtype(at::ScalarType::Float).device(v.device()));
-    at::Tensor k_state = at::empty({B, H, 1, DV}, at::dtype(at::ScalarType::Float).device(v.device()));
-
-    // convert to bf16
-    c10::BFloat16 *q_bf16 = q.data_ptr<c10::BFloat16>();
-    c10::BFloat16 *k_bf16 = k.data_ptr<c10::BFloat16>();
-    c10::BFloat16 *v_bf16 = v.data_ptr<c10::BFloat16>();
-    c10::BFloat16 *qmap_bf16 = qmap.data_ptr<c10::BFloat16>();
-    c10::BFloat16 *kmap_bf16 = kmap.data_ptr<c10::BFloat16>();
-    float *d_alphas_float = d_alphas.data_ptr<float>(); // alpha and beta are already float32
-    float *d_betas_float = d_betas.data_ptr<float>();
-    // alpha and beta are already float32
-    
-    bf16 *d_q = reinterpret_cast<bf16*>(q_bf16);
-    bf16 *d_k = reinterpret_cast<bf16*>(k_bf16);
-    bf16 *d_v = reinterpret_cast<bf16*>(v_bf16);
-    bf16 *d_qmap = reinterpret_cast<bf16*>(qmap_bf16);
-    bf16 *d_kmap = reinterpret_cast<bf16*>(kmap_bf16);
-    bf16 *d_o = reinterpret_cast<bf16*>(out.data_ptr<c10::BFloat16>());
-    float *d_k_state = k_state.data_ptr<float>();
-    float *d_kv_state = kv_state.data_ptr<float>();
-
-    dispatch_hedgehog(
-        d_q, d_k, d_v, d_o, 
-        d_qmap, d_kmap,
-        d_k_state, d_kv_state,
-        d_alphas_float, d_betas_float,
-        B, H, N
-    );
-
-    CHECK_CUDA_ERROR(cudaGetLastError());
-    return std::make_tuple(out, kv_state, k_state);
-}
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("hedgehog", hedgehog, "Hedgehog forward. Takes tensors (q, k, v, q_map, k_map, alphas, betas). q, k, v are bf16 (B,H,N,64), q_map and k_map are bf16 (H,E,64,64), alphas and betas are fp32 (H,E). Returns (B,H,N,64) in bf16.");
-}
-#else
 #include "harness.impl"
-#endif

@@ -20,8 +20,8 @@ __global__ void naive_gett_kernel(
     float acc = 0.0f;
     for (int k = 0; k < K; ++k) {
       // A col-major: A[i,k] = A[i + k * lda]
-      // B col-major: B[k,j] = B[k + j * ldb]
-      acc += __half2float(A[i + k * lda]) * __half2float(B[k + j * ldb]);
+      // B col-major: B[k,j] = B[(k%128) + 128*(j+N*(k/128))]
+      acc += __half2float(A[i + k * lda]) * __half2float(B[(k%128) + 128*(j+N*(k/128))]);
     }
     // C col-major: C[i,j] = C[i + j * ldc]
     // D col-major: D[i,j] = D[i + j * ldd]

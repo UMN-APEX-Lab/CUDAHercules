@@ -1,0 +1,51 @@
+{
+  "framework_source_hash": "27e04d444c5064cf89722e3ef8b1d28ab2c480b365af1a9c8bf572feaca469a1",
+  "tests_source_hash": "6467adca9a1c896f78bf8a503bb489d8628fd4cf88a15f224d91a5abe99668bd",
+  "cpu_regressions": {
+    "passed": true,
+    "test_count": 14,
+    "output": "..............                                                           [100%]\n14 passed in 1.31s"
+  },
+  "bwd_memcheck": {
+    "passed": true,
+    "command": "compute-sanitizer --tool memcheck --error-exitcode 99 python tests/cuda/hopper_bwd_workspace.py",
+    "output": "========= COMPUTE-SANITIZER\nPassed: guarded hdim128 backward, B2 H4 Sq257 Sk385, five launches\n========= ERROR SUMMARY: 0 errors"
+  },
+  "actual_fa3_noop": {
+    "task": "class2/hopper/fa3_fwd_hdim128_fp16",
+    "passed": true,
+    "compiled": true,
+    "noop_rejected": true,
+    "status": "FAIL"
+  },
+  "cli_rotary_with_matching_baseline_cache": {
+    "task_id": "class1/hopper/tk_rotary",
+    "compiled": true,
+    "correct": true,
+    "correctness_detail": {},
+    "speedup": 0.21228694052728386,
+    "latency_mean_ms": 0.0,
+    "latency_std_ms": 0.0,
+    "latency_min_ms": 0.8155,
+    "latency_p90_ms": 0.0,
+    "ref_latency_mean_ms": 0.0,
+    "per_size": [
+      {
+        "name": "rotary: B=1, H=72, N=16384, D=128",
+        "ref_min_ms": 0.17312,
+        "kernel_min_ms": 0.8155,
+        "speedup": 0.21228694052728386
+      }
+    ],
+    "domain": "ml",
+    "level": 1,
+    "min_sm": 90,
+    "status": "PASS",
+    "error_msg": ""
+  },
+  "generated_files": {
+    "fa3_check": true,
+    "make_prompts_check": true
+  },
+  "blackwell_task_files_changed": false
+}

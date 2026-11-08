@@ -1,5 +1,5 @@
 /*
- * Flash Attention 3 Backward — hdim=64, bf16, non-causal
+ * Flash Attention 3 Backward — hdim=64, bfloat16, causal=False
  *
  * Source: flash-attention/hopper/ (FA3 Hopper kernels)
  */
@@ -22,14 +22,14 @@ static inline int round_up(int x, int m) {
 }
 
 extern "C" void launch_fa3_bwd(
-    const void* Q,          // [B, H, Sq, D] bf16
-    const void* K,          // [B, H, Sk, D] bf16
-    const void* V,          // [B, H, Sk, D] bf16
-    const void* O,          // [B, H, Sq, D] bf16
-    const void* dO,         // [B, H, Sq, D] bf16
-    void* dQ,               // [B, H, Sq, D] bf16
-    void* dK,               // [B, H, Sk, D] bf16
-    void* dV,               // [B, H, Sk, D] bf16
+    const void* Q,          // [B, H, Sq, D] fp16
+    const void* K,          // [B, H, Sk, D] fp16
+    const void* V,          // [B, H, Sk, D] fp16
+    const void* O,          // [B, H, Sq, D] fp16
+    const void* dO,         // [B, H, Sq, D] fp16
+    void* dQ,               // [B, H, Sq, D] fp16
+    void* dK,               // [B, H, Sk, D] fp16
+    void* dV,               // [B, H, Sk, D] fp16
     const float* lse,       // [B, H, Sq]
     float* dsoftmax_sum,    // [B, H, Sq]
     float* dq_accum,        // [B, H, Sq, D] fp32 accumulator
@@ -108,7 +108,7 @@ extern "C" void launch_fa3_bwd(
     // Convert LSE to log2 scale for backward kernel
     static float* d_lse_log2 = nullptr;
     static size_t lse_log2_size = 0;
-    size_t needed = (size_t)B * H * Sq * sizeof(float);
+    size_t needed = (size_t)B * H * params.seqlen_q_rounded * sizeof(float);
     if (needed > lse_log2_size) {
         if (d_lse_log2) cudaFree(d_lse_log2);
         cudaMalloc(&d_lse_log2, needed);
@@ -133,8 +133,12 @@ extern "C" void launch_fa3_bwd(
 
     int device;
     cudaGetDevice(&device);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, device);
+    static thread_local int cached_device = -1;
+    static thread_local cudaDeviceProp prop;
+    if (device != cached_device) {
+        cudaGetDeviceProperties(&prop, device);
+        cached_device = device;
+    }
     params.num_sm = prop.multiProcessorCount;
     params.arch = 90;
 
@@ -146,7 +150,7 @@ extern "C" void launch_fa3_bwd(
     static size_t sem_size = 0;
     int num_blocks_m = (Sq + 127) / 128;
     int num_blocks_n = (Sk + 127) / 128;
-    size_t needed_sem = (size_t)(num_blocks_m * B * H + 1) * sizeof(int);
+    size_t needed_sem = (size_t)(std::max(num_blocks_m, num_blocks_n) * B * H + 1) * sizeof(int);
     if (needed_sem > sem_size) {
         if (d_dq_sem) cudaFree(d_dq_sem);
         if (d_dk_sem) cudaFree(d_dk_sem);

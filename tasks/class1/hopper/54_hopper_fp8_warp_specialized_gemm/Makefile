@@ -6,11 +6,11 @@ ARCH        = -gencode arch=compute_90a,code=sm_90a
 
 # Reference only: compile CUTLASS example (no solution needed)
 ref: 54_hopper_fp8_warp_specialized_gemm.cu
-	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(CUTLASS_INC) $< -lcuda -o $@
+	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(CUTLASS_INC) $< -lcuda -o $@ -lcublas
 
 # Test LLM solution: compile with solution.h included (needs CUTLASS headers)
 test: 54_hopper_fp8_warp_specialized_gemm.cu solution.h
-	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(CUTLASS_INC) -DKH_TEST_SOLUTION $< -lcuda -o $@
+	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(CUTLASS_INC) -DKH_TEST_SOLUTION $< -lcuda -o $@ -lcublas
 
 clean:
 	rm -f ref test

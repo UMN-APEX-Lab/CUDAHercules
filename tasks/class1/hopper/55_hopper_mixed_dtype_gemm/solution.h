@@ -30,13 +30,13 @@ __global__ void naive_mixed_dtype_gemm_kernel(
     float acc = 0.0f;
     for (int k = 0; k < K; ++k) {
       int g = k / group_size;
-      float s = __half2float(scale_B[j * num_groups + g]);
-      float z = __half2float(zero_B[j * num_groups + g]);
+      float s = __half2float(scale_B[j + g * N]);
+      float z = __half2float(zero_B[j + g * N]);
       float a_val = __half2float(A[i * lda + k]);
-      float b_val = s * (float(B[k + j * ldb]) - z);
+      float b_val = __half2float(__float2half(s * float(B[k + j * ldb]) + z));
       acc += a_val * b_val;
     }
-    float d_val = alpha * acc + beta * __half2float(D[i * ldd + j]);
+    float d_val = alpha * acc + (beta == 0 ? 0.0f : beta * __half2float(D[i * ldd + j]));
     D[i * ldd + j] = __float2half(d_val);
   }
 }

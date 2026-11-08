@@ -49,7 +49,8 @@ __global__ void reference_abs_diff_kernel(
     __shared__ double block_sum_diff;
 
     for (size_t i = threadIdx.x + blockIdx.x * blockDim.x; i < count; i += blockDim.x * gridDim.x) {
-      double diff = fabs(data[i] - data_ref[i]);
+      double diff = fabs(double(data[i]) - double(data_ref[i]));
+      if (!isfinite(diff)) diff = INFINITY;
       if (print_diff) if (diff != diff || diff > 0.01f) printf("difference at %lld: %f ... %f vs %f\n", static_cast<long long int>(i), diff, (double)data[i], (double)data_ref[i]);
       thread_max_diff = fmax(diff, thread_max_diff);
       thread_sum_diff += diff;

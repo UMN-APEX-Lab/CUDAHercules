@@ -1,3 +1,4 @@
+#include "hopper_validation.cuh"
 /***************************************************************************************************
  * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -319,12 +320,12 @@ bool initialize_block(
     scope_max = Element(2);
     scope_min = Element(-2);
   } else {
-    scope_max = Element(8);
-    scope_min = Element(-8);
+    scope_max = Element(1);
+    scope_min = Element(-1);
   }
 
   cutlass::reference::device::BlockFillRandomUniform(
-    block.get(), block.size(), seed, scope_max, scope_min, 0);
+    block.get(), block.size(), seed, scope_max, scope_min, -1);
 
   return true;
 }
@@ -472,10 +473,10 @@ struct Runner
 
     // Check if the problem size is supported or not
     CUTLASS_CHECK(gemm.can_implement(arguments));
+    CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
   }
 
   void run() {
-    CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
     CUTLASS_CHECK(gemm.run());
   }
 
@@ -485,6 +486,26 @@ struct Runner
 };
 
 /// Execute the example (verification and timing)
+__global__ void pack_solution_sparse(const cutlass::half_t* dense,
+    __half* compressed, uint16_t* metadata, int M, int K) {
+  int word=blockIdx.x*blockDim.x+threadIdx.x;
+  if (word>=M*(K/16)) return;
+  int row=word/(K/16), kbase=(word%(K/16))*16;
+  uint16_t bits=0;
+  for (int g=0;g<4;++g) {
+    int found=0;
+    for (int j=0;j<4;++j) {
+      float x=float(dense[row*K+kbase+4*g+j]);
+      if (x!=0 && found<2) {
+        compressed[row*(K/2)+(kbase/4+g)*2+found]=__float2half(x);
+        bits |= uint16_t(j) << (g*4+found*2);
+        ++found;
+      }
+    }
+  }
+  metadata[word]=bits;
+}
+
 int run(Options &options) {
   bool init = initialize(options);
   if (!init) {
@@ -520,6 +541,7 @@ int run(Options &options) {
     // Profile reference (sparse GEMM)
     float ref_total_ms = 0, ref_min_ms = 1e30f;
     for (int iter = 0; iter < options.iterations; ++iter) {
+      kh_cold_l2();
       cudaEventRecord(start);
       gemm.run();
       cudaEventRecord(stop);
@@ -552,11 +574,18 @@ int run(Options &options) {
     // solution interface from the old harness uses __half. We need to convert.
     __half *dD_sol;
     cudaMalloc(&dD_sol, M * N * sizeof(__half));
+    kh_poison(dD_sol, M * N * sizeof(__half));
 
+    __half* canonical_A;
+    uint16_t* canonical_E;
+    CUDA_CHECK(cudaMalloc(&canonical_A,size_t(M)*K/2*sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&canonical_E,size_t(M)*K/16*sizeof(uint16_t)));
+    pack_solution_sparse<<<(M*(K/16)+255)/256,256>>>(block_A.get(),canonical_A,canonical_E,M,K);
+    CUDA_CHECK(cudaDeviceSynchronize());
     // Run solution once for correctness check
     HopperSparseGemm(M, N, K, options.alpha,
-                      reinterpret_cast<const __half*>(block_A_compressed.get()),
-                      reinterpret_cast<const uint16_t*>(block_E.get()),
+                      canonical_A,
+                      canonical_E,
                       reinterpret_cast<const __half*>(block_B.get()), K,
                       options.beta, dD_sol, N);
     cudaDeviceSynchronize();
@@ -568,17 +597,21 @@ int run(Options &options) {
       cudaMemcpy(sol_host.data(), dD_sol, M * N * sizeof(__half), cudaMemcpyDeviceToHost);
       cudaMemcpy(ref_host.data(), block_D.get(), M * N * sizeof(float), cudaMemcpyDeviceToHost);
 
+      std::vector<__half> rounded_ref(M*N);
+      for(int i=0;i<M*N;++i) rounded_ref[i]=__float2half(ref_host[(i%N)*M+i/N]);
+      kh_compare_outputs(sol_host,rounded_ref,0.005,0.002,0.001);
       float max_diff = 0.0f;
       float mean_diff = 0.0f;
       for (int i = 0; i < M * N; i++) {
-        float diff = std::abs(__half2float(sol_host[i]) - ref_host[i]);
+        float y=__half2float(rounded_ref[i]);
+        float diff = kh_abs(__half2float(sol_host[i])-y)/(0.005f+0.002f*kh_abs(y));
         mean_diff += diff;
         if (diff > max_diff) max_diff = diff;
       }
       mean_diff /= (M * N);
 
-      float tolerance = 1e-1f;  // half precision tolerance
-      if (max_diff > tolerance) {
+      float tolerance = 1.0f;  // half precision tolerance
+      if (!std::isfinite(max_diff) || max_diff > tolerance) {
         fprintf(stderr, "  Solution incorrect vs reference: max_diff=%.6f mean_diff=%.6f\n", max_diff, mean_diff);
         std::cout << "Incorrect" << std::endl;
         cudaFree(dD_sol);
@@ -589,8 +622,8 @@ int run(Options &options) {
     // Warmup solution
     for (int i = 0; i < options.warmup; i++) {
       HopperSparseGemm(M, N, K, options.alpha,
-                        reinterpret_cast<const __half*>(block_A_compressed.get()),
-                        reinterpret_cast<const uint16_t*>(block_E.get()),
+                        canonical_A,
+                        canonical_E,
                         reinterpret_cast<const __half*>(block_B.get()), K,
                         options.beta, dD_sol, N);
     }
@@ -599,10 +632,11 @@ int run(Options &options) {
     // Profile solution
     float sol_total_ms = 0, sol_min_ms = 1e30f;
     for (int iter = 0; iter < options.iterations; ++iter) {
+      kh_cold_l2();
       cudaEventRecord(start);
       HopperSparseGemm(M, N, K, options.alpha,
-                        reinterpret_cast<const __half*>(block_A_compressed.get()),
-                        reinterpret_cast<const uint16_t*>(block_E.get()),
+                        canonical_A,
+                        canonical_E,
                         reinterpret_cast<const __half*>(block_B.get()), K,
                         options.beta, dD_sol, N);
       cudaEventRecord(stop);
@@ -616,6 +650,7 @@ int run(Options &options) {
             sol_total_ms / options.iterations, options.iterations, sol_min_ms);
     fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
 
+    cudaFree(canonical_A); cudaFree(canonical_E);
     cudaFree(dD_sol);
 #endif
 
@@ -683,9 +718,9 @@ int main(int argc, char const **args) {
     configs.push_back({"custom", options.m, options.n, options.k});
   } else {
     configs = {
-      {"small",   1024, 1024, 1024},
-      {"medium",  4096, 4096, 4096},
-      {"large",   8192, 8192, 8192},
+      {"decode",128,8192,8192},
+      {"prefill",8192,8192,8192},
+      {"mlp",8192,28672,8192},
     };
   }
 

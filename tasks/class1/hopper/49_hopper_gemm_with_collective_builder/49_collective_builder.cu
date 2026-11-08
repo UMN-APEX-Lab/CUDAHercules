@@ -1,3 +1,5 @@
+#include <tuple>
+#include "hopper_validation.cuh"
 /***************************************************************************************************
  * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -104,11 +106,18 @@ cudaError_t CutlassGemm49(int M, int N, int K, float alpha,
   args.epilogue.thread.alpha = alpha;
   args.epilogue.thread.beta = beta;
 
-  G49 gemm;
+  auto key=std::make_tuple(M,N,K,alpha,beta,A,B,D);
+  static decltype(key) previous{};
+  static bool ready=false;
+  static G49 gemm;
   size_t ws = G49::get_workspace_size(args);
-  cutlass::device_memory::allocation<uint8_t> workspace(ws);
+  static cutlass::device_memory::allocation<uint8_t> workspace;
+  if (!ready || key!=previous) {
+    workspace.reset(ws);
   if (gemm.can_implement(args) != cutlass::Status::kSuccess) return cudaErrorUnknown;
   if (gemm.initialize(args, workspace.get()) != cutlass::Status::kSuccess) return cudaErrorUnknown;
+    previous=key;ready=true;
+  }
   if (gemm.run() != cutlass::Status::kSuccess) return cudaErrorUnknown;
   return cudaSuccess;
 }
@@ -119,7 +128,7 @@ cudaError_t CutlassGemm49(int M, int N, int K, float alpha,
 __global__ void InitHalfMatrix_kernel(__half *matrix, int size, int seed) {
   int idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx < size) {
-    float value = float(((idx + seed) * 16807 % 16) - 8) * 0.01f;
+    float value = kh_random(idx,seed);
     matrix[idx] = __float2half(value);
   }
 }
@@ -153,19 +162,12 @@ cudaError_t TestCorrectness(int M, int N, int K, float alpha, float beta) {
   cudaMalloc(&D_ref, szD); cudaMemset(D_ref, 0, szD);
   cudaMalloc(&D_cut, szD); cudaMemset(D_cut, 0, szD);
 
-  {dim3 bl(16,16), gr((M+15)/16,(N+15)/16);
-   NaiveHGemm_kernel<<<gr,bl>>>(M,N,K,alpha,A,lda,B,ldb,beta,D_ref,ldd);}
-  cudaDeviceSynchronize();
-
-  bool cutlass_ok = false;
-#if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
-  if (CutlassGemm49(M,N,K,alpha,(cutlass::half_t const*)A,(cutlass::half_t const*)B,beta,(cutlass::half_t*)D_cut,ldd)==cudaSuccess) {
-    cudaDeviceSynchronize(); cutlass_ok = true;
-  } else { cudaGetLastError(); }
-#endif
-
+  bool cutlass_ok = true;
+  if (CutlassGemm49(M,N,K,alpha,(cutlass::half_t*)A,(cutlass::half_t*)B,beta,(cutlass::half_t*)D_cut,ldd)!=cudaSuccess) return cudaErrorUnknown;
+  kh_sample_gemm(M,N,K,alpha,A,B,beta,D_ref,D_cut);
 #ifdef KH_TEST_SOLUTION
-  __half *D_sol; cudaMalloc(&D_sol, szD); cudaMemset(D_sol, 0, szD);
+  __half *D_sol; cudaMalloc(&D_sol, szD);
+    kh_poison(D_sol, szD); cudaMemset(D_sol, 0xff, szD);
   cudaError_t sr = HopperCollectiveGemm(M,N,K,alpha,A,lda,B,ldb,beta,D_sol,ldd);
   if (sr != cudaSuccess) {
     std::cerr<<"Solution failed: "<<cudaGetErrorString(sr)<<std::endl;
@@ -178,8 +180,9 @@ cudaError_t TestCorrectness(int M, int N, int K, float alpha, float beta) {
   std::vector<__half> hs(M*N), hr(M*N);
   cudaMemcpy(hs.data(), D_sol, szD, cudaMemcpyDeviceToHost);
   cudaMemcpy(hr.data(), D_chk, szD, cudaMemcpyDeviceToHost);
-  float md=0; for (int i=0;i<M*N;++i) md=fmaxf(md,fabsf(__half2float(hs[i])-__half2float(hr[i])));
-  if (md > 1.0f) {
+  kh_compare_outputs(hs,hr,0.005,0.002,0.001);
+  float md=0; for (int i=0;i<M*N;++i) md=fmaxf(md,kh_abs(__half2float(hs[i])-__half2float(hr[i])));
+  if (md > 0.125f) {
     std::cerr<<"Solution incorrect. Max diff: "<<md<<std::endl;
     cudaFree(D_sol); cudaFree(D_ref); cudaFree(D_cut); cudaFree(B); cudaFree(A);
     return cudaErrorUnknown;
@@ -201,6 +204,7 @@ void Profile(int M, int N, int K, float alpha, float beta, int iters) {
     cudaDeviceSynchronize();
     float rt=0;
     for (int i=0;i<iters;++i) {
+      kh_cold_l2();
       cudaEventRecord(t0);
       CutlassGemm49(M,N,K,alpha,(cutlass::half_t const*)A,(cutlass::half_t const*)B,beta,(cutlass::half_t*)D,ldd);
       cudaEventRecord(t1); cudaEventSynchronize(t1);
@@ -228,8 +232,8 @@ void Profile(int M, int N, int K, float alpha, float beta, int iters) {
     cudaMemcpy(h_ref.data(), D_ref_saved, sizeof(__half)*M*N, cudaMemcpyDeviceToHost);
     cudaFree(D_ref_saved);
     float md=0;
-    for(int i=0;i<M*N;++i) md=fmaxf(md,fabsf(__half2float(h_sol[i])-__half2float(h_ref[i])));
-    if (md > 1.0f) {
+    for(int i=0;i<M*N;++i) md=fmaxf(md,kh_abs(__half2float(h_sol[i])-__half2float(h_ref[i])));
+    if (md > 0.125f) {
       fprintf(stderr,"Solution incorrect in Profile: max_diff=%.6f\n",md);
       std::cout<<"Incorrect"<<std::endl;
       cudaEventDestroy(t0); cudaEventDestroy(t1); cudaFree(D); cudaFree(B); cudaFree(A);
@@ -241,6 +245,7 @@ void Profile(int M, int N, int K, float alpha, float beta, int iters) {
   cudaDeviceSynchronize();
   float st=0,sm=1e30f;
   for(int i=0;i<iters;++i){
+    kh_cold_l2();
     cudaEventRecord(t0); HopperCollectiveGemm(M,N,K,alpha,A,K,B,K,beta,D,ldd);
     cudaEventRecord(t1); cudaEventSynchronize(t1);
     float ms; cudaEventElapsedTime(&ms,t0,t1); st+=ms; if(ms<sm)sm=ms;
@@ -262,7 +267,7 @@ int main(int argc, const char *arg[]) {
     if(argc>6)std::stringstream(arg[6])>>iters;
     cfgs.push_back({"custom",M,N,K});
   } else {
-    cfgs={{"small",1024,1024,1024},{"medium",4096,4096,4096},{"large",8192,8192,8192}};
+    cfgs={{"decode",128,8192,8192},{"prefill",8192,8192,8192},{"mlp",8192,28672,8192}};
   }
   for (auto& c : cfgs) {
     fprintf(stdout,"\n=== %s: M=%d, N=%d, K=%d ===\n",c.l,c.m,c.n,c.k);

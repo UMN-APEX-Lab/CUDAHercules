@@ -14,7 +14,7 @@ __global__ void naive_hopper_gemm_kernel(
     for (int k = 0; k < K; ++k) {
       acc += A[i * lda + k] * B[k + j * ldb];
     }
-    C[i + j * ldc] = alpha * acc + beta * C[i + j * ldc];
+    C[i + j * ldc] = alpha * acc + (beta == 0 ? 0.0f : beta * C[i + j * ldc]);
   }
 }
 

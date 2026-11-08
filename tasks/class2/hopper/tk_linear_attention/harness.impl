@@ -1,0 +1,87 @@
+#include "hopper_validation.cuh"
+#include <cuda_bf16.h>
+#include <algorithm>
+#include <vector>
+#include <iostream>
+#include <fstream>
+#include <string>
+#include "solution_api.h"
+#define KH_CHECK(call) do { auto err=(call); if(err!=cudaSuccess) {fprintf(stderr,"%s: %s\n",#call,cudaGetErrorString(err));exit(1);} } while(0)
+std::vector<void*> kh_buffers;
+std::vector<uint64_t> kh_buffer_sizes;
+template<class T> T* alloc(size_t n, int seed, float scale=1, float bias=0) {
+  T* ptr; KH_CHECK(cudaMalloc(&ptr,n*sizeof(T))); kh_buffers.push_back(ptr); kh_buffer_sizes.push_back(n*sizeof(T));
+  std::vector<T> values(n);
+  for(size_t i=0;i<n;++i) values[i]=T(kh_random(i,seed)*scale+bias);
+  KH_CHECK(cudaMemcpy(ptr,values.data(),n*sizeof(T),cudaMemcpyHostToDevice));
+  return ptr;
+}
+template<class F> float measure(const char* name,F fn) {
+  for(int i=0;i<3;++i) fn(); KH_CHECK(cudaDeviceSynchronize());
+  void* cache=alloc<uint8_t>(128u<<20,93);
+  cudaEvent_t a,b; KH_CHECK(cudaEventCreate(&a)); KH_CHECK(cudaEventCreate(&b));
+  float total=0,best=1e30f;
+  for(int i=0;i<10;++i) {
+    KH_CHECK(cudaMemset(cache,i,128u<<20));
+    KH_CHECK(cudaEventRecord(a)); fn(); KH_CHECK(cudaEventRecord(b)); KH_CHECK(cudaEventSynchronize(b));
+    float ms; KH_CHECK(cudaEventElapsedTime(&ms,a,b)); total+=ms; best=std::min(best,ms);
+  }
+  printf("%s time: %.6f ms (avg over 10 trials, min: %.6f ms)\n",name,total/10,best);
+  KH_CHECK(cudaEventDestroy(a)); KH_CHECK(cudaEventDestroy(b));
+  return best;
+}
+int main(int argc,char** argv) {
+  int B=4,H=32,N=16384;
+  if(argc>=4) { B=atoi(argv[1]);H=atoi(argv[2]);N=atoi(argv[3]); }
+  if(B<=0||H<=0||H%2||N%256) { fputs("Require B>0, even H>0, N multiple of 256\n",stderr);return 1; }
+  printf("\n=== tk_linear_attention: B=%d, H=%d, N=%d ===\n",B,H,N);
+
+  auto q=alloc<bf16>(size_t(B)*H*N*128,1,0.5f),k=alloc<bf16>(size_t(B)*H*N*128,2,0.5f);
+  auto v=alloc<bf16>(size_t(B)*H*N*128,3),o=alloc<bf16>(size_t(B)*H*N*128,4);
+  auto slopes=alloc<float>(H,5,0.02f,0.03f);
+  auto globals=la_init(q,k,v,o,slopes,B,H,N);
+  unsigned long smem=kittens::MAX_SHARED_MEMORY-1024;
+  KH_CHECK(cudaFuncSetAttribute(la_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,smem));
+  auto reference=[&](){KH_CHECK(cudaMemset(o,0,size_t(B)*H*N*128*sizeof(bf16)));la_kernel<<<dim3(H,B),NUM_THREADS,smem>>>(globals,N);KH_CHECK(cudaGetLastError());};
+  kh_poison(o,size_t(B)*H*N*128*sizeof(bf16));
+  reference(); KH_CHECK(cudaDeviceSynchronize());
+  size_t count=size_t(B)*H*N*128;
+  std::vector<bf16> expected(count);
+  KH_CHECK(cudaMemcpy(expected.data(),o,count*sizeof(bf16),cudaMemcpyDeviceToHost));
+  for(auto x:expected) if(!std::isfinite(float(x))) {fputs("Nonfinite reference\n",stderr);return 1;}
+  if(argc==5) {
+    // Optional binary dump for an independent mathematical oracle.
+    std::ofstream file(argv[4],std::ios::binary);
+    uint64_t num=kh_buffers.size();file.write((char*)&num,8);
+    for(size_t i=0;i<num;++i) {
+      uint64_t bytes=kh_buffer_sizes[i];std::vector<char> data(bytes);
+      KH_CHECK(cudaMemcpy(data.data(),kh_buffers[i],bytes,cudaMemcpyDeviceToHost));
+      file.write((char*)&bytes,8);file.write(data.data(),bytes);
+    }
+    if(!file) {fputs("Failed to export oracle inputs\n",stderr);return 1;}
+
+  }
+#ifdef KH_TEST_SOLUTION
+  bf16* sol=alloc<bf16>(count,99);
+  kh_poison(sol,count*sizeof(bf16));
+  auto solution=[&](){ LinearAttention(q,k,v,sol,slopes,B,H,N,128); KH_CHECK(cudaGetLastError()); };
+  solution(); KH_CHECK(cudaDeviceSynchronize());
+  std::vector<bf16> actual(count);
+  KH_CHECK(cudaMemcpy(actual.data(),sol,count*sizeof(bf16),cudaMemcpyDeviceToHost));
+  double error2=0,magnitude2=0;
+  for(size_t i=0;i<count;++i) {
+    float x=float(actual[i]),y=float(expected[i]);
+    error2+=double(x-y)*(x-y);magnitude2+=double(y)*y;
+    if(!std::isfinite(x)||std::abs(x-y)>0.1f+0.06f*std::abs(y)) {
+      fprintf(stderr,"Incorrect at %zu: got %g expected %g\n",i,x,y);return 1;
+    }
+  }
+  if(std::sqrt(error2/(magnitude2+1e-30))>0.01) {fputs("Incorrect normalized RMS\n",stderr);return 1;}
+#endif
+  float rt=measure("Ref",reference);
+#ifdef KH_TEST_SOLUTION
+  float st=measure("Kernel",solution); printf("Speedup: %.6fx\n",rt/st);
+#endif
+  puts("Passed");
+  for(void* ptr:kh_buffers) KH_CHECK(cudaFree(ptr));
+}

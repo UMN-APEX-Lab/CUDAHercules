@@ -1,264 +1,152 @@
 #!/usr/bin/env python3
-"""Test all Hopper reference implementations (Class 1 + Class 2)."""
+"""H200 reference and adversarial harness validation for Make-based Hopper tasks.
 
+Builds isolated task copies, validates all default reference cases, and verifies
+that an actual no-op CUDA submission cannot pass. Compilations may overlap;
+GPU execution is serialized with the FA3 validation script. Results and complete
+logs are saved after every task. This script never modifies solution.h in tasks.
+Use test_fa3_references.py for the 60 def.py tasks and
+ test_tk_hopper_oracles.py for independent TK math validation.
+"""
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import fcntl
+import json
 import os
-import sys
-import subprocess
-import time
 from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-
-def test_class1_hopper():
-    """Test Class 1 Hopper tasks by running `make ref` and executing."""
-    hopper_dir = PROJECT_ROOT / "tasks" / "class1" / "hopper"
-    if not hopper_dir.exists():
-        print("No Class 1 Hopper tasks found")
-        return [], []
-
-    tasks = sorted(d for d in hopper_dir.iterdir() if d.is_dir())
-    passed, failed = [], []
-
-    for task_dir in tasks:
-        makefile = task_dir / "Makefile"
-        if not makefile.exists():
-            continue
-
-        name = task_dir.name
-        print(f"\n{'='*60}")
-        print(f"[Class 1] {name}")
-        print(f"{'='*60}")
-
-        # Clean first
-        subprocess.run(["make", "clean"], cwd=task_dir, capture_output=True)
-
-        # Build reference
-        t0 = time.time()
-        result = subprocess.run(
-            ["make", "ref"],
-            cwd=task_dir,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        build_time = time.time() - t0
-
-        if result.returncode != 0:
-            print(f"  BUILD FAILED ({build_time:.1f}s)")
-            print(f"  stderr: {result.stderr[-500:]}")
-            failed.append((name, "build", result.stderr[-200:]))
-            continue
-
-        print(f"  Build OK ({build_time:.1f}s)")
-
-        # Run reference
-        ref_binary = task_dir / "ref"
-        if not ref_binary.exists():
-            failed.append((name, "no binary", ""))
-            continue
-
-        try:
-            t0 = time.time()
-            result = subprocess.run(
-                ["./ref"],
-                cwd=task_dir,
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-            run_time = time.time() - t0
-
-            if result.returncode != 0:
-                print(f"  RUN FAILED ({run_time:.1f}s)")
-                print(f"  stderr: {result.stderr[-500:]}")
-                failed.append((name, "runtime", result.stderr[-200:]))
-            else:
-                print(f"  Run OK ({run_time:.1f}s)")
-                for line in result.stdout.splitlines():
-                    if any(kw in line.lower() for kw in ["time", "gflops", "tflops", "passed"]):
-                        print(f"  {line.strip()}")
-                passed.append(name)
-        except subprocess.TimeoutExpired:
-            print(f"  RUN TIMEOUT (>600s)")
-            failed.append((name, "timeout", "exceeded 600s"))
-
-        # Cleanup binary
-        subprocess.run(["make", "clean"], cwd=task_dir, capture_output=True)
-
-    return passed, failed
+ROOT=Path(__file__).resolve().parents[1]
 
 
-def test_class2_hopper():
-    """Test Class 2 Hopper tasks by compiling and running CUDA references."""
-    hopper_dir = PROJECT_ROOT / "tasks" / "class2" / "hopper"
-    if not hopper_dir.exists():
-        print("No Class 2 Hopper tasks found")
-        return [], []
+from cuda_hercules.utils import task_source_hash as source_hash
 
-    # Add project to path
-    sys.path.insert(0, str(PROJECT_ROOT / "src"))
-    from cuda_hercules.eval import load_task_def
-    from cuda_hercules.compiler import compile_cuda_module
-    from cuda_hercules.utils import get_project_root
+
+def empty_solution(source):
+    # Keep the exact public API, with a launched CUDA kernel doing no work.
+    match=re.search(r'(?m)^(?:cudaError_t|void)\s+(?:Hopper\w+|Bf16Gemm|Fp8GemmScaled|Fp8Gemm|FusedRotary|solution_mqa_logits|BasedLinearAttention|HedgehogAttention|LinearAttention|Mamba2Forward)\s*\([^)]*\)\s*\{',source)
+    if match is None: raise ValueError('Cannot find public solution entry point')
+    signature=match[0].rstrip()[:-1].rstrip()
+    includes='\n'.join(line for line in source.splitlines() if line.startswith('#include'))
+    body='kh_empty<<<1,1>>>();'
+    if signature.startswith('cudaError_t'):body+='return cudaGetLastError();'
+    return includes+'\n__global__ void kh_empty() {}\n'+signature+'{'+body+'}\n'
+
+
+def validate(task, output_dir, negative, positive=False):
+    import yaml
+    config=yaml.safe_load((task/'task.yaml').read_text())
+    name=f'{task.parent.parent.name}_{task.name}'
+    logs=[]
     import torch
-
-    tasks = sorted(d for d in hopper_dir.iterdir() if d.is_dir())
-    passed, failed = [], []
-    root_dir = get_project_root()
-
-    # Handle Makefile-based tasks (e.g. TK tasks with backend: class1_make)
-    for task_dir in tasks:
-        if not (task_dir / "Makefile").exists() or (task_dir / "def.py").exists():
-            continue
-
-        name = task_dir.name
-        print(f"\n{'='*60}")
-        print(f"[Class 2 / Makefile] {name}")
-        print(f"{'='*60}")
-
-        subprocess.run(["make", "clean"], cwd=task_dir, capture_output=True)
-        t0 = time.time()
-        result = subprocess.run(
-            ["make", "ref"], cwd=task_dir, capture_output=True, text=True, timeout=300,
-        )
-        build_time = time.time() - t0
-        if result.returncode != 0:
-            print(f"  BUILD FAILED ({build_time:.1f}s)")
-            print(f"  stderr: {result.stderr[-500:]}")
-            failed.append((name, "build", result.stderr[-200:]))
-            continue
-        print(f"  Build OK ({build_time:.1f}s)")
-
-        ref_binary = task_dir / "ref"
-        if not ref_binary.exists():
-            failed.append((name, "no binary", ""))
-            continue
-        try:
-            t0 = time.time()
-            result = subprocess.run(
-                ["./ref"], cwd=task_dir, capture_output=True, text=True, timeout=600,
-            )
-            run_time = time.time() - t0
-            if result.returncode != 0:
-                print(f"  RUN FAILED ({run_time:.1f}s)")
-                print(f"  stderr: {result.stderr[-500:]}")
-                failed.append((name, "runtime", result.stderr[-200:]))
-            else:
-                print(f"  Run OK ({run_time:.1f}s)")
-                for line in result.stdout.splitlines():
-                    if any(kw in line.lower() for kw in ["time", "gflops", "tflops", "passed"]):
-                        print(f"  {line.strip()}")
-                passed.append(name)
-        except subprocess.TimeoutExpired:
-            print(f"  RUN TIMEOUT (>600s)")
-            failed.append((name, "timeout", "exceeded 600s"))
-        subprocess.run(["make", "clean"], cwd=task_dir, capture_output=True)
-
-    # Handle def.py-based tasks (Class 2 pybind11 pipeline)
-    for task_dir in tasks:
-        def_py = task_dir / "def.py"
-        ref_cu = task_dir / "reference.cu"
-        if not def_py.exists():
-            continue
-
-        name = task_dir.name
-        print(f"\n{'='*60}")
-        print(f"[Class 2] {name}")
-        print(f"{'='*60}")
-
-        try:
-            task_def = load_task_def(str(task_dir))
-        except Exception as e:
-            print(f"  LOAD FAILED: {e}")
-            failed.append((name, "load", str(e)[:200]))
-            continue
-
-        if not task_def["HAS_CUDA_REFERENCE"] or not ref_cu.exists():
-            print(f"  SKIP: no CUDA reference")
-            continue
-
-        # Compile reference
-        t0 = time.time()
-        try:
-            extra_includes = []
-            for inc in task_def["REFERENCE_EXTRA_INCLUDES"]:
-                if os.path.isabs(inc):
-                    inc_path = inc
-                else:
-                    inc_path = os.path.join(str(task_dir), inc)
-                    if not os.path.isdir(inc_path):
-                        inc_path = os.path.join(root_dir, inc)
-                if os.path.isdir(inc_path):
-                    extra_includes.append(inc_path)
-
-            build_dir = os.path.join(root_dir, ".cache", "ref_builds", name)
-            os.makedirs(build_dir, exist_ok=True)
-
-            ref_fn = compile_cuda_module(
-                cuda_source=str(ref_cu),
-                function_signature=task_def["FUNCTION_SIGNATURE"],
-                extra_include_dirs=extra_includes,
-                extra_cuda_cflags=task_def.get("REFERENCE_EXTRA_CUDA_FLAGS", []),
-                extra_ldflags=task_def.get("REFERENCE_EXTRA_LDFLAGS", []),
-                build_dir=build_dir,
-                verbose=False,
-            )
-            build_time = time.time() - t0
-            print(f"  Compile OK ({build_time:.1f}s)")
-        except Exception as e:
-            build_time = time.time() - t0
-            print(f"  COMPILE FAILED ({build_time:.1f}s): {e}")
-            failed.append((name, "compile", str(e)[:200]))
-            continue
-
-        # Run reference with test inputs
-        try:
-            from cuda_hercules.eval import _build_call_args
-
-            torch.manual_seed(42)
-            torch.cuda.manual_seed(42)
-            inputs = task_def["get_inputs"]()
-            outputs = task_def["get_outputs"](inputs)
-            args = _build_call_args(task_def, inputs, outputs)
-            ref_fn(*args)
-            torch.cuda.synchronize()
-            print(f"  Run OK")
-            passed.append(name)
-        except Exception as e:
-            print(f"  RUN FAILED: {e}")
-            failed.append((name, "runtime", str(e)[:200]))
-
-    return passed, failed
+    record=dict(task=config['task_id'],gpu=torch.cuda.get_device_name())
+    env={**os.environ,'CUTLASS_DIR':str(ROOT/'reference_sources/cutlass'),
+         'TK_DIR':str(ROOT/'reference_sources/ThunderKittens'),
+         'DEEPGEMM_DIR':str(ROOT/'reference_sources/deep_gemm'),
+         'KH_BENCHMARK':'10'}
+    def run(cmd,cwd,timeout):
+        result=subprocess.run(cmd,cwd=cwd,env=env,capture_output=True,text=True,timeout=timeout)
+        logs.append('$ '+' '.join(cmd)+'\n'+result.stdout+result.stderr)
+        return result
+    try:
+        with tempfile.TemporaryDirectory(prefix='hercules_hopper_') as temp:
+            work=Path(temp)/'task'
+            shutil.copytree(task,work,ignore=shutil.ignore_patterns('ref','test','*.o','__pycache__'))
+            record['source_hash']=source_hash(work)
+            ref=run(['make','-B','ref'],work,600)
+            record['ref_compiled']=ref.returncode==0
+            if ref.returncode: raise RuntimeError('reference build failed')
+            if positive:
+                build=run(['make','-B','test'],work,600)
+                record['positive_compiled']=build.returncode==0
+                if build.returncode:raise RuntimeError('positive control build failed')
+                shutil.copy2(work/'test',work/'positive')
+            if negative:
+                sol=work/'solution.h'
+                sol.write_text(empty_solution(sol.read_text()))
+                build=run(['make','-B','test'],work,600)
+                record['empty_compiled']=build.returncode==0
+                if build.returncode:raise RuntimeError('empty control build failed')
+            # Lock the GPU only after compilation.
+            with (ROOT/'.cache/hopper_gpu.lock').open('w') as lock:
+                fcntl.flock(lock,fcntl.LOCK_EX)
+                ref=run(['./ref'],work,600)
+                record['reference_passed']=ref.returncode==0 and bool(re.search(r'\bPassed\b',ref.stdout))
+                record['reference_cases']=[]
+                sections=re.split(r'===\s*(.*?)\s*===',ref.stdout)
+                for label,body in zip(sections[1::2],sections[2::2]):
+                    timing=re.search(r'Ref time:[^\n]*min:\s*([\d.]+)\s*ms',body)
+                    if timing:record['reference_cases'].append(dict(name=label,ref_min_ms=float(timing[1])))
+                if not record['reference_passed']:raise RuntimeError('reference execution failed')
+                if not record['reference_cases']:raise RuntimeError('reference emitted no per-case timings')
+                if positive:
+                    task_name=task.name
+                    if task_name.startswith('tk_') and task.parent.parent.name=='class2':
+                        small=['1','2','256']
+                    elif task_name=='tk_rotary':small=[]
+                    elif task_name.startswith('tk_'):small=['128','256','256']
+                    elif task_name=='deepgemm_mqa_logits':small=['128','512']
+                    elif task_name.startswith('61_'):small=['--m=128','--n=128','--k=256','--iterations=1']
+                    elif task_name.startswith('54_'):small=['128','256','256']
+                    elif task_name.startswith('57_'):small=['--m=128','--n=256','--k=2048','--groups=8','--iterations=1']
+                    elif task_name.startswith('52_'):small=['128','512','256','256','1']
+                    elif task_name.startswith(('48_','49_','50_','51_')):small=['128','256','256','1']
+                    elif task_name.startswith('88_'):small=['--b=1','--h=2','--q=256','--k=256','--d=128']
+                    else:small=['--m=128','--n=256','--k=256','--groups=8','--l=4','--iterations=1']
+                    record['positive_args']=small
+                    good=run(['./positive',*small],work,600)
+                    record['positive_passed']=good.returncode==0 and bool(re.search(r'\bPassed\b',good.stdout))
+                    if not record['positive_passed']:raise RuntimeError('positive implementation rejected')
+                if negative:
+                    # No-op fails before performance measurement in the first case.
+                    bad=run(['./test'],work,600)
+                    record['empty_rejected']=bad.returncode!=0
+                    if not record['empty_rejected']:raise RuntimeError('EMPTY SOLUTION PASSED')
+            record['passed']=True
+    except Exception as error:
+        record.update(passed=False,error=str(error))
+    (output_dir/(name+'.log')).write_text('\n'.join(logs))
+    print(record['task']+(' PASS' if record['passed'] else ' FAIL: '+record['error']),flush=True)
+    return record
 
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("Testing Hopper Reference Implementations")
-    print("=" * 60)
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--filter',default='')
+    parser.add_argument('--jobs',type=int,default=4)
+    parser.add_argument('--no-negative',action='store_true')
+    parser.add_argument('--positive',action='store_true',help='Also verify the supplied simple CUDA implementation on a diagnostic size')
+    parser.add_argument('--resume',action='store_true',help='Reuse passing records only when their source hash still matches')
+    parser.add_argument('--output',default='results/hopper_make_validation.json')
+    args=parser.parse_args()
+    import torch
+    if torch.cuda.get_device_capability()!=(9,0):raise SystemExit('Requires an SM90 GPU')
+    output=ROOT/args.output;output.parent.mkdir(parents=True,exist_ok=True)
+    log_dir=output.parent/output.stem;log_dir.mkdir(parents=True,exist_ok=True)
+    (ROOT/'.cache').mkdir(exist_ok=True)
+    tasks=[p.parent for cls in ['class1','class2'] for p in (ROOT/'tasks'/cls/'hopper').glob('*/Makefile') if args.filter in p.parent.name]
+    reports=[]
+    if args.resume and output.exists():
+        previous={r['task']:r for r in json.loads(output.read_text())}
+        pending=[]
+        for task in tasks:
+            task_id='/'.join(task.parts[-3:])
+            cached=previous.get(task_id,{})
+            if (cached.get('passed') and cached.get('source_hash')==source_hash(task)
+                    and (args.no_negative or cached.get('empty_rejected'))
+                    and (not args.positive or cached.get('positive_passed'))):
+                reports.append(cached)
+            else:pending.append(task)
+        tasks=pending
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures=[pool.submit(validate,t,log_dir,not args.no_negative,args.positive) for t in sorted(tasks)]
+        for future in as_completed(futures):
+            reports.append(future.result());reports.sort(key=lambda r:r['task'])
+            output.write_text(json.dumps(reports,indent=2)+'\n')
+    print(f'{sum(r["passed"] for r in reports)}/{len(reports)} passed; {output}')
+    if not reports or not all(r['passed'] for r in reports):raise SystemExit(1)
 
-    c1_passed, c1_failed = test_class1_hopper()
-    c2_passed, c2_failed = test_class2_hopper()
-
-    print("\n\n" + "=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-
-    total_passed = len(c1_passed) + len(c2_passed)
-    total_failed = len(c1_failed) + len(c2_failed)
-
-    print(f"\nClass 1 Hopper: {len(c1_passed)} passed, {len(c1_failed)} failed")
-    print(f"Class 2 Hopper: {len(c2_passed)} passed, {len(c2_failed)} failed")
-    print(f"Total: {total_passed} passed, {total_failed} failed")
-
-    if c1_failed:
-        print(f"\nClass 1 failures:")
-        for name, stage, err in c1_failed:
-            print(f"  {name} [{stage}]: {err[:100]}")
-
-    if c2_failed:
-        print(f"\nClass 2 failures:")
-        for name, stage, err in c2_failed:
-            print(f"  {name} [{stage}]: {err[:100]}")
-
-    sys.exit(1 if total_failed > 0 else 0)
+if __name__=='__main__':main()

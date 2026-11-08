@@ -1,0 +1,22 @@
+{
+  "fa3_fwd_split_hdim128_bf16": 4,
+  "fa3_fwd_split_hdim128_bf16_causal": 4,
+  "fa3_fwd_split_hdim128_fp16": 4,
+  "fa3_fwd_split_hdim128_fp16_causal": 4,
+  "fa3_fwd_split_hdim192_bf16": 16,
+  "fa3_fwd_split_hdim192_bf16_causal": 16,
+  "fa3_fwd_split_hdim192_fp16": 16,
+  "fa3_fwd_split_hdim192_fp16_causal": 16,
+  "fa3_fwd_split_hdim256_bf16": 32,
+  "fa3_fwd_split_hdim256_bf16_causal": 32,
+  "fa3_fwd_split_hdim256_fp16": 32,
+  "fa3_fwd_split_hdim256_fp16_causal": 32,
+  "fa3_fwd_split_hdim64_bf16": 4,
+  "fa3_fwd_split_hdim64_bf16_causal": 4,
+  "fa3_fwd_split_hdim64_fp16": 4,
+  "fa3_fwd_split_hdim64_fp16_causal": 4,
+  "fa3_fwd_split_hdim96_bf16": 8,
+  "fa3_fwd_split_hdim96_bf16_causal": 8,
+  "fa3_fwd_split_hdim96_fp16": 8,
+  "fa3_fwd_split_hdim96_fp16_causal": 8
+}

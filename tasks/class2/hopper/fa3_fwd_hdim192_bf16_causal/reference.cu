@@ -1,5 +1,5 @@
 /*
- * Flash Attention 3 Forward — hdim=192, bf16, causal
+ * Flash Attention 3 Forward — hdim=192, bfloat16, causal=True
  *
  * Source: flash-attention/hopper/ (FA3 Hopper kernels)
  * Kernel source code in reference_sources/flash_attn_v3/.
@@ -20,13 +20,14 @@ static inline int round_up(int x, int m) {
 }
 
 extern "C" void launch_fa3_fwd(
-    const void* Q,     // [B, H, Sq, D] bf16
-    const void* K,     // [B, H, Sk, D] bf16
-    const void* V,     // [B, H, Sk, D] bf16
-    void* O,           // [B, H, Sq, D] bf16
+    const void* Q,     // [B, H, Sq, D] fp16
+    const void* K,     // [B, H, Sk, D] fp16
+    const void* V,     // [B, H, Sk, D] fp16
+    void* O,           // [B, H, Sq, D] fp16
     float* lse,        // [B, H, Sq]
     int B,
     int H,
+    int Hkv,
     int Sq,
     int Sk,
     int D,
@@ -42,8 +43,8 @@ extern "C" void launch_fa3_fwd(
     params.o_ptr = O;
 
     params.q_batch_stride = static_cast<int64_t>(H) * Sq * D;
-    params.k_batch_stride = static_cast<int64_t>(H) * Sk * D;
-    params.v_batch_stride = static_cast<int64_t>(H) * Sk * D;
+    params.k_batch_stride = static_cast<int64_t>(Hkv) * Sk * D;
+    params.v_batch_stride = static_cast<int64_t>(Hkv) * Sk * D;
     params.o_batch_stride = static_cast<int64_t>(H) * Sq * D;
 
     params.q_row_stride = D;
@@ -59,7 +60,7 @@ extern "C" void launch_fa3_fwd(
     params.v_dim_stride = 1;  // Row-major V
 
     params.h = H;
-    params.h_k = H;
+    params.h_k = Hkv;
 
     params.b = B;
     params.seqlen_q = Sq;
@@ -94,8 +95,12 @@ extern "C" void launch_fa3_fwd(
     // Device info
     int device;
     cudaGetDevice(&device);
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, device);
+    static thread_local int cached_device = -1;
+    static thread_local cudaDeviceProp prop;
+    if (device != cached_device) {
+        cudaGetDeviceProperties(&prop, device);
+        cached_device = device;
+    }
     params.num_sm = prop.multiProcessorCount;
     params.arch = 90;
 

@@ -29,6 +29,8 @@
  *
  **************************************************************************************************/
 #pragma once
+#include <tuple>
+#include "cutlass/util/device_memory.h"
 
 #include "cute/tensor.hpp"
 
@@ -132,8 +134,20 @@ gett_kernel(
   print("TileSape:"); print(TileShape{}); print("\n");
 #endif
 
-  GettOperator op;
-  return op(args, stream);
+  auto key=std::make_tuple(ptr_A,ptr_B,ptr_C,ptr_D,cute::size<0>(problem_shape_mnkl),cute::size<1>(problem_shape_mnkl),cute::size<2>(problem_shape_mnkl),cute::size<3>(problem_shape_mnkl),alpha,beta);
+  static decltype(key) previous{};
+  static bool ready=false;
+  static GettOperator op;
+  static cutlass::device_memory::allocation<uint8_t> workspace;
+  if(!ready || key!=previous) {
+    workspace.reset(GettOperator::get_workspace_size(args));
+    auto status=op.can_implement(args);
+    if(status!=cutlass::Status::kSuccess) return status;
+    status=op.initialize(args,workspace.get(),stream);
+    if(status!=cutlass::Status::kSuccess) return status;
+    previous=key;ready=true;
+  }
+  return op.run(stream);
 }
 
 } // namespace example

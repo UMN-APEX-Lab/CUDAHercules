@@ -1,3 +1,4 @@
+#include "hopper_validation.cuh"
 /***************************************************************************************************
  * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -127,14 +128,14 @@ using StageCountType = cutlass::gemm::collective::StageCountAuto;           // S
 
 // Different configs for pingpong/cooperative
 struct CooperativeConfig {
-  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8FastAccum;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative;
   using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
   using TileShape           = Shape<_256,_128,_128>;
   using ClusterShape        = Shape<_1,_2,_1>;
 };
 
 struct PingpongConfig {
-  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8FastAccum;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong;
   using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
   using TileShape           = Shape<_128,_128,_128>;
   using ClusterShape        = Shape<_2,_1,_1>;
@@ -455,7 +456,7 @@ bool initialize_block(
   }
 
   cutlass::reference::device::BlockFillRandomUniform(
-    block.get(), block.size(), seed, scope_max, scope_min, 0);
+    block.get(), block.size(), seed, scope_max, scope_min, -1);
 
   return true;
 }
@@ -719,8 +720,14 @@ int run(Options &options, bool host_problem_shapes_available = true)
   CUTLASS_CHECK(gemm.run());
 
   // Check if output from CUTLASS kernel and reference kernel are equal or not
-  Result result;
-  // CPU verification skipped (non-fatal, not needed for benchmark)
+  // Native FP8 tensor-core accumulation is checked independently in fp64.
+  for (int i=0;i<options.groups;++i) {
+    auto shape=options.problem_sizes_host[i];
+    if (get<0>(shape)==0) continue;
+    kh_sample_gemm(get<0>(shape),get<1>(shape),get<2>(shape),alpha_host[i],
+      block_A.get()+offset_A[i],block_B.get()+offset_B[i],beta_host[i],
+      block_C.get()+offset_C[i],block_D.get()+offset_D[i],0.03f,0.002f);
+  }
 
   std::cout << "Passed" << std::endl;
 
@@ -733,7 +740,6 @@ int run(Options &options, bool host_problem_shapes_available = true)
 
     // Warmup
     for (int i = 0; i < 3; i++) {
-      CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
       CUTLASS_CHECK(gemm.run());
     }
     cudaDeviceSynchronize();
@@ -741,7 +747,7 @@ int run(Options &options, bool host_problem_shapes_available = true)
     // Profile reference
     float ref_total_ms = 0, ref_min_ms = 1e30f;
     for (int iter = 0; iter < options.iterations; ++iter) {
-      CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
+      kh_cold_l2();
       cudaEventRecord(start);
       CUTLASS_CHECK(gemm.run());
       cudaEventRecord(stop);
@@ -755,6 +761,7 @@ int run(Options &options, bool host_problem_shapes_available = true)
             ref_total_ms / options.iterations, options.iterations, ref_min_ms);
 
 #ifdef KH_TEST_SOLUTION
+    kh_poison(block_ref_D.get(),block_ref_D.size()*sizeof(ElementC));
     // Set up solution D output pointers (reuse block_ref_D for solution output)
     {
       // Build solution pointer arrays: reuse block_A, block_B data; output to block_ref_D
@@ -768,7 +775,7 @@ int run(Options &options, bool host_problem_shapes_available = true)
 
       // Build host arrays for solution call
       std::vector<__nv_fp8_e4m3 const *> h_A_ptrs(options.groups);
-      std::vector<__nv_fp8_e4m3 const *> h_B_ptrs(options.groups);
+      std::vector<__nv_fp8_e5m2 const *> h_B_ptrs(options.groups);
       std::vector<__half *> h_D_ptrs(options.groups);
       std::vector<int> h_Ms(options.groups), h_Ns(options.groups), h_Ks(options.groups);
       std::vector<int> h_ldas(options.groups), h_ldbs(options.groups), h_ldds(options.groups);
@@ -779,22 +786,22 @@ int run(Options &options, bool host_problem_shapes_available = true)
         auto N = get<1>(problem);
         auto K = get<2>(problem);
         h_A_ptrs[i] = reinterpret_cast<__nv_fp8_e4m3 const *>(block_A.get() + offset_A.at(i));
-        h_B_ptrs[i] = reinterpret_cast<__nv_fp8_e4m3 const *>(block_B.get() + offset_B.at(i));
+        h_B_ptrs[i] = reinterpret_cast<__nv_fp8_e5m2 const *>(block_B.get() + offset_B.at(i));
         h_D_ptrs[i] = reinterpret_cast<__half *>(block_ref_D.get() + offset_D.at(i));
         h_Ms[i] = M; h_Ns[i] = N; h_Ks[i] = K;
         h_ldas[i] = K;  // row-major A
         h_ldbs[i] = K;  // col-major B
-        h_ldds[i] = N;  // col-major D (ColumnMajor: ldd = M)
+        h_ldds[i] = M;  // col-major D (ColumnMajor: ldd = M)
       }
 
       // Allocate device arrays for solution
       __nv_fp8_e4m3 const **d_A_ptrs;
-      __nv_fp8_e4m3 const **d_B_ptrs;
+      __nv_fp8_e5m2 const **d_B_ptrs;
       __half **d_D_ptrs;
       int *d_Ms, *d_Ns, *d_Ks, *d_ldas, *d_ldbs, *d_ldds;
 
       cudaMalloc(&d_A_ptrs, options.groups * sizeof(__nv_fp8_e4m3 const *));
-      cudaMalloc(&d_B_ptrs, options.groups * sizeof(__nv_fp8_e4m3 const *));
+      cudaMalloc(&d_B_ptrs, options.groups * sizeof(__nv_fp8_e5m2 const *));
       cudaMalloc(&d_D_ptrs, options.groups * sizeof(__half *));
       cudaMalloc(&d_Ms, options.groups * sizeof(int));
       cudaMalloc(&d_Ns, options.groups * sizeof(int));
@@ -804,7 +811,7 @@ int run(Options &options, bool host_problem_shapes_available = true)
       cudaMalloc(&d_ldds, options.groups * sizeof(int));
 
       cudaMemcpy(d_A_ptrs, h_A_ptrs.data(), options.groups * sizeof(__nv_fp8_e4m3 const *), cudaMemcpyHostToDevice);
-      cudaMemcpy(d_B_ptrs, h_B_ptrs.data(), options.groups * sizeof(__nv_fp8_e4m3 const *), cudaMemcpyHostToDevice);
+      cudaMemcpy(d_B_ptrs, h_B_ptrs.data(), options.groups * sizeof(__nv_fp8_e5m2 const *), cudaMemcpyHostToDevice);
       cudaMemcpy(d_D_ptrs, h_D_ptrs.data(), options.groups * sizeof(__half *), cudaMemcpyHostToDevice);
       cudaMemcpy(d_Ms, h_Ms.data(), options.groups * sizeof(int), cudaMemcpyHostToDevice);
       cudaMemcpy(d_Ns, h_Ns.data(), options.groups * sizeof(int), cudaMemcpyHostToDevice);
@@ -827,17 +834,9 @@ int run(Options &options, bool host_problem_shapes_available = true)
         std::vector<__half> h_sol(total_D), h_ref(total_D);
         cudaMemcpy(h_sol.data(), reinterpret_cast<__half*>(block_ref_D.get()), total_D * sizeof(__half), cudaMemcpyDeviceToHost);
         cudaMemcpy(h_ref.data(), reinterpret_cast<__half*>(block_D.get()), total_D * sizeof(__half), cudaMemcpyDeviceToHost);
-        float max_diff = 0;
-        for (size_t i = 0; i < total_D; ++i)
-          max_diff = fmaxf(max_diff, fabsf(__half2float(h_sol[i]) - __half2float(h_ref[i])));
-        if (max_diff > 1e-1f) {
-          fprintf(stderr, "Solution incorrect vs reference: max_diff=%.6f\n", max_diff);
-          std::cout << "Incorrect" << std::endl;
-          cudaFree(d_A_ptrs); cudaFree(d_B_ptrs); cudaFree(d_D_ptrs);
-          cudaFree(d_Ms); cudaFree(d_Ns); cudaFree(d_Ks);
-          cudaFree(d_ldas); cudaFree(d_ldbs); cudaFree(d_ldds);
-          return -1;
-        }
+        // Native FP8 WGMMA and fp32 dots can round to adjacent fp16 values.
+        // Retain tight relative/RMS bounds instead of an absolute-only gate.
+        kh_compare_outputs(h_sol,h_ref,0.03,0.002,0.001);
       }
 
       // Warmup solution
@@ -853,6 +852,7 @@ int run(Options &options, bool host_problem_shapes_available = true)
       // Profile solution
       float sol_total_ms = 0, sol_min_ms = 1e30f;
       for (int iter = 0; iter < options.iterations; ++iter) {
+        kh_cold_l2();
         cudaEventRecord(start);
         HopperGroupedGemm(options.groups, d_Ms, d_Ns, d_Ks,
                           (options.alpha == FLT_MAX) ? alpha_host.at(0) : options.alpha,
@@ -939,9 +939,9 @@ int main(int argc, char const **args) {
     configs.push_back({"custom", options.m, options.n, options.k, options.groups});
   } else {
     configs = {
-      {"small",   128,  128,  128,   4},
-      {"medium",  512,  512,  512,  16},
-      {"large",  2048, 2048, 2048,   4},
+      {"moe_decode",128,1536,2048,16},
+      {"moe_prefill",1024,1536,2048,32},
+      {"moe_large",2048,1536,2048,16},
     };
   }
 
@@ -952,7 +952,8 @@ int main(int argc, char const **args) {
     // Set alpha/beta to known values for predictable testing
     options.alpha = 1.0f;
     options.beta = 0.0f;
-    options.set_uniform_problems(cfg.m, cfg.n, cfg.k, cfg.groups);
+    options.set_uniform_problems(cfg.m,cfg.n,cfg.k,cfg.groups);
+    for(int i=0;i<cfg.groups;++i) options.problem_sizes_host[i]=make_shape(i%7==6?0:std::max(16,((cfg.m*(i%5+1)/3)/16)*16),cfg.n,cfg.k);
 
     int result = run<Gemm>(options);
     if (result != 0) {

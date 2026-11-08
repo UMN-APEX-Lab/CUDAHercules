@@ -1,3 +1,5 @@
+#include <tuple>
+#include "hopper_validation.cuh"
 /***************************************************************************************************
  * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -203,9 +205,14 @@ cudaError_t CutlassGemm50(
     hw_info
   };
 
-  Gemm50 gemm;
+  auto key=std::make_tuple(M,N,K,alpha,beta,A,B,D);
+  static decltype(key) previous{};
+  static bool ready=false;
+  static Gemm50 gemm;
   size_t workspace_size = Gemm50::get_workspace_size(arguments);
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+  static cutlass::device_memory::allocation<uint8_t> workspace;
+  if (!ready || key!=previous) {
+    workspace.reset(workspace_size);
 
   cutlass::Status status = gemm.can_implement(arguments);
   if (status != cutlass::Status::kSuccess) {
@@ -219,7 +226,9 @@ cudaError_t CutlassGemm50(
     return cudaErrorUnknown;
   }
 
-  status = gemm.run();
+    previous=key;ready=true;
+  }
+  cutlass::Status status = gemm.run();
   if (status != cutlass::Status::kSuccess) {
     std::cerr << "run failed: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
     return cudaErrorUnknown;
@@ -239,7 +248,7 @@ __global__ void InitializeMatrix_i8_kernel(
   if (idx < size) {
     int const k = 16807;
     int const m = 16;
-    int value = ((idx + seed) * k % m) - m / 2;
+    int value = int(kh_hash(uint32_t(idx)^kh_hash(seed))%255)-127;
     matrix[idx] = static_cast<int8_t>(value);
   }
 }
@@ -261,7 +270,7 @@ __global__ void InitializeMatrix_i32_kernel(
   if (idx < size) {
     int const k = 16807;
     int const m = 16;
-    int value = ((idx + seed) * k % m) - m / 2;
+    int value = int(kh_hash(uint32_t(idx)^kh_hash(seed))%255)-127;
     matrix[idx] = static_cast<int32_t>(value);
   }
 }
@@ -328,43 +337,13 @@ cudaError_t TestCorrectness(int M, int N, int K, int32_t alpha, int32_t beta) {
   AllocateMatrixI32(&D_cutlass, M * N, 101);
   AllocateMatrixI32(&D_reference, M * N, 101);
 
-  // Run naive reference
-  ReferenceGemm(M, N, K, alpha, A, lda, B, ldb, beta, D_reference, ldd);
-  cudaDeviceSynchronize();
-
-  bool cutlass_ok = false;
-#if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
-  // Reset D_cutlass to same initial values
-  InitializeMatrix_i32_kernel<<<(M * N + 255) / 256, 256>>>(D_cutlass, M * N, 101);
-  cudaDeviceSynchronize();
-  cudaError_t result = CutlassGemm50(M, N, K, alpha, A, lda, B, ldb, beta, D_cutlass, ldd);
-  if (result == cudaSuccess) {
-    cudaDeviceSynchronize();
-    // Verify CUTLASS vs naive
-    std::vector<int32_t> host_cutlass(M * N);
-    std::vector<int32_t> host_reference(M * N);
-    cudaMemcpy(host_cutlass.data(), D_cutlass, sizeof_D, cudaMemcpyDeviceToHost);
-    cudaMemcpy(host_reference.data(), D_reference, sizeof_D, cudaMemcpyDeviceToHost);
-
-    int max_diff = 0;
-    for (int i = 0; i < M * N; ++i) {
-      int diff = std::abs(host_cutlass[i] - host_reference[i]);
-      if (diff > max_diff) max_diff = diff;
-    }
-    if (max_diff <= 1) {
-      cutlass_ok = true;
-    } else {
-      std::cerr << "CUTLASS vs naive mismatch (max diff " << max_diff << "), using naive as reference." << std::endl;
-    }
-  } else {
-    std::cerr << "CUTLASS GEMM failed (non-SM90 GPU?), using naive reference." << std::endl;
-    cudaGetLastError(); // clear error
-  }
-#endif
-
+  bool cutlass_ok = true;
+  if(CutlassGemm50(M,N,K,alpha,A,lda,B,ldb,beta,D_cutlass,ldd)!=cudaSuccess) return cudaErrorUnknown;
+  kh_sample_gemm(M,N,K,alpha,A,B,beta,D_reference,D_cutlass,0.0f,0.0f);
 #ifdef KH_TEST_SOLUTION
   int32_t *D_solution;
   AllocateMatrixI32(&D_solution, M * N, 101);
+  kh_poison(D_solution,sizeof_D);
 
   cudaError_t sol_result = HopperEpilogueSwizzleGemm(M, N, K, alpha, A, lda, B, ldb, beta, D_solution, ldd);
   if (sol_result != cudaSuccess) {
@@ -386,7 +365,7 @@ cudaError_t TestCorrectness(int M, int N, int K, int32_t alpha, int32_t beta) {
 
   int sol_max_diff = 0;
   for (int i = 0; i < M * N; ++i) {
-    int diff = std::abs(host_solution[i] - host_ref[i]);
+    int diff = kh_abs(host_solution[i] - host_ref[i]);
     if (diff > sol_max_diff) sol_max_diff = diff;
   }
   int tol = cutlass_ok ? 1 : 0;
@@ -434,6 +413,7 @@ void Profile(int M, int N, int K, int32_t alpha, int32_t beta, int iterations) {
 
     float ref_total_ms = 0;
     for (int iter = 0; iter < iterations; ++iter) {
+      kh_cold_l2();
       cudaEventRecord(start);
       CutlassGemm50(M, N, K, alpha, A, lda, B, ldb, beta, D, ldd);
       cudaEventRecord(stop);
@@ -471,7 +451,7 @@ void Profile(int M, int N, int K, int32_t alpha, int32_t beta, int iterations) {
     cudaFree(D_ref_saved);
     int max_diff = 0;
     for (int i = 0; i < M * N; ++i) {
-      int diff = std::abs(h_sol[i] - h_ref[i]);
+      int diff = kh_abs(h_sol[i] - h_ref[i]);
       if (diff > max_diff) max_diff = diff;
     }
     if (max_diff > 1) {
@@ -491,6 +471,7 @@ void Profile(int M, int N, int K, int32_t alpha, int32_t beta, int iterations) {
 
   float sol_total_ms = 0, sol_min_ms = 1e30f;
   for (int iter = 0; iter < iterations; ++iter) {
+    kh_cold_l2();
     cudaEventRecord(start);
     HopperEpilogueSwizzleGemm(M, N, K, alpha, A, lda, B, ldb, beta, D, ldd);
     cudaEventRecord(stop);
@@ -540,9 +521,9 @@ int main(int argc, const char *arg[]) {
     configs.push_back({"custom", M, N, K});
   } else {
     configs = {
-      {"small",   1024, 1024, 1024},
-      {"medium",  4096, 4096, 4096},
-      {"large",   8192, 8192, 8192},
+      {"decode",128,8192,8192},
+      {"prefill",8192,8192,8192},
+      {"mlp",8192,28672,8192},
     };
   }
 

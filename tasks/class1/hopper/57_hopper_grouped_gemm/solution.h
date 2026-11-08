@@ -8,7 +8,7 @@
 __global__ void naive_grouped_fp8_gemm_kernel(
     int M, int N, int K, float alpha, float beta,
     __nv_fp8_e4m3 const *A, int lda,
-    __nv_fp8_e4m3 const *B, int ldb,
+    __nv_fp8_e5m2 const *B, int ldb,
     __half *D, int ldd) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -29,7 +29,7 @@ cudaError_t HopperGroupedGemm(
     int const *Ms, int const *Ns, int const *Ks,
     float alpha,
     __nv_fp8_e4m3 const **A_ptrs, int const *ldas,
-    __nv_fp8_e4m3 const **B_ptrs, int const *ldbs,
+    __nv_fp8_e5m2 const **B_ptrs, int const *ldbs,
     float beta,
     __half **D_ptrs, int const *ldds) {
 
@@ -37,7 +37,7 @@ cudaError_t HopperGroupedGemm(
   std::vector<int> h_Ms(problem_count), h_Ns(problem_count), h_Ks(problem_count);
   std::vector<int> h_ldas(problem_count), h_ldbs(problem_count), h_ldds(problem_count);
   std::vector<__nv_fp8_e4m3 const *> h_A(problem_count);
-  std::vector<__nv_fp8_e4m3 const *> h_B(problem_count);
+  std::vector<__nv_fp8_e5m2 const *> h_B(problem_count);
   std::vector<__half *> h_D(problem_count);
 
   cudaMemcpy(h_Ms.data(), Ms, problem_count * sizeof(int), cudaMemcpyDeviceToHost);
@@ -47,7 +47,7 @@ cudaError_t HopperGroupedGemm(
   cudaMemcpy(h_ldbs.data(), ldbs, problem_count * sizeof(int), cudaMemcpyDeviceToHost);
   cudaMemcpy(h_ldds.data(), ldds, problem_count * sizeof(int), cudaMemcpyDeviceToHost);
   cudaMemcpy(h_A.data(), A_ptrs, problem_count * sizeof(__nv_fp8_e4m3 const *), cudaMemcpyDeviceToHost);
-  cudaMemcpy(h_B.data(), B_ptrs, problem_count * sizeof(__nv_fp8_e4m3 const *), cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_B.data(), B_ptrs, problem_count * sizeof(__nv_fp8_e5m2 const *), cudaMemcpyDeviceToHost);
   cudaMemcpy(h_D.data(), D_ptrs, problem_count * sizeof(__half *), cudaMemcpyDeviceToHost);
 
   for (int p = 0; p < problem_count; ++p) {

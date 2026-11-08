@@ -1,3 +1,6 @@
+#include <tuple>
+#include "hopper_validation.cuh"
+#include "hopper_block_scaled_oracle.cuh"
 /***************************************************************************************************
  * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -137,12 +140,12 @@ using ScaleConfig = decltype(cutlass::detail::sm90_trivial_blockwise_scale_confi
 using LayoutSFA             = decltype(ScaleConfig::deduce_layoutSFA());                     // Layout type for SFA matrix operand
 using LayoutSFB             = decltype(ScaleConfig::deduce_layoutSFB());                     // Layout type for SFB matrix operand
 
-using KernelSchedule      = cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8Blockwise; 
+using KernelSchedule      = cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8Blockwise;
 using EpilogueSchedule    = cutlass::epilogue::TmaWarpSpecializedCooperative;
 
 using EpilogueTileType    = cutlass::epilogue::collective::EpilogueTileAuto;
 using FusionOperation     = cutlass::epilogue::fusion::ScaledLinCombPerRowBiasEltActAmaxAux<
-    LayoutAux, cutlass::epilogue::thread::ReLU, ElementD, ElementCompute, ElementAux, ElementAmax, ElementBias, ElementC>;
+    LayoutAux, cutlass::epilogue::thread::Identity, ElementD, ElementCompute, ElementAux, ElementAmax, ElementBias, ElementC>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag, OperatorClass,
@@ -327,8 +330,8 @@ bool initialize_scale_tensor(
 
     double scope_max, scope_min;
 
-    scope_min = -1;
-    scope_max = 1;
+    scope_min = 0.125;
+    scope_max = 1.875;
 
     cutlass::reference::host::TensorFillRandomUniform(
       view, seed, scope_max, scope_min);
@@ -646,10 +649,15 @@ bool verify(const Options<RasterOrderOptions> &options) {
 
 /// Run CUTLASS reference GEMM once with current tensors/options
 cudaError_t RunCutlassReference(Options<RasterOrderOptions> &options) {
-  Gemm gemm;
+  auto key=std::make_tuple(options.m,options.n,options.k,options.alpha,options.beta,tensor_A.device_data(),tensor_B.device_data(),tensor_D.device_data());
+  static decltype(key) previous{};
+  static bool ready=false;
+  static Gemm gemm;
   auto arguments = args_from_options(options);
   size_t workspace_size = Gemm::get_workspace_size(arguments);
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+  static cutlass::device_memory::allocation<uint8_t> workspace;
+  if (!ready || key!=previous) {
+    workspace.reset(workspace_size);
 
   cutlass::Status status = gemm.can_implement(arguments);
   if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
@@ -657,7 +665,9 @@ cudaError_t RunCutlassReference(Options<RasterOrderOptions> &options) {
   status = gemm.initialize(arguments, workspace.get());
   if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
 
-  status = gemm.run();
+    previous=key;ready=true;
+  }
+  cutlass::Status status = gemm.run();
   if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
 
   return cudaSuccess;
@@ -675,7 +685,10 @@ cudaError_t TestCorrectness(Options<RasterOrderOptions> &options) {
   }
   cudaDeviceSynchronize();
 
-  // CPU verification skipped (non-fatal, not needed for benchmark)
+  kh_sample_block_scaled<false>(options.m,options.n,options.k,options.alpha,
+    tensor_A.device_data(),tensor_B.device_data(),blockscale_tensor_A.device_data(),
+    blockscale_tensor_B.device_data(),tensor_D.device_data(),0.3,0.003);
+
 
 #ifdef KH_TEST_SOLUTION
   // Run solution: A row-major E4M3 [M,K], B col-major E4M3 [K,N], D col-major float [M,N]
@@ -684,6 +697,7 @@ cudaError_t TestCorrectness(Options<RasterOrderOptions> &options) {
   cutlass::HostTensor<ElementD, LayoutD> tensor_sol_D;
   tensor_sol_D.resize(c_coord);
   tensor_sol_D.sync_device();
+  kh_poison(tensor_sol_D.device_data(), tensor_sol_D.capacity()*sizeof(ElementD));
 
   // D is col-major [M, N] (ldd = M)
   int lda_sol = options.k;
@@ -708,6 +722,7 @@ cudaError_t TestCorrectness(Options<RasterOrderOptions> &options) {
   cudaDeviceSynchronize();
 
   // Compare solution D vs CUTLASS reference D
+  kh_check_device(tensor_sol_D.device_data(),tensor_D.device_data(),size_t(options.m)*options.n,0.3,0.003,0.002);
   tensor_sol_D.sync_host();
   tensor_D.sync_host();
 
@@ -716,10 +731,10 @@ cudaError_t TestCorrectness(Options<RasterOrderOptions> &options) {
   for (int i = 0; i < total; ++i) {
     float ref_val = float(tensor_D.host_data()[i]);
     float sol_val = float(tensor_sol_D.host_data()[i]);
-    max_diff = std::fmax(max_diff, std::fabs(sol_val - ref_val));
+    max_diff = std::fmax(max_diff, kh_abs(sol_val - ref_val)/(0.3f+0.003f*kh_abs(ref_val)));
   }
   // FP8 blockwise scaling has moderate precision
-  float tol = std::fmax(1.0f, 0.02f * options.k);
+  float tol = 1.0f;
   if (max_diff > tol) {
     std::cerr << "Solution incorrect. Max diff vs reference: " << max_diff << " (tol=" << tol << ")" << std::endl;
     return cudaErrorUnknown;
@@ -746,6 +761,7 @@ void Profile(Options<RasterOrderOptions> &options, int iterations) {
   // Profile reference
   float ref_total_ms = 0, ref_min_ms = 1e30f;
   for (int iter = 0; iter < iterations; ++iter) {
+    kh_cold_l2();
     cudaEventRecord(start);
     RunCutlassReference(options);
     cudaEventRecord(stop);
@@ -766,6 +782,7 @@ void Profile(Options<RasterOrderOptions> &options, int iterations) {
   float *D_ref_saved;
   cudaMalloc(&D_ref_saved, total_D * sizeof(float));
   cudaMemcpy(D_ref_saved, tensor_D.device_data(), total_D * sizeof(float), cudaMemcpyDeviceToDevice);
+  kh_poison(tensor_D.device_data(), total_D * sizeof(float));
 
   // Run solution once for correctness check
   HopperFp8BlockwiseGemm(options.m, options.n, options.k, options.alpha,
@@ -782,10 +799,11 @@ void Profile(Options<RasterOrderOptions> &options, int iterations) {
     cudaMemcpy(h_sol.data(), tensor_D.device_data(), total_D * sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_ref.data(), D_ref_saved, total_D * sizeof(float), cudaMemcpyDeviceToHost);
     cudaFree(D_ref_saved);
+    kh_compare_outputs(h_sol,h_ref,0.3,0.003,0.002);
     float max_diff = 0;
     for (int i = 0; i < total_D; ++i)
-      max_diff = std::fmax(max_diff, std::fabs(h_sol[i] - h_ref[i]));
-    if (max_diff > 1e-2f) {
+      max_diff = std::fmax(max_diff, kh_abs(h_sol[i] - h_ref[i])/(0.3f+0.003f*kh_abs(h_ref[i])));
+    if (max_diff > 1.0f) {
       fprintf(stderr, "Solution incorrect in Profile: max_diff=%.6f\n", max_diff);
       std::cout << "Incorrect" << std::endl;
       cudaEventDestroy(start); cudaEventDestroy(stop);
@@ -808,6 +826,7 @@ void Profile(Options<RasterOrderOptions> &options, int iterations) {
   // Profile solution
   float sol_total_ms = 0, sol_min_ms = 1e30f;
   for (int iter = 0; iter < iterations; ++iter) {
+    kh_cold_l2();
     cudaEventRecord(start);
     HopperFp8BlockwiseGemm(options.m, options.n, options.k, options.alpha,
       reinterpret_cast<__nv_fp8_e4m3 const*>(tensor_A.device_data()), lda_sol,
@@ -886,9 +905,9 @@ int main(int argc, char const **args) {
     configs.push_back({"custom", options.m, options.n, options.k});
   } else {
     configs = {
-      {"small",   1024, 1024, 1024},
-      {"medium",  4096, 4096, 4096},
-      {"large",   8192, 8192, 8192},
+      {"decode",128,8192,8192},
+      {"prefill",8192,8192,8192},
+      {"mlp",8192,28672,8192},
     };
   }
 

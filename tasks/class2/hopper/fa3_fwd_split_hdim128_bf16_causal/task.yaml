@@ -13,7 +13,8 @@ hardware:
   min_sm: 90
   tested_sms:
   - 90
-  required_features: []
+  required_features:
+  - sm_90a
 runner:
   backend: class2_defpy
   workdir: tasks/class2/hopper/fa3_fwd_split_hdim128_bf16_causal
@@ -31,8 +32,8 @@ execute:
 correctness:
   mode: tensor_compare
   tolerances:
-    atol: 0.05
-    rtol: 0.05
+    atol: 0.006
+    rtol: 0.01
 performance:
   enabled: true
   parser: {}
@@ -44,9 +45,10 @@ source:
   license: BSD-3-Clause
 anti_cheat:
   blocked_patterns:
-  - '#include\s*[<"]flash_attn'
-  - '#include\s*[<"]flash_fwd'
-  - '#include\s*[<"]flash_bwd'
+  - '#include\s*[<"][^">]*(?:flash_attn|flash_fwd|flash_bwd|reference)'
+  - \b(?:run_mha_|prepare_varlen_num_blocks)
+  - \b(?:__nv_fp8|float_e[45]m[23]|__nv_cvt_.*fp8)
+  - cvt\.[^;\n]*\.(?:e4m3|e5m2)
   required_patterns:
   - __global__\s+void
   - <<<.*>>>

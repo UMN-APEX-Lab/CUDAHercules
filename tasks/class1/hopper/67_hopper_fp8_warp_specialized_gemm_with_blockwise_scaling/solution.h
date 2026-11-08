@@ -20,8 +20,8 @@ __global__ void naive_fp8_blockwise_gemm_kernel(
     for (int kb = 0; kb < num_blocks; ++kb) {
       int k_start = kb * block_size;
       int k_end = min(k_start + block_size, K);
-      float sa = scale_A[i * num_blocks + kb];
-      float sb = scale_B[j * num_blocks + kb];
+      float sa = scale_A[i / 128 + kb * ((M + 127)/128)];
+      float sb = scale_B[j / 128 + kb * ((N + 127)/128)];
       float block_acc = 0.0f;
       for (int k = k_start; k < k_end; ++k) {
         block_acc += float(A[i * lda + k]) * float(B[k + j * ldb]);

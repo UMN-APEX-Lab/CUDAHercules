@@ -1,3 +1,4 @@
+#include "hopper_validation.cuh"
 /***************************************************************************************************
  * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -92,7 +93,7 @@ using namespace cute;
 
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
 
-static constexpr int TopK = 2;
+static constexpr int TopK = 8;
 static constexpr bool EnableTopKSoftmax = TopK > 1;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -124,7 +125,7 @@ using ElementAccumulator  = float;                                          // E
 using ElementCompute      = float;                                          // Element type for epilogue computation
 using ArchTag             = cutlass::arch::Sm90;                            // Tag indicating the minimum SM that supports the intended feature
 using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
-using TileShape           = Shape<_64,_64,_128>;                            // Threadblock-level tile size
+using TileShape           = Shape<_64,_128,_128>;                            // Threadblock-level tile size
 using ClusterShape        = Shape<_1,_1,_1>;                                // Shape of the threadblocks in a cluster
 using KernelSchedule      = cutlass::gemm::KernelTmaWarpSpecialized;
 using EpilogueSchedule    = cutlass::epilogue::TmaWarpSpecialized;
@@ -480,6 +481,7 @@ int run(Options &options) {
     // Profile reference
     float ref_total_ms = 0, ref_min_ms = 1e30f;
     for (int iter = 0; iter < options.iterations; ++iter) {
+      kh_cold_l2();
       cudaEventRecord(start);
       CUTLASS_CHECK(gemm.run());
       cudaEventRecord(stop);
@@ -497,6 +499,7 @@ int run(Options &options) {
     int cD = options.m * options.n;
     __half *dD_sol;
     cudaMalloc(&dD_sol, cD * sizeof(__half));
+    kh_poison(dD_sol, cD * sizeof(__half));
 
     // Run solution once for correctness check
     HopperGemmTopkSoftmax(
@@ -513,8 +516,8 @@ int run(Options &options) {
       cudaMemcpy(h_ref.data(), reinterpret_cast<__half*>(tensor_D.device_data()), cD * sizeof(__half), cudaMemcpyDeviceToHost);
       float max_diff = 0;
       for (int i = 0; i < cD; ++i)
-        max_diff = fmaxf(max_diff, fabsf(__half2float(h_sol[i]) - __half2float(h_ref[i])));
-      if (max_diff > 1e-1f) {
+        max_diff = fmaxf(max_diff, kh_abs(__half2float(h_sol[i]) - __half2float(h_ref[i])));
+      if (max_diff > 0.004f) {
         fprintf(stderr, "Solution incorrect vs reference: max_diff=%.6f\n", max_diff);
         std::cout << "Incorrect" << std::endl;
         cudaFree(dD_sol);
@@ -535,6 +538,7 @@ int run(Options &options) {
     // Profile solution
     float sol_total_ms = 0, sol_min_ms = 1e30f;
     for (int iter = 0; iter < options.iterations; ++iter) {
+      kh_cold_l2();
       cudaEventRecord(start);
       HopperGemmTopkSoftmax(
           options.m, options.n, options.k, options.alpha(),
@@ -620,9 +624,9 @@ int main(int argc, char const **args) {
   } else {
     // N must be <= TileShape::kN (64) for this TopK+Softmax fusion
     configs = {
-      {"small",   1024,  64, 1024},
-      {"medium",  4096,  64, 4096},
-      {"large",   8192,  64, 8192},
+      {"router_prefill",8192,128,2048},
+      {"router_long",16384,128,2048},
+      {"router_large",16384,128,5120},
     };
   }
 

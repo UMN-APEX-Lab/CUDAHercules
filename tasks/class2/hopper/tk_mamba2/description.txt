@@ -1,50 +1,14 @@
-# Task: tk_mamba2
+Implement a CUDA kernel for Hopper SM90 (H200).
 
-## Target Hardware
-NVIDIA Hopper GPU (SM90).
+Mamba2 SSD state-128, single shared Q/K group variant.
+Q,K BF16 [B=8,1,N=8192,128], V/O BF16 [B,H=80,N,64], A fp32 negative log-decays [B,H,N].
+State_(-1)=0; State_t=exp(A_t)*State_(t-1)+outer(K_t,V_t); O_t=Q_t@State_t.
+Thus O_t=sum_{j<=t} dot(Q_t,K_j)*exp(sum_{u=j+1..t} A_u)*V_j. No additional softmax or scale.
+Accumulate in fp32, round output to BF16. Q/K are shared across heads; A/V are not.
 
+Required public API:
+void Mamba2Forward(__nv_bfloat16* Q,__nv_bfloat16* K,__nv_bfloat16* V,
+    __nv_bfloat16* O,float* A,int B,int H,int N);
 
-Mamba2 SSM Forward Pass on H100, matching ThunderKittens performance.
-
-Mamba2 state space model with per-position exponential decay factors.
-D=64 (head dim), hardcoded.
-
-## Function Signature
-
-Implement in solution.h:
-
-```cuda
-#pragma once
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
-
-void Mamba2Forward(
-    __nv_bfloat16 *Q, __nv_bfloat16 *K, __nv_bfloat16 *V,
-    __nv_bfloat16 *O, float *A,
-    int B, int H, int N);
-```
-
-## Operation
-
-Selective state space model with decay:
-- For each chunk of sequence, computes causal Q@K^T with exponential decay
-- A contains log-space decay factors per position
-- Maintains running KV state across chunks with decay
-
-Where:
-- Q: [B, 1, N, 64] bf16 queries (shared across heads via groups)
-- K: [B, 1, N, 64] bf16 keys (shared across heads)
-- V: [B, H, N, 64] bf16 values
-- A: [B, H, N] float decay factors (log-space)
-- O: [B, H, N, 64] bf16 output
-
-## Build & Test
-
-```bash
-conda activate attn
-python gentests.py randn
-make test
-./test randn.txt
-```
-
-Requires H100 GPU (SM90a). ThunderKittens headers on include path.
+The harness generates fractional random inputs, poisons output-only buffers, and rejects nonfinite results.
+Reference and solution use the same cold-L2 timing policy and per-case minimum; every reported case contributes to the geometric-mean speedup.

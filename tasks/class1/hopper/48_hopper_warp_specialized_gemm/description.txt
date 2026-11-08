@@ -1,58 +1,21 @@
-# Task: 48_hopper_warp_specialized_gemm
+Implement a CUDA kernel for Hopper SM90 (H200).
 
-## Target Hardware
-NVIDIA Hopper GPU (SM90).
+FP32/TF32 GEMM. A is row-major [M,K], B column-major [K,N], C column-major [M,N].
+C = alpha*A@B + beta*C. Accumulate in fp32; TF32 tensor-core rounding is allowed.
+BF16/FP16/FP8 quantization of the input is not allowed. Reciprocal per-K power-of-two factors spanning 2^-20..2^20
+exercise the FP32/TF32 exponent range while keeping dot products well scaled. beta=0 means C is output-only.
 
-
-TF32 Warp-Specialized GEMM on Hopper architecture (CUTLASS 3.0).
-
-## Function Signature
-
-Implement the following function in `solution.h`:
-
-```cuda
-#pragma once
-#include <cuda_runtime.h>
-
+Required public API:
 cudaError_t HopperGemm(
-    int M, int N, int K,
-    float alpha,
+    int M, int N, int K, float alpha,
     float const *A, int lda,
     float const *B, int ldb,
-    float beta,
-    float *C, int ldc);
-```
+    float beta, float *C, int ldc);
 
-## Operation
+Default cases (m, n, k):
+{"decode",128,8192,8192}
+{"prefill",8192,8192,8192}
+{"mlp",8192,28672,8192}
 
-C = alpha * A * B + beta * C
-
-Where:
-- A is M x K (row-major)
-- B is K x N (column-major)
-- C is M x N (column-major)
-
-## Data Types
-
-All matrices are `float` (FP32). The reference uses TF32 tensor cores internally.
-
-## Memory Layout
-
-- A: Row-major. Element (i,k) at `A[i * lda + k]`. lda >= K.
-- B: Column-major. Element (k,j) at `B[k + j * ldb]`. ldb >= K.
-- C: Column-major. Element (i,j) at `C[i + j * ldc]`. ldc >= M.
-
-## Build & Test
-
-```bash
-make test                    # requires solution.h in task directory
-./test                       # default: runs small/medium/large sizes
-./test 1024 1024 1024        # custom single size: M N K
-./test 1024 1024 1024 1.0 0.0 20  # M N K alpha beta iterations
-```
-
-Correctness is verified against a CUTLASS reference at multiple problem sizes
-(small: 1024, medium: 4096, large: 8192). TF32 tolerance (1% relative error).
-Performance is timed for both reference and your solution at each size.
-
-CUTLASS headers are available on the include path.
+The harness generates fractional random inputs, poisons output-only buffers, and rejects nonfinite results.
+Reference and solution use the same cold-L2 timing policy and per-case minimum; every reported case contributes to the geometric-mean speedup.

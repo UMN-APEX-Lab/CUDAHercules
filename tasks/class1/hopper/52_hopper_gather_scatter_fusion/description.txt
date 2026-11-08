@@ -1,21 +1,13 @@
-# Task: 52_hopper_gather_scatter_fusion
+Implement a CUDA kernel for Hopper SM90 (H200).
 
-## Target Hardware
-NVIDIA Hopper GPU (SM90).
+N-axis gather/GEMM/scatter fusion. A is fp16 row-major [M,K], B fp16 column-major [K,N_orig].
+gather_indices and scatter_indices are device arrays of length index_size, with distinct indices in each array.
+For logical column j: D[i + scatter_indices[j]*ldd] = half(alpha*sum_k A[i*lda+k]*B[k+gather_indices[j]*ldb]).
+D is fp16 column-major [M,N_orig]; lda=ldb=K, ldd=M, beta=0. Every selected column must be written;
+unselected columns start at zero and must remain zero. Accumulate in fp32. For MoE token routing, view A as row-major weights [N_out,K], B as row-major tokens [T,K], and D as row-major [T,N_out].
+Gather/scatter then select token rows in the transposed GEMM view. Defaults use N_out=1536/2048, T=4096..32768, K=1536/2048.
 
-
-Hopper GEMM with N-mode gather/scatter fusion. Gather selects columns from B,
-scatter writes result columns into D using index arrays.
-
-## Function Signature
-
-Implement the following function in `solution.h`:
-
-```cuda
-#pragma once
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-
+Required public API:
 cudaError_t HopperGatherScatterGemm(
     int M, int index_size, int K, float alpha,
     __half const *A, int lda,
@@ -24,42 +16,11 @@ cudaError_t HopperGatherScatterGemm(
     float beta,
     __half *D, int ldd,
     int const *scatter_indices);
-```
 
-## Operation
+Default cases (m, n_orig, k, index_size):
+{"moe_decode",1536,4096,2048,2048}
+{"moe_prefill",1536,32768,2048,16384}
+{"moe_down",2048,16384,1536,8192}
 
-For each j in [0, index_size):
-  D[:, scatter_indices[j]] = alpha * A * B[:, gather_indices[j]] + beta * D[:, scatter_indices[j]]
-
-Where:
-- A is M x K (no gather, full matrix)
-- B is K x N_orig, but only index_size columns are gathered via gather_indices
-- D is M x N_orig, but only index_size columns are written via scatter_indices
-- The logical GEMM dimension is M x index_size x K
-
-## Data Types
-
-- All matrices A, B, D: `__half` (FP16)
-- Scalars alpha, beta: `float`
-- Index arrays: `int`
-
-## Memory Layout
-
-- A is **row-major** [M, K]: Element (i,k) at `A[i * lda + k]`.  lda = K.
-- B is **column-major** [K, N_orig]: Element (k,j) at `B[k + j * ldb]`.  ldb = K.
-- D is **column-major** [M, N_orig]: Element (i,j) at `D[i + j * ldd]`.  ldd = M.
-- gather_indices[j]: column index in B for logical column j
-- scatter_indices[j]: column index in D for logical column j
-
-## Test Sizes
-
-- small: M=1024, N_orig=1024, K=512, index_size=512
-- medium: M=4096, N_orig=4096, K=2048, index_size=2048
-- large: M=8192, N_orig=8192, K=4096, index_size=4096
-
-## Compilation
-
-```bash
-make test    # compiles with solution.h, needs CUTLASS headers
-./test       # runs correctness check + profiling
-```
+The harness generates fractional random inputs, poisons output-only buffers, and rejects nonfinite results.
+Reference and solution use the same cold-L2 timing policy and per-case minimum; every reported case contributes to the geometric-mean speedup.

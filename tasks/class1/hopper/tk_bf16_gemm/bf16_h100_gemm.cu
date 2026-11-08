@@ -1,3 +1,6 @@
+#include <map>
+#include <tuple>
+#include "hopper_validation.cuh"
 #include "kittens.cuh"
 #include "prototype.cuh"
 #include "common.cuh"
@@ -110,10 +113,17 @@ template<typename mmt>
 void inner_run(bf16 *d_A, bf16 *d_B, bf16 *d_C, size_t M, size_t N, size_t K, dim3 grid, dim3 block) {
     using global_layout = typename mmt::layout::global_layout;
     using globals  = typename mmt::layout::globals;
+    auto key=std::make_tuple(d_A,d_B,d_C,M,N,K);
+    static std::map<decltype(key),globals> descriptors;
+    auto it=descriptors.find(key);
+    if(it==descriptors.end()) {
     global_layout Ag{d_A, nullptr, nullptr, M, K};
     global_layout Bg{d_B, nullptr, nullptr, K, N};
     global_layout Cg{d_C, nullptr, nullptr, M, N};
     globals G{Ag, Bg, Cg};
+      it=descriptors.emplace(key,G).first;
+    }
+    globals const& G=it->second;
     prototype::lcf::kernel<mmt><<<grid, block, MAX_SHARED_MEMORY-1024>>>(G);
 }
 
@@ -183,6 +193,7 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
         cudaEvent_t start, stop;
         CUDACHECK(cudaEventCreate(&start));
         CUDACHECK(cudaEventCreate(&stop));
+        kh_cold_l2();
         CUDACHECK(cudaEventRecord(start));
         inner_run<mmt>(d_A[idx], d_B[idx], d_C[idx], M, N, K, grid, block);
         CUDACHECK(cudaEventRecord(stop));
@@ -196,6 +207,7 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
     }
     float tk_avg_ms = tk_total_ms / num_iters;
 
+    kh_check_device(d_C[0],d_C_ref,M*N,0.01,0.008,0.003);
     // Verify TK results
     check_correctness(d_C[0], d_C_ref, M * N);
     std::cout << "Passed" << std::endl;
@@ -207,7 +219,8 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
     // Allocate solution output buffer
     __nv_bfloat16 *d_C_solution;
     CUDACHECK(cudaMalloc(&d_C_solution, M*N*sizeof(__nv_bfloat16)));
-    fill<__nv_bfloat16, FillMode::CONSTANT>(d_C_solution, M*N, 0.0f);
+    kh_poison(d_C_solution, M*N*sizeof(__nv_bfloat16));
+    fill<__nv_bfloat16, FillMode::CONSTANT>(d_C_solution, M*N, NAN);
     CUDACHECK(cudaDeviceSynchronize());
 
     // Run solution
@@ -221,13 +234,16 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
       std::vector<__nv_bfloat16> h_sol(M * N), h_ref(M * N);
       cudaMemcpy(h_sol.data(), d_C_solution, M * N * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
       cudaMemcpy(h_ref.data(), d_C_ref, M * N * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-      float max_diff = 0;
-      for (size_t i = 0; i < M * N; ++i)
-        max_diff = fmaxf(max_diff, fabsf(__bfloat162float(h_sol[i]) - __bfloat162float(h_ref[i])));
-      if (max_diff > 1e-1f) {
-        fprintf(stderr, "Solution incorrect vs reference: max_diff=%.6f\n", max_diff);
-        std::cout << "Incorrect" << std::endl;
-        exit(-1);
+      double error2=0,ref2=0;
+      bool valid=true;
+      for(size_t i=0;i<M*N;++i) {
+        float x=__bfloat162float(h_sol[i]),y=__bfloat162float(h_ref[i]);
+        float error=kh_abs(x-y);
+        valid &= std::isfinite(x) && error <= 0.01f+0.008f*std::abs(y);
+        error2+=double(error)*error;ref2+=double(y)*y;
+      }
+      if (!valid || sqrt(error2/std::max(ref2,1e-20))>0.003) {
+        fputs("Incorrect BF16 output\n",stderr);exit(1);
       }
     }
     std::cout << "Passed" << std::endl;
@@ -245,6 +261,7 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
         cudaEvent_t start, stop;
         CUDACHECK(cudaEventCreate(&start));
         CUDACHECK(cudaEventCreate(&stop));
+        kh_cold_l2();
         CUDACHECK(cudaEventRecord(start));
         Bf16Gemm(d_A[0], d_B[0], d_C_solution, M, N, K);
         CUDACHECK(cudaEventRecord(stop));
@@ -275,8 +292,9 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
     cudaFree(d_C_ref);
 }
 
-int main() {
-    run_benchmark<matmul_template<2,4,8>>("bf16_gemm_4096", 4096, 4096, 4096);
-    run_benchmark<matmul_template<2,4,8>>("bf16_gemm_8192", 8192, 8192, 8192);
+int main(int argc,char** argv) {
+    if(argc==4) {run_benchmark<matmul_template<2,4,8>>("custom",atoi(argv[1]),atoi(argv[2]),atoi(argv[3]));return 0;}
+    run_benchmark<matmul_template<2,4,8>>("qwen_decode", 128, 5120, 5120);
+    run_benchmark<matmul_template<2,4,8>>("qwen_prefill", 8192, 27648, 5120);
     return 0;
 }

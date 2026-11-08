@@ -1,3 +1,4 @@
+#include "hopper_validation.cuh"
 /***************************************************************************************************
  * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -303,7 +304,7 @@ bool initialize_block(
   }
 
   cutlass::reference::device::BlockFillRandomUniform(
-    block.get(), block.size(), seed, scope_max, scope_min, 0);
+    block.get(), block.size(), seed, scope_max, scope_min, -1);
 
   return true;
 }
@@ -481,7 +482,7 @@ int run(Options &options)
     std::vector<__half *> sol_D_host(batch);
     for (int b = 0; b < batch; ++b) {
       cudaMalloc(&sol_D_host[b], sizeD_per_batch * sizeof(__half));
-      cudaMemset(sol_D_host[b], 0, sizeD_per_batch * sizeof(__half));
+      cudaMemset(sol_D_host[b], 0xff, sizeD_per_batch * sizeof(__half));
     }
 
     // Build pointer arrays for A, B, D_sol
@@ -497,8 +498,11 @@ int run(Options &options)
     __half const **d_B_ptrs_sol;
     __half **d_D_ptrs_sol;
     cudaMalloc(&d_A_ptrs_sol, batch * sizeof(__half const *));
+    kh_poison(d_A_ptrs_sol, batch * sizeof(__half const *));
     cudaMalloc(&d_B_ptrs_sol, batch * sizeof(__half const *));
+    kh_poison(d_B_ptrs_sol, batch * sizeof(__half const *));
     cudaMalloc(&d_D_ptrs_sol, batch * sizeof(__half *));
+    kh_poison(d_D_ptrs_sol, batch * sizeof(__half *));
     cudaMemcpy(d_A_ptrs_sol, h_A_ptrs.data(), batch * sizeof(__half const *), cudaMemcpyHostToDevice);
     cudaMemcpy(d_B_ptrs_sol, h_B_ptrs.data(), batch * sizeof(__half const *), cudaMemcpyHostToDevice);
     cudaMemcpy(d_D_ptrs_sol, h_D_ptrs.data(), batch * sizeof(__half *), cudaMemcpyHostToDevice);
@@ -526,9 +530,10 @@ int run(Options &options)
       cudaMemcpy(h_ref.data(), block_D.get() + offset_D[b], sizeD_per_batch * sizeof(__half), cudaMemcpyDeviceToHost);
       cudaMemcpy(h_sol.data(), sol_D_host[b], sizeD_per_batch * sizeof(__half), cudaMemcpyDeviceToHost);
 
+  kh_compare_outputs(h_sol,h_ref,0.005,0.002,0.001);
       float max_diff = 0.0f;
       for (size_t i = 0; i < sizeD_per_batch; ++i) {
-        float diff = std::fabs(__half2float(h_sol[i]) - __half2float(h_ref[i]));
+        float diff = kh_abs(__half2float(h_sol[i]) - __half2float(h_ref[i]));
         max_diff = std::fmax(max_diff, diff);
       }
       if (max_diff > 1.0f) {
@@ -559,7 +564,6 @@ int run(Options &options)
 
     // Warmup reference
     for (int i = 0; i < 3; i++) {
-      CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
       CUTLASS_CHECK(gemm.run());
     }
     cudaDeviceSynchronize();
@@ -567,8 +571,8 @@ int run(Options &options)
     // Profile reference
     float ref_total_ms = 0, ref_min_ms = 1e30f;
     for (int iter = 0; iter < kIterations; ++iter) {
+      kh_cold_l2();
       cudaEventRecord(ev_start);
-      CUTLASS_CHECK(gemm.initialize(arguments, workspace.get()));
       CUTLASS_CHECK(gemm.run());
       cudaEventRecord(ev_stop);
       cudaEventSynchronize(ev_stop);
@@ -604,8 +608,11 @@ int run(Options &options)
       __half const **d_B_ptrs_sol;
       __half **d_D_ptrs_sol;
       cudaMalloc(&d_A_ptrs_sol, batch * sizeof(__half const *));
+    kh_poison(d_A_ptrs_sol, batch * sizeof(__half const *));
       cudaMalloc(&d_B_ptrs_sol, batch * sizeof(__half const *));
+    kh_poison(d_B_ptrs_sol, batch * sizeof(__half const *));
       cudaMalloc(&d_D_ptrs_sol, batch * sizeof(__half *));
+    kh_poison(d_D_ptrs_sol, batch * sizeof(__half *));
       cudaMemcpy(d_A_ptrs_sol, h_A_ptrs.data(), batch * sizeof(__half const *), cudaMemcpyHostToDevice);
       cudaMemcpy(d_B_ptrs_sol, h_B_ptrs.data(), batch * sizeof(__half const *), cudaMemcpyHostToDevice);
       cudaMemcpy(d_D_ptrs_sol, h_D_ptrs.data(), batch * sizeof(__half *), cudaMemcpyHostToDevice);
@@ -620,6 +627,7 @@ int run(Options &options)
       // Profile solution
       float sol_total_ms = 0, sol_min_ms = 1e30f;
       for (int iter = 0; iter < kIterations; ++iter) {
+        kh_cold_l2();
         cudaEventRecord(ev_start);
         HopperPtrArrayBatchedGemm(M, N, K, batch, options.alpha,
           d_A_ptrs_sol, lda, d_B_ptrs_sol, ldb, options.beta, d_D_ptrs_sol, ldd);
@@ -706,9 +714,9 @@ int main(int argc, char const **args) {
     configs.push_back({"custom", options.m, options.n, options.k, options.l});
   } else {
     configs = {
-      {"small",   128,  128,  128,   4},
-      {"medium",  512,  512,  512,  16},
-      {"large",  2048, 2048, 2048,   4},
+      {"expert_decode",   128, 1536, 2048, 128},
+      {"expert_prefill",  1024, 1536, 2048, 128},
+      {"expert_large",  2048, 1536, 2048, 32},
     };
   }
 

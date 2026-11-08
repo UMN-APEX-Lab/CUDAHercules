@@ -191,19 +191,19 @@ bool initialize_tensor(
     scope_min = 0;
   }
   else if (bits_input <= 8) {
-    scope_max = 2;
-    scope_min = -2;
+    scope_max = 127;
+    scope_min = -127;
   }
   else if (bits_output == 16) {
-    scope_max = 5;
-    scope_min = -5;
+    scope_max = 1;
+    scope_min = -1;
   }
   else {
     scope_max = 8;
     scope_min = -8;
   }
   cutlass::reference::device::BlockFillRandomUniform(
-      block.get(), block.size(), seed, Element(scope_max), Element(scope_min));
+      block.get(), block.size(), seed, Element(scope_max), Element(scope_min), -1);
 
   return true;
 }
@@ -218,11 +218,11 @@ bool initialize_scale(
   float scope_max = 1.0f, scope_min = 1.0f;
   if (options.mode != MixedDtypeGemmMode::ConvertOnly) {
     float elt_max_f = float(cutlass::platform::numeric_limits<Element>::max());
-    scope_max = 2.f;
-    scope_min = 0.1f;
+    scope_max = 0.03f;
+    scope_min = 0.005f;
   }
   cutlass::reference::device::BlockFillRandomUniform(
-    block.get(), block.size(), seed, Element(scope_max), Element(scope_min));
+    block.get(), block.size(), seed, Element(scope_max), Element(scope_min), -1);
 
   return true;
 }
@@ -240,7 +240,7 @@ bool initialize_zero(
     scope_min = -2.0f;
   }
   cutlass::reference::device::BlockFillRandomUniform(
-    block.get(), block.size(), seed, Element(scope_max), Element(scope_min));
+    block.get(), block.size(), seed, Element(scope_max), Element(scope_min), -1);
 
   return true;
 }

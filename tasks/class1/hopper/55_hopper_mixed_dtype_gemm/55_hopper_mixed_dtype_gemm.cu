@@ -1,3 +1,4 @@
+#include "hopper_validation.cuh"
 /***************************************************************************************************
  * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -34,19 +35,19 @@
 
     This example shows how to perform GEMM where the input tensors A and B have different element types. CUTLASS currently supports upcasting
     from a narrower (fewer bits) to a wider (more bits) type and utilizing the tensor core instruction for the wider type. For instance, when doing
-    INT8 x FP16, CUTLASS will convert INT8 -> FP16 and do math using FP16 tensor cores. Similarly, for INT4 x INT8, it will upcast to INT8 and issue math 
+    INT8 x FP16, CUTLASS will convert INT8 -> FP16 and do math using FP16 tensor cores. Similarly, for INT4 x INT8, it will upcast to INT8 and issue math
     using INT8 tensor cores.
 
-    The narrower type always passes through the register file. Therefore, in cases where the narrower type is operand B, the collective will implicitly swap 
-    A and B in the main loop. However, implicit swaps do not support TMA epilogues. Consequently, it is essential to consider this when constructing the epilogue, 
+    The narrower type always passes through the register file. Therefore, in cases where the narrower type is operand B, the collective will implicitly swap
+    A and B in the main loop. However, implicit swaps do not support TMA epilogues. Consequently, it is essential to consider this when constructing the epilogue,
     as illustrated in this example.
 
     Note that in this example, we explicitly swap A and B in order to use TMA epilogues. We do this since TMA epilogues are more performant on problem sizes of interest.
 
-    It is expected that the scale's K dimension be scale_k = ceil_div(problem_k, group_size). 
-    
+    It is expected that the scale's K dimension be scale_k = ceil_div(problem_k, group_size).
+
     Scales are always expected to be MN major. This means the fastest changing dimension must be M if A is scaled or N if B is scaled.
-    
+
     If A is being scaled, the scales should have shape [M, scale_k],  while if B is scaled, it must have shape [N, scale_k].
 
     The implementation only supports "group-wise" scales. However, we can make it work for per-column scales by setting the groups size
@@ -58,16 +59,16 @@
       3) The scales and the zeros must have the same layout and groupsize.
       4) The groupsize must be greater or equal to tile shape k.
       5) When dealing with 8-bit x {4-bit, 2-bit}, both inputs must be in K-major format.
-      6) Currently, TMA epilogues cannot be used when the narrow type is the B operand. This limitation arises because the implementation always swaps the 
-         operands to ensure that the narrow type passes through the register file, and TMA epilogues do not currently support implicit swap + transpose operations. 
+      6) Currently, TMA epilogues cannot be used when the narrow type is the B operand. This limitation arises because the implementation always swaps the
+         operands to ensure that the narrow type passes through the register file, and TMA epilogues do not currently support implicit swap + transpose operations.
          We plan to address this limitation in the future. However, we address this in the example by explicitly swapping and transposing the operands.
-    
+
     Optimizing suggestions:
       1) Use a small tile size, since the register pressure for this GEMM (and RS GEMM in general) is high (it uses a lot of register space).
       2) Try avoid using scale or zero mode cause the computations will be the bottleneck.
 
     Examples:
-      
+
       Runs the mixed input batched gemm (with batch size 2), converting B to the type of A (mode 0)
       $ ./examples/55_hopper_mixed_dtype_gemm/55_hopper_mixed_dtype_gemm --m=2048 --n=2048 --k=2048 --l=2 --mode=0
 
@@ -118,7 +119,7 @@ using namespace cute;
 /// GEMM kernel configurations
 /////////////////////////////////////////////////////////////////////////////////////////////////
 using MmaType = cutlass::half_t;
-using QuantType = cutlass::float_e4m3_t;
+using QuantType = int8_t;
 constexpr int TileShapeK = 128 * 8 / sizeof_bits<MmaType>::value;
 
 // A matrix configuration
@@ -156,7 +157,7 @@ using ArchTag             = cutlass::arch::Sm90;                            // T
 using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
 using TileShape           = Shape<_128,_128,cute::Int<TileShapeK>>;         // Threadblock-level tile size
 using ClusterShape        = Shape<_1,_1,_1>;                                // Shape of the threadblocks in a cluster
-using KernelSchedule      = cutlass::gemm::KernelTmaWarpSpecializedCooperative;  // Kernel to launch based on the default setting in the Collective Builder 
+using KernelSchedule      = cutlass::gemm::KernelTmaWarpSpecializedCooperative;  // Kernel to launch based on the default setting in the Collective Builder
 using EpilogueSchedule    = cutlass::epilogue::TmaWarpSpecializedCooperative;
 using EpilogueTileType    = cutlass::epilogue::collective::EpilogueTileAuto;
 
@@ -346,7 +347,7 @@ Args args_from_options(MixedDtypeOptions const& options)
       {block_B.get(), stride_B, block_A.get(), stride_A},
       {{options.alpha, options.beta}, block_C.get(), stride_C, block_D.get(), stride_D}
     };
-  } 
+  }
   else if (options.mode == MixedDtypeGemmMode::ScaleOnly) {
     return Args {
       cutlass::gemm::GemmUniversalMode::kGemm,
@@ -354,7 +355,7 @@ Args args_from_options(MixedDtypeOptions const& options)
       {block_B.get(), stride_B, block_A.get(), stride_A, block_scale.get(), stride_S, options.g},
       {{options.alpha, options.beta}, block_C.get(), stride_C, block_D.get(), stride_D}
     };
-  } 
+  }
   else if (options.mode == MixedDtypeGemmMode::ScaleWithZeroPoint) {
     return Args {
       cutlass::gemm::GemmUniversalMode::kGemm,
@@ -487,7 +488,8 @@ int run(MixedDtypeOptions &options)
     // For solution verification, we compare against block_D (CUTLASS output)
     __half *d_D_sol;
     cudaMalloc(&d_D_sol, sizeD * sizeof(__half));
-    cudaMemset(d_D_sol, 0, sizeD * sizeof(__half));
+    kh_poison(d_D_sol, sizeD * sizeof(__half));
+    cudaMemset(d_D_sol, 0xff, sizeD * sizeof(__half));
 
     cudaError_t sol_err = HopperMixedDtypeGemm(
       M, N, K, options.alpha,
@@ -511,21 +513,7 @@ int run(MixedDtypeOptions &options)
     cudaMemcpy(h_ref.data(), block_D.get(), sizeD * sizeof(__half), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_sol.data(), d_D_sol, sizeD * sizeof(__half), cudaMemcpyDeviceToHost);
 
-    float max_diff = 0.0f;
-    for (size_t i = 0; i < sizeD; ++i) {
-      float diff = std::fabs(__half2float(h_sol[i]) - __half2float(h_ref[i]));
-      float abs_ref = std::fabs(__half2float(h_ref[i]));
-      float rel = abs_ref > 1e-4f ? diff / abs_ref : diff;
-      max_diff = std::fmax(max_diff, rel);
-    }
-
-    float tolerance = 0.1f;
-    if (max_diff > tolerance) {
-      std::cerr << "Solution incorrect. Max relative diff: " << max_diff << std::endl;
-      cudaFree(d_D_sol);
-      std::cout << "Incorrect" << std::endl;
-      exit(-1);
-    }
+  kh_compare_outputs(h_sol,h_ref,0.01,0.003,0.001);
     cudaFree(d_D_sol);
   }
 #endif
@@ -548,6 +536,7 @@ int run(MixedDtypeOptions &options)
     // Profile reference
     float ref_total_ms = 0, ref_min_ms = 1e30f;
     for (int iter = 0; iter < kIterations; ++iter) {
+      kh_cold_l2();
       cudaEventRecord(ev_start);
       CUTLASS_CHECK(gemm.run());
       cudaEventRecord(ev_stop);
@@ -569,6 +558,7 @@ int run(MixedDtypeOptions &options)
 
       __half *d_D_sol;
       cudaMalloc(&d_D_sol, sizeD * sizeof(__half));
+    kh_poison(d_D_sol, sizeD * sizeof(__half));
 
       // Warmup solution
       for (int i = 0; i < 3; i++) {
@@ -584,6 +574,7 @@ int run(MixedDtypeOptions &options)
       // Profile solution
       float sol_total_ms = 0, sol_min_ms = 1e30f;
       for (int iter = 0; iter < kIterations; ++iter) {
+        kh_cold_l2();
         cudaEventRecord(ev_start);
         HopperMixedDtypeGemm(M, N, K, options.alpha,
           reinterpret_cast<const __half*>(block_A.get()), lda,
@@ -674,9 +665,9 @@ int main(int argc, char const **args) {
     configs.push_back({"custom", options.m, options.n, options.k});
   } else {
     configs = {
-      {"small",   1024, 1024, 1024},
-      {"medium",  4096, 4096, 4096},
-      {"large",   8192, 8192, 8192},
+      {"decode",128,8192,8192},
+      {"prefill",8192,8192,8192},
+      {"mlp",8192,28672,8192},
     };
   }
 

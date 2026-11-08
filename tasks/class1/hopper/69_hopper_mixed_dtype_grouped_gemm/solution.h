@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <vector>
 
 // Naive grouped mixed-dtype GEMM for testing the harness
 // A: row-major half [M x K], B: column-major int8 [K x N], D: row-major half [M x N]
@@ -23,7 +24,7 @@ __global__ void naive_mixed_grouped_gemm_kernel(
       // B is column-major: B[k, col] = B[k + col * ldb]
       acc += __half2float(A[row * lda + k]) * float(B[k + col * ldb]);
     }
-    float old_val = __half2float(D[row * ldd + col]);
+    float old_val = beta == 0 ? 0.0f : __half2float(D[row * ldd + col]);
     D[row * ldd + col] = __float2half(alpha * acc + beta * old_val);
   }
 }
@@ -56,6 +57,7 @@ cudaError_t HopperMixedGroupedGemm(
 
   for (int p = 0; p < problem_count; ++p) {
     int M = h_Ms[p], N = h_Ns[p], K = h_Ks[p];
+    if(M==0 || N==0) continue;
     dim3 block(16, 16);
     dim3 grid((M + 15) / 16, (N + 15) / 16);
     naive_mixed_grouped_gemm_kernel<<<grid, block>>>(

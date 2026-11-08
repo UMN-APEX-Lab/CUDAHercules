@@ -21,7 +21,7 @@ __global__ void naive_fp8_gemm_kernel(
       float b_val = float(B[k + j * ldb]);
       acc += a_val * b_val;
     }
-    C[i + j * ldc] = alpha * acc + beta * C[i + j * ldc];
+    C[i + j * ldc] = alpha * acc + (beta == 0 ? 0.0f : beta * C[i + j * ldc]);
   }
 }
 

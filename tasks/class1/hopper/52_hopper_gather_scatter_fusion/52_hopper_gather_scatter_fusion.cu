@@ -1,3 +1,4 @@
+#include "hopper_validation.cuh"
 /***************************************************************************************************
  * Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -62,7 +63,7 @@ using namespace cute;
 __global__ void InitHalf52_kernel(__half *matrix, int size, int seed) {
   int idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx < size) {
-    float value = float(((idx + seed) * 16807 % 16) - 8) * 0.01f;
+    float value = kh_random(idx,seed);
     matrix[idx] = __float2half(value);
   }
 }
@@ -418,6 +419,32 @@ struct ExampleRunner
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+using example::NoGather;
+using IndexedGather = example::IndexedGather<int>;
+using Runner52 = example::ExampleRunner<
+    cutlass::half_t,cutlass::layout::RowMajor,NoGather,
+    cutlass::half_t,cutlass::layout::ColumnMajor,IndexedGather,
+    cutlass::half_t,cutlass::layout::ColumnMajor,NoGather,
+    cutlass::half_t,cutlass::layout::ColumnMajor,IndexedGather,float,float>;
+struct Prepared52 {
+  Runner52::Gemm gemm;
+  cutlass::device_memory::allocation<uint8_t> workspace;
+  Prepared52(int M,int N,int K,float alpha,__half* A,__half* B,int* gather,
+             float beta,__half* D,int* scatter) {
+    using G=Runner52::Gemm; using GK=typename G::GemmKernel;
+    auto da=cutlass::make_cute_packed_stride(typename GK::StrideA{},make_shape(M,K,1));
+    auto db=cutlass::make_cute_packed_stride(typename GK::StrideB{},make_shape(N,K,1));
+    auto dc=cutlass::make_cute_packed_stride(typename GK::StrideC{},make_shape(M,N,1));
+    typename G::Arguments args{cutlass::gemm::GemmUniversalMode::kGemm,{M,N,K,1},
+      {reinterpret_cast<cutlass::half_t*>(A),da,reinterpret_cast<cutlass::half_t*>(B),db},
+      {{alpha,beta},reinterpret_cast<cutlass::half_t*>(D),dc,reinterpret_cast<cutlass::half_t*>(D),dc,
+       NoGather{},IndexedGather{scatter}}, {}, {}, NoGather{},IndexedGather{gather}};
+    workspace.reset(G::get_workspace_size(args));
+    CUTLASS_CHECK(gemm.can_implement(args)); CUTLASS_CHECK(gemm.initialize(args,workspace.get()));
+  }
+  void run() {CUTLASS_CHECK(gemm.run());}
+};
+
 cudaError_t TestCorrectness(int M, int N_orig, int K, int index_size, float alpha, float beta) {
   int lda = K, ldb = K, ldd = M;
   int64_t total_A = int64_t(M) * K;
@@ -439,21 +466,17 @@ cudaError_t TestCorrectness(int M, int N_orig, int K, int index_size, float alph
   InitIndices_kernel<<<(index_size + 255) / 256, 256>>>(scatter_idx, index_size, N_orig, 99);
   cudaDeviceSynchronize();
 
-  // Run naive reference
-  {
-    dim3 bl(16, 16), gr((M + 15) / 16, (index_size + 15) / 16);
-    NaiveGatherScatterRef_kernel<<<gr, bl>>>(M, index_size, K, alpha, A, lda, B, ldb,
-                                              gather_idx, beta, D_ref, ldd, scatter_idx);
-  }
-  cudaDeviceSynchronize();
-
-  // CUTLASS reference not used for correctness checking here (SM90-only),
-  // naive reference is sufficient for verifying solution.
+  Prepared52 ref(M,index_size,K,alpha,A,B,gather_idx,beta,D_ref,scatter_idx);
+  ref.run(); CUDA_CHECK(cudaDeviceSynchronize());
 
 #ifdef KH_TEST_SOLUTION
   __half *D_sol;
   cudaMalloc(&D_sol, total_D * sizeof(__half));
+
   cudaMemset(D_sol, 0, total_D * sizeof(__half));
+  std::vector<int> selected(index_size);
+  cudaMemcpy(selected.data(),scatter_idx,index_size*sizeof(int),cudaMemcpyDeviceToHost);
+  for(int col:selected) kh_poison(D_sol+size_t(col)*M,M*sizeof(__half));
 
   cudaError_t sr = HopperGatherScatterGemm(M, index_size, K, alpha, A, lda, B, ldb,
                                             gather_idx, beta, D_sol, ldd, scatter_idx);
@@ -468,8 +491,8 @@ cudaError_t TestCorrectness(int M, int N_orig, int K, int index_size, float alph
   cudaMemcpy(hs.data(), D_sol, total_D * sizeof(__half), cudaMemcpyDeviceToHost);
   cudaMemcpy(hr.data(), D_ref, total_D * sizeof(__half), cudaMemcpyDeviceToHost);
   float md = 0;
-  for (int64_t i = 0; i < total_D; ++i) md = fmaxf(md, fabsf(__half2float(hs[i]) - __half2float(hr[i])));
-  if (md > 1e-1f) {
+  for (int64_t i = 0; i < total_D; ++i) md = fmaxf(md, kh_abs(__half2float(hs[i]) - __half2float(hr[i])));
+  if (md > 0.01f) {
     std::cerr << "Solution incorrect. Max diff: " << md << std::endl;
     cudaFree(D_sol); cudaFree(D_ref); cudaFree(scatter_idx); cudaFree(gather_idx); cudaFree(B); cudaFree(A);
     return cudaErrorUnknown;
@@ -507,7 +530,16 @@ void Profile(int M, int N_orig, int K, int index_size, float alpha, float beta, 
   cudaEventCreate(&t0);
   cudaEventCreate(&t1);
 
-  // CUTLASS reference profiling skipped (SM90-only)
+  Prepared52 ref(M,index_size,K,alpha,A,B,gather_idx,beta,D,scatter_idx);
+  for(int i=0;i<3;++i) ref.run();
+  cudaDeviceSynchronize();
+  float rt=0,rm=1e30f;
+  for(int i=0;i<iterations;++i) {
+    kh_cold_l2();
+    cudaEventRecord(t0); ref.run(); cudaEventRecord(t1); cudaEventSynchronize(t1);
+    float ms;cudaEventElapsedTime(&ms,t0,t1);rt+=ms;rm=std::min(rm,ms);
+  }
+  fprintf(stdout,"Ref time: %.6f ms (avg over %d trials, min: %.6f ms)\n",rt/iterations,iterations,rm);
 
 #ifdef KH_TEST_SOLUTION
   // Warmup
@@ -518,6 +550,7 @@ void Profile(int M, int N_orig, int K, int index_size, float alpha, float beta, 
 
   float st = 0, sm = 1e30f;
   for (int i = 0; i < iterations; ++i) {
+    kh_cold_l2();
     cudaEventRecord(t0);
     HopperGatherScatterGemm(M, index_size, K, alpha, A, lda, B, ldb,
                              gather_idx, beta, D, ldd, scatter_idx);
@@ -528,7 +561,8 @@ void Profile(int M, int N_orig, int K, int index_size, float alpha, float beta, 
     st += ms;
     if (ms < sm) sm = ms;
   }
-  fprintf(stdout, "Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n", st / iterations, iterations, sm);
+  fprintf(stdout, "Kernel time: %.6f ms (avg over %d trials, min: %.6f ms)\n", st / iterations, iterations, sm);
+  fprintf(stdout,"Speedup: %.6fx\n",rm/sm);
 #endif
 
   cudaEventDestroy(t0);
@@ -563,9 +597,9 @@ int main(int argc, const char ** argv) {
     configs.push_back({"custom", M, N, K, idx});
   } else {
     configs = {
-      {"small",   1024, 1024,  512,  512},
-      {"medium",  4096, 4096, 2048, 2048},
-      {"large",   8192, 8192, 4096, 4096},
+      {"moe_decode",1536,4096,2048,2048},
+      {"moe_prefill",1536,32768,2048,16384},
+      {"moe_down",2048,16384,1536,8192},
     };
   }
 

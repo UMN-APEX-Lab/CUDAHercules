@@ -48,7 +48,7 @@ __global__ void naive_gather_scatter_kernel(
     acc += __half2float(A[i * lda + k]) * __half2float(B[k + j_b * ldb]);
   }
   // D col-major: D[i, j_d] = D[i + j_d * ldd]
-  float old_val = beta * __half2float(D[i + j_d * ldd]);
+  float old_val = (beta == 0 ? 0.0f : beta * __half2float(D[i + j_d * ldd]));
   D[i + j_d * ldd] = __float2half(alpha * acc + old_val);
 }
 

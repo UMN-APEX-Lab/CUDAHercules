@@ -1,3 +1,5 @@
+#include <tuple>
+#include "hopper_validation.cuh"
 /*
  * DeepGEMM FP8 MQA Attention Scoring — CUDA-Hercules Class 1 harness
  *
@@ -17,7 +19,7 @@
 #include <cmath>
 #include <cfloat>
 
-#include "../../include/kh_benchmark.h"
+#include "kh_benchmark.h"
 
 // DeepGEMM kernel
 #include <deep_gemm/impls/sm90_fp8_mqa_logits.cuh>
@@ -61,9 +63,9 @@ static constexpr int NUM_THREADS = NUM_TMA + NUM_MATH;
 
 struct TestConfig { int seq_len; int seq_len_kv; const char* label; };
 static const TestConfig configs[] = {
-    {1024, 4096,  "S=1024,SKV=4096"},
-    {2048, 4096,  "S=2048,SKV=4096"},
-    {2048, 8192,  "S=2048,SKV=8192"}
+    {4096, 32768, "S=4096,SKV=32768"},
+    {8192, 32768, "S=8192,SKV=32768"},
+    {8192, 65536, "S=8192,SKV=65536"}
 };
 
 // ─── TMA helpers ─────────────────────────────────────────────────────
@@ -129,7 +131,7 @@ __global__ void quantize_kv_to_fp8(
     // Find max abs in this token's row
     float max_abs = 0;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        float v = fabsf(__bfloat162float(kv_bf16[token * head_dim + d]));
+        float v = kh_abs(__bfloat162float(kv_bf16[token * head_dim + d]));
         max_abs = fmaxf(max_abs, v);
     }
     // Warp reduction
@@ -153,6 +155,27 @@ __global__ void fill_neginf(float* data, int n) {
     if (idx < n) data[idx] = -INFINITY;
 }
 
+// The uncompressed upstream kernel writes whole KV tiles; restore the exact mask.
+__global__ void mask_logits(float* logits,const int* ks,const int* ke,int S,int Sk) {
+  size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(i<size_t(S)*Sk) {int q=i/Sk,k=i%Sk;if(k<ks[q]||k>=ke[q]) logits[i]=-INFINITY;}
+}
+__global__ void sample_mqa_oracle(const __nv_fp8_e4m3* q,const __nv_fp8_e4m3* kv,
+    const float* scales,const float* weights,const int* ke,const float* out,int S,int Sk,int* bad) {
+  int sample=threadIdx.x;
+  int row=kh_hash(sample+3521)%S;
+  int key=kh_hash(sample+1113)%ke[row];
+  double expected=0;
+  for(int h=0;h<NUM_HEADS;++h) {
+    double dot=0;
+    for(int d=0;d<HEAD_DIM;++d) dot+=double(float(q[(size_t(row)*NUM_HEADS+h)*HEAD_DIM+d]))*double(float(kv[size_t(key)*HEAD_DIM+d]));
+    expected+=fmax(dot,0.0)*double(weights[row*NUM_HEADS+h]);
+  }
+  expected*=scales[key];
+  float actual=out[size_t(row)*Sk+key];
+  if(!isfinite(actual)||fabs(actual-expected)>0.001+0.01*fabs(expected)) atomicExch(bad,1);
+}
+
 // ─── Run DeepGEMM reference kernel ──────────────────────────────────
 
 static void run_ref_kernel(__nv_fp8_e4m3* q, __nv_fp8_e4m3* kv,
@@ -162,8 +185,13 @@ static void run_ref_kernel(__nv_fp8_e4m3* q, __nv_fp8_e4m3* kv,
     // swizzle for head_dim=128, FP8 elem_size=1: (128*1)%128==0 → 128
     // smem_inner overridden: 128/1=128 (matches head_dim)
 
+    auto key=std::make_tuple(q,kv,kv_scales,weights,seq_len,seq_len_kv);
+    static decltype(key) previous{};
+    static bool ready=false;
+    static CUtensorMap tma_q,tma_kv,tma_kv_scales,tma_weights;
+    if(!ready || key!=previous) {
     // Q TMA: inner=head_dim, outer=seq_len*num_heads
-    CUtensorMap tma_q = make_tma_2d(
+    tma_q = make_tma_2d(
         q, CU_TENSOR_MAP_DATA_TYPE_UINT8,
         HEAD_DIM, seq_len * NUM_HEADS,
         HEAD_DIM, BLOCK_QH,
@@ -171,7 +199,7 @@ static void run_ref_kernel(__nv_fp8_e4m3* q, __nv_fp8_e4m3* kv,
         CU_TENSOR_MAP_SWIZZLE_128B);
 
     // KV TMA: inner=head_dim, outer=seq_len_kv
-    CUtensorMap tma_kv = make_tma_2d(
+    tma_kv = make_tma_2d(
         kv, CU_TENSOR_MAP_DATA_TYPE_UINT8,
         HEAD_DIM, seq_len_kv,
         HEAD_DIM, BLOCK_KV,
@@ -180,7 +208,7 @@ static void run_ref_kernel(__nv_fp8_e4m3* q, __nv_fp8_e4m3* kv,
 
     // KV scales TMA: inner=aligned_seq_len_kv, outer=1
     int aligned_skv = tma_aligned_size(seq_len_kv, (int)sizeof(float));
-    CUtensorMap tma_kv_scales = make_tma_2d(
+    tma_kv_scales = make_tma_2d(
         kv_scales, CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
         aligned_skv, 1,
         BLOCK_KV, 1,
@@ -188,13 +216,15 @@ static void run_ref_kernel(__nv_fp8_e4m3* q, __nv_fp8_e4m3* kv,
         CU_TENSOR_MAP_SWIZZLE_NONE);
 
     // Weights TMA: inner=num_heads, outer=seq_len
-    CUtensorMap tma_weights = make_tma_2d(
+    tma_weights = make_tma_2d(
         weights, CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
         NUM_HEADS, seq_len,
         NUM_HEADS, BLOCK_Q,
         NUM_HEADS * (int)sizeof(float),
         CU_TENSOR_MAP_SWIZZLE_NONE);
 
+      previous=key;ready=true;
+    }
     // Shared memory
     int smem_size = 0;
     smem_size += NUM_Q_STAGES * BLOCK_Q * NUM_HEADS * HEAD_DIM * 1;    // Q (FP8)
@@ -211,8 +241,11 @@ static void run_ref_kernel(__nv_fp8_e4m3* q, __nv_fp8_e4m3* kv,
         NUM_Q_STAGES, NUM_KV_STAGES,
         NUM_TMA, NUM_MATH>;
 
-    KH_CUDA_CHECK(cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    static bool attributes_set=false;
+    if(!attributes_set) {
+      KH_CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,smem_size));
+      attributes_set=true;
+    }
 
     // Align seq_len to BLOCK_Q
     int aligned_seq_len = ((seq_len + BLOCK_Q - 1) / BLOCK_Q) * BLOCK_Q;
@@ -223,6 +256,7 @@ static void run_ref_kernel(__nv_fp8_e4m3* q, __nv_fp8_e4m3* kv,
         (uint32_t*)ks, (uint32_t*)ke,
         logits,
         tma_q, tma_kv, tma_kv_scales, tma_weights);
+    mask_logits<<<(size_t(aligned_seq_len)*seq_len_kv+255)/256,256>>>(logits,ks,ke,aligned_seq_len,seq_len_kv);
     KH_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -259,7 +293,7 @@ static void cpu_mqa_logits(
 
 // ─── main ────────────────────────────────────────────────────────────
 
-int main() {
+int main(int argc,char** argv) {
     KH_DRIVER_CHECK(cuInit(0));
 
     // Get number of SMs
@@ -272,7 +306,9 @@ int main() {
     int benchmark_trials = kh_benchmark_trials();
     bool all_passed = true;
 
-    for (auto& cfg : configs) {
+    std::vector<TestConfig> cases(std::begin(configs),std::end(configs));
+    if(argc==3) cases={{atoi(argv[1]),atoi(argv[2]),"custom"}};
+    for (auto& cfg : cases) {
         printf("\n=== %s ===\n", cfg.label);
         int S = cfg.seq_len, SKV = cfg.seq_len_kv;
         // Align S to BLOCK_Q
@@ -311,7 +347,7 @@ int main() {
         int *h_ks = new int[S_aligned], *h_ke = new int[S_aligned];
         for (int i = 0; i < S_aligned; i++) {
             h_ks[i] = 0;
-            h_ke[i] = (i < S) ? (i + offset) : 0;
+            h_ke[i] = (i < S) ? (i + offset + 1) : 0;
         }
         int *d_ks, *d_ke;
         KH_CUDA_CHECK(cudaMalloc(&d_ks, S_aligned * sizeof(int)));
@@ -328,11 +364,17 @@ int main() {
         run_ref_kernel(q_fp8, kv_fp8, kv_scales, weights,
                        d_ks, d_ke, logits_ref, S_aligned, SKV, num_sms);
         KH_CUDA_CHECK(cudaDeviceSynchronize());
+        int* bad;KH_CUDA_CHECK(cudaMalloc(&bad,sizeof(int)));KH_CUDA_CHECK(cudaMemset(bad,0,sizeof(int)));
+        sample_mqa_oracle<<<1,32>>>(q_fp8,kv_fp8,kv_scales,weights,d_ke,logits_ref,S,SKV,bad);
+        int invalid=1;KH_CUDA_CHECK(cudaMemcpy(&invalid,bad,sizeof(int),cudaMemcpyDeviceToHost));
+        KH_CUDA_CHECK(cudaFree(bad));
+        if(invalid) {fputs("Independent MQA oracle failed\n",stderr);return 1;}
 
 #ifdef KH_TEST_SOLUTION
         float* logits_sol;
         KH_CUDA_CHECK(cudaMalloc(&logits_sol, (size_t)S_aligned * SKV * sizeof(float)));
-        fill_neginf<<<((size_t)S_aligned * SKV + 255) / 256, 256>>>(logits_sol, S_aligned * SKV);
+    kh_poison(logits_sol, (size_t)S_aligned * SKV * sizeof(float));
+        kh_poison(logits_sol,(size_t)S_aligned*SKV*sizeof(float));
         KH_CUDA_CHECK(cudaDeviceSynchronize());
 
         solution_mqa_logits(q_fp8, kv_fp8, kv_scales, weights,
@@ -359,12 +401,12 @@ int main() {
                     if (!(isinf(h_sol[i]) && h_sol[i] < 0)) mismatches++;
                     continue;
                 }
-                float diff = fabsf(h_ref[i] - h_sol[i]);
-                float denom = fmaxf(fabsf(h_ref[i]), 1e-6f);
+                float diff = kh_abs(h_ref[i] - h_sol[i]);
+                float denom = 0.001f + 0.01f * kh_abs(h_ref[i]);
                 max_rel_diff = fmaxf(max_rel_diff, diff / denom);
             }
             printf("Max relative diff: %.6f, mask mismatches: %d\n", max_rel_diff, mismatches);
-            if (max_rel_diff > 0.01f || mismatches > 0) {
+            if (max_rel_diff > 1.0f || mismatches > 0) {
                 printf("FAILED\n");
                 printf("Incorrect\n");
                 all_passed = false;

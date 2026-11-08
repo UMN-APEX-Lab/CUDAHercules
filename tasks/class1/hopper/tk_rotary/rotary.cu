@@ -1,3 +1,4 @@
+#include "hopper_validation.cuh"
 #include "kittens.cuh"
 #include "prototype.cuh"
 
@@ -70,7 +71,7 @@ template<int _headdim> struct rotary_template {
     struct consumer {
         __device__ static void setup(consumer_setup_args<layout> args) {
             warpgroup::consumer_registers<NUM_CONSUMER_WARPS/4>();
-            kittens::coord idx = { blockIdx.x*NUM_CONSUMER_WARPS + warpid(), 0 };
+            kittens::coord idx = { (blockIdx.x*NUM_CONSUMER_WARPS + warpid())*16, 0 };
             warp::load(args.state.sin, args.globals.sin, idx); // could be better coalesced but doing just once
             warp::load(args.state.cos, args.globals.cos, idx);
         }
@@ -142,7 +143,7 @@ void dispatch_fused_rotary(
     cudaFuncSetAttribute(prototype::lcsf::kernel<rope_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
     dim3 grid((ATTN_N+ROWS_PER_BLOCK-1)/ROWS_PER_BLOCK, (ATTN_B+BATCHES_PER_BLOCK-1)/BATCHES_PER_BLOCK);
     dim3 block(kittens::prototype::detail::NUM_THREADS_v<rope_t>);
-    kittens::prototype::lcsf::kernel<rope_t><<<grid, block, mem_size>>>(g); 
+    kittens::prototype::lcsf::kernel<rope_t><<<grid, block, mem_size>>>(g);
 }
 
 at::Tensor fused_rotary(
@@ -157,7 +158,7 @@ at::Tensor fused_rotary(
     const int B = x.size(0);
     const int H = x.size(1);
     const int N = x.size(2);
-    
+
     TORCH_CHECK(B == x.size(0), "Batch size mismatch");
     TORCH_CHECK(H == x.size(1), "Head size mismatch");
     TORCH_CHECK(N == x.size(2), "Sequence length mismatch");
@@ -185,7 +186,7 @@ at::Tensor fused_rotary(
             d_out,
             d_x,
             d_sin_in,
-            d_cos_in, 
+            d_cos_in,
             B, H, N
         );
     }
@@ -194,7 +195,7 @@ at::Tensor fused_rotary(
             d_out,
             d_x,
             d_sin_in,
-            d_cos_in, 
+            d_cos_in,
             B, H, N
         );
     }

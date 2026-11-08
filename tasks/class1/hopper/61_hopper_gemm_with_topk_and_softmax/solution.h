@@ -16,6 +16,7 @@ __global__ void naive_gemm_topk_softmax_kernel(
   int m = blockIdx.x * blockDim.x + threadIdx.x;
   if (m >= M) return;
 
+  float logits[128];
   // Step 1: Compute GEMM row
   extern __shared__ float shmem[];
   // Use global memory for row storage since N can be large
@@ -27,7 +28,7 @@ __global__ void naive_gemm_topk_softmax_kernel(
     for (int k = 0; k < K; ++k) {
       acc += __half2float(A[m * lda + k]) * __half2float(B[k + n * ldb]);
     }
-    D[m * ldd + n] = __float2half(alpha * acc);
+    logits[n] = alpha * acc;
   }
 
   // Step 2: Find top-K values using insertion sort
@@ -36,7 +37,7 @@ __global__ void naive_gemm_topk_softmax_kernel(
   int topk_count = 0;
 
   for (int n = 0; n < N; ++n) {
-    float val = __half2float(D[m * ldd + n]);
+    float val = logits[n];
     if (topk_count < topk) {
       // Insert into topk_vals maintaining sorted order (descending)
       int pos = topk_count;
@@ -66,7 +67,7 @@ __global__ void naive_gemm_topk_softmax_kernel(
   // Step 4: Apply to output - zero non-top-K, softmax top-K
   float threshold = topk_vals[topk - 1];
   for (int n = 0; n < N; ++n) {
-    float val = __half2float(D[m * ldd + n]);
+    float val = logits[n];
     if (val >= threshold) {
       D[m * ldd + n] = __float2half(expf(val - max_val) / sum_exp);
     } else {

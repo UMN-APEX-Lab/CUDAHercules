@@ -1,349 +1,92 @@
+#include "hopper_validation.cuh"
+#include <cuda_bf16.h>
+#include <algorithm>
+#include <vector>
 #include <iostream>
-#include <string>
 #include <fstream>
-#include <chrono>
-
-#ifdef KH_TEST_SOLUTION
-#include "solution.h"
-#endif
-
-constexpr int ATTN_B = 16;
-constexpr int ATTN_H = 32;
-constexpr int ATTN_N = 2048;
-constexpr int ATTN_D = 64; // hardcoded into this kernel
-constexpr int ATTN_G = 1;  // hardcoded into this kernel
-constexpr int ITER   = 10;
-
-constexpr int BLOCK_SIZE = prototype::detail::NUM_THREADS_v<mamba2_fwd_template>;
-
-#define CudaCheckError()    __cudaCheckError( __FILE__, __LINE__ )
-inline void __cudaCheckError( const char *file, const int line ) {
-    cudaError err = cudaGetLastError();
-    if ( cudaSuccess != err )
-    {
-        fprintf( stderr, "cudaCheckError() failed at %s:%i : %s\n",
-                 file, line, cudaGetErrorString( err ) );
-        exit( -1 );
-    }
-    // More careful checking. However, this will affect performance.
-    // Comment away if needed.
-    err = cudaDeviceSynchronize();
-    if( cudaSuccess != err )
-    {
-        fprintf( stderr, "cudaCheckError() with sync failed at %s:%i : %s\n",
-                 file, line, cudaGetErrorString( err ) );
-        exit( -1 );
-    }
+#include <string>
+#include "solution_api.h"
+#define KH_CHECK(call) do { auto err=(call); if(err!=cudaSuccess) {fprintf(stderr,"%s: %s\n",#call,cudaGetErrorString(err));exit(1);} } while(0)
+std::vector<void*> kh_buffers;
+std::vector<uint64_t> kh_buffer_sizes;
+template<class T> T* alloc(size_t n, int seed, float scale=1, float bias=0) {
+  T* ptr; KH_CHECK(cudaMalloc(&ptr,n*sizeof(T))); kh_buffers.push_back(ptr); kh_buffer_sizes.push_back(n*sizeof(T));
+  std::vector<T> values(n);
+  for(size_t i=0;i<n;++i) values[i]=T(kh_random(i,seed)*scale+bias);
+  KH_CHECK(cudaMemcpy(ptr,values.data(),n*sizeof(T),cudaMemcpyHostToDevice));
+  return ptr;
 }
+template<class F> float measure(const char* name,F fn) {
+  for(int i=0;i<3;++i) fn(); KH_CHECK(cudaDeviceSynchronize());
+  void* cache=alloc<uint8_t>(128u<<20,93);
+  cudaEvent_t a,b; KH_CHECK(cudaEventCreate(&a)); KH_CHECK(cudaEventCreate(&b));
+  float total=0,best=1e30f;
+  for(int i=0;i<10;++i) {
+    KH_CHECK(cudaMemset(cache,i,128u<<20));
+    KH_CHECK(cudaEventRecord(a)); fn(); KH_CHECK(cudaEventRecord(b)); KH_CHECK(cudaEventSynchronize(b));
+    float ms; KH_CHECK(cudaEventElapsedTime(&ms,a,b)); total+=ms; best=std::min(best,ms);
+  }
+  printf("%s time: %.6f ms (avg over 10 trials, min: %.6f ms)\n",name,total/10,best);
+  KH_CHECK(cudaEventDestroy(a)); KH_CHECK(cudaEventDestroy(b));
+  return best;
+}
+int main(int argc,char** argv) {
+  int B=8,H=80,N=8192;
+  if(argc>=4) { B=atoi(argv[1]);H=atoi(argv[2]);N=atoi(argv[3]); }
+  if(B<=0||H<=0||H%2||N%256) { fputs("Require B>0, even H>0, N multiple of 256\n",stderr);return 1; }
+  printf("\n=== tk_mamba2: B=%d, H=%d, N=%d ===\n",B,H,N);
 
-// Compute FLOPs for forward attention
-constexpr uint64_t ATTN_FLOPS = 
-    2llu * ATTN_B * ATTN_H * ATTN_N * ATTN_N * ATTN_D + // Q * K^T: 2BHNND (multiply-add)
-    4llu * ATTN_B * ATTN_H * ATTN_N * ATTN_N +          // Softmax: 2BHNN (exp and divide, plus flash-attn bookkeeping)
-    2llu * ATTN_B * ATTN_H * ATTN_N * ATTN_N * ATTN_D;      // (Q * K^T) * V: 2BHNND (multiply-add)
-
-int main(int argc, char **argv) {
-    // TODO: consider doing sequential kernel launches to force batches dimension element to execute sequentially,
-    // which may increase the probability of L2 cache hits on KV
-
-    std::cout << "Entered main!" << std::endl;
-
-    // create dummy variables that are the right size
-    constexpr int TOTAL_ELEMENTS_VO  = ATTN_B*ATTN_H*ATTN_N*ATTN_D;
-    constexpr int TOTAL_ELEMENTS_QK  = ATTN_B*ATTN_G*ATTN_N*ATTN_D; 
-    constexpr int TOTAL_ELEMENTS_A   = ATTN_B*ATTN_H*ATTN_N;
-
-    float *q = new float[TOTAL_ELEMENTS_QK];
-    float *a = new float[TOTAL_ELEMENTS_A];
-    float *k = new float[TOTAL_ELEMENTS_QK];
-    float *v = new float[TOTAL_ELEMENTS_VO];
-    float *o_ref = new float[TOTAL_ELEMENTS_VO];
-
-    bf16 *q_bf = new bf16[TOTAL_ELEMENTS_QK];
-    bf16 *k_bf = new bf16[TOTAL_ELEMENTS_QK];
-    bf16 *v_bf = new bf16[TOTAL_ELEMENTS_VO];
-    bf16 *o_bf = new bf16[TOTAL_ELEMENTS_VO];
-
-    float *a_in = new float[ATTN_B*ATTN_H*ATTN_N];
-    float *o    = new float[TOTAL_ELEMENTS_VO];
-
-    std::ifstream infile(argv[1]);
-
-    std::cout << "Starting to enter!" << std::endl;
-
-
-    int elements_loaded = 0;
-    for(int i = 0; i < TOTAL_ELEMENTS_VO; i++) {
-        infile >> v[i];
-        elements_loaded++;
+  // This TK kernel implements the explicit state-128, one-group variant.
+  auto q=alloc<bf16>(size_t(B)*N*128,1,0.25f),k=alloc<bf16>(size_t(B)*N*128,2,0.25f);
+  auto v=alloc<bf16>(size_t(B)*H*N*64,3),o=alloc<bf16>(size_t(B)*H*N*64,4);
+  auto decay=alloc<float>(size_t(B)*H*N,5,0.09f,-0.11f);
+  using L=mamba2_fwd_template::layout;
+  L::q_global Qg(q,B,1,N,nullptr); L::k_global Kg(k,B,1,N,nullptr);
+  L::v_global Vg(v,B,H,N,nullptr); L::o_global Og(o,B,H,N,nullptr);
+  L::a_global Ag(decay,B,H,nullptr,N); L::globals globals{Qg,Kg,Vg,Og,Ag};
+  unsigned long smem=kittens::prototype::detail::MAX_SHARED_MEMORY_v<mamba2_fwd_template>;
+  KH_CHECK(cudaFuncSetAttribute(prototype::lcsf::kernel<mamba2_fwd_template>,cudaFuncAttributeMaxDynamicSharedMemorySize,smem));
+  int sms;KH_CHECK(cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,0));
+  auto reference=[&](){prototype::lcsf::kernel<mamba2_fwd_template><<<sms*2,prototype::detail::NUM_THREADS_v<mamba2_fwd_template>,smem>>>(globals);KH_CHECK(cudaGetLastError());};
+  kh_poison(o,size_t(B)*H*N*64*sizeof(bf16));
+  reference(); KH_CHECK(cudaDeviceSynchronize());
+  size_t count=size_t(B)*H*N*64;
+  std::vector<bf16> expected(count);
+  KH_CHECK(cudaMemcpy(expected.data(),o,count*sizeof(bf16),cudaMemcpyDeviceToHost));
+  for(auto x:expected) if(!std::isfinite(float(x))) {fputs("Nonfinite reference\n",stderr);return 1;}
+  if(argc==5) {
+    // Optional binary dump for an independent mathematical oracle.
+    std::ofstream file(argv[4],std::ios::binary);
+    uint64_t num=kh_buffers.size();file.write((char*)&num,8);
+    for(size_t i=0;i<num;++i) {
+      uint64_t bytes=kh_buffer_sizes[i];std::vector<char> data(bytes);
+      KH_CHECK(cudaMemcpy(data.data(),kh_buffers[i],bytes,cudaMemcpyDeviceToHost));
+      file.write((char*)&bytes,8);file.write(data.data(),bytes);
     }
-    std::cout << "Finished loading V: " << elements_loaded << " elements loaded" << std::endl;
+    if(!file) {fputs("Failed to export oracle inputs\n",stderr);return 1;}
 
-    elements_loaded = 0;
-    for(int i = 0; i < TOTAL_ELEMENTS_A; i++) {
-        infile >> a[i];
-        elements_loaded++;
-    }
-    std::cout << "Finished loading A: " << elements_loaded << " elements loaded" << std::endl;
-
-    elements_loaded = 0;
-    for(int i = 0; i < TOTAL_ELEMENTS_QK; i++) {
-        infile >> k[i];
-        elements_loaded++;
-    }
-    std::cout << "Finished loading K: " << elements_loaded << " elements loaded" << std::endl;
-
-    elements_loaded = 0;
-    for(int i = 0; i < TOTAL_ELEMENTS_QK; i++) {
-        infile >> q[i];
-        elements_loaded++;
-    }
-    std::cout << "Finished loading Q: " << elements_loaded << " elements loaded" << std::endl;
-
-    elements_loaded = 0;
-    for(int i = 0; i < TOTAL_ELEMENTS_VO; i++) {
-        infile >> o_ref[i];
-        elements_loaded++;
-    }
-    std::cout << "Finished loading O_REF: " << elements_loaded << " elements loaded" << std::endl;
-
-    std::cout << "Finished loading file from " << argv[1] << "!" << std::endl;
-
-    // replicate v into batch and heads
-    for (int i = 0; i < TOTAL_ELEMENTS_VO; i++) {
-        v_bf[i] = __float2bfloat16(v[i]);
-    }
-
-    // replicate q and k into batch
-    for (int i = 0; i < TOTAL_ELEMENTS_QK; i++) {
-        q_bf[i] = __float2bfloat16(q[i]);
-        k_bf[i] = __float2bfloat16(k[i]);
-    }
-
-    // replicate a into batch and heads
-    for (int i = 0; i < TOTAL_ELEMENTS_A; i++) {
-        a_in[i] = a[i];
-    }
-
-    bf16 *d_q, *d_k, *d_v, *d_o;
-    float *d_a;
-    cudaMalloc(&d_q, TOTAL_ELEMENTS_QK * sizeof(bf16));
-    cudaMalloc(&d_k, TOTAL_ELEMENTS_QK * sizeof(bf16));    
-    cudaMalloc(&d_v, TOTAL_ELEMENTS_VO * sizeof(bf16));
-    cudaMalloc(&d_o, TOTAL_ELEMENTS_VO * sizeof(bf16));
-    cudaMalloc(&d_a, TOTAL_ELEMENTS_A * sizeof(float));
-
-    cudaMemcpy(d_q, q_bf, TOTAL_ELEMENTS_QK * sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k, k_bf, TOTAL_ELEMENTS_QK * sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v, v_bf, TOTAL_ELEMENTS_VO * sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_a, a_in, TOTAL_ELEMENTS_A * sizeof(float), cudaMemcpyHostToDevice);
-
-    mamba2_fwd_template::layout::q_global Qg(d_q, ATTN_B, ATTN_G, ATTN_N, nullptr);
-    mamba2_fwd_template::layout::k_global Kg(d_k, ATTN_B, ATTN_G, ATTN_N, nullptr);
-
-    mamba2_fwd_template::layout::a_global Ag(d_a, ATTN_B, ATTN_H, nullptr, ATTN_N);
-
-    mamba2_fwd_template::layout::v_global Vg(d_v, ATTN_B, ATTN_H, ATTN_N, nullptr);
-    mamba2_fwd_template::layout::o_global Og(d_o, ATTN_B, ATTN_H, ATTN_N, nullptr);
-
-    mamba2_fwd_template::layout::globals globals = {Qg, Kg, Vg, Og, Ag};
-    
-    unsigned long mem_size = kittens::prototype::detail::MAX_SHARED_MEMORY_v<mamba2_fwd_template>;
-    
-    cudaFuncSetAttribute(
-        prototype::lcsf::kernel<mamba2_fwd_template>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        mem_size
-    );
-
-    cudaDeviceSynchronize();
-    std::cout << "Starting kernel\n";
-    constexpr int NUM_WORKERS = prototype::detail::NUM_CONSUMER_WARPGROUPS_v<mamba2_fwd_template>;
-    // dim3 grid((ATTN_N + mamba2_fwd_template::layout::qo_tile::rows*NUM_WORKERS - 1) / (attn_fwd_templamamba2_fwd_templatete::layout::qo_tile::rows*NUM_WORKERS), ATTN_H, ATTN_B);
-    dim3 grid(264, 1, 1);
-    // dim3 bad_grid(grid.z, grid.y, grid.x);
-    std::cout << "Grid size: " << grid.x << " x " << grid.y << " x " << grid.z << std::endl;
-    // warmup
-    for(int j = 0; j < ITER; j++)
-        prototype::lcsf::kernel<mamba2_fwd_template><<<grid, BLOCK_SIZE, mem_size>>>(globals);
-    cudaDeviceSynchronize();
-    
-    const auto start = std::chrono::high_resolution_clock::now();
-    for(int i = 0; i < ITER; i++) {
-        std::cout << "Launching kernel " << i+1 << " of " << ITER << std::endl;
-        prototype::lcsf::kernel<mamba2_fwd_template><<<grid, BLOCK_SIZE, mem_size>>>(globals);
-    }
-    cudaDeviceSynchronize();
-    const auto finish = std::chrono::high_resolution_clock::now();
-    CudaCheckError();
-    std::cout << "Finished kernel\n";
-    
-    // check correctness
-    cudaMemcpy(o_bf, d_o, TOTAL_ELEMENTS_VO * sizeof(bf16), cudaMemcpyDeviceToHost);
-    for(int i = 0; i < TOTAL_ELEMENTS_VO; i++) {
-        o[i] = __bfloat162float(o_bf[i]);
-    }
-
-    bool good = true;
-    double total_error = 0;
-    std::ofstream o_ref_file("printouts/o_ref.txt");
-    std::ofstream o_file("printouts/o.txt");
-    std::ofstream diff_file("printouts/diff.txt");
-    for(int i = 0; i < TOTAL_ELEMENTS_VO; i++) {
-        float diff = o[i] - o_ref[i];
-        if (i < ATTN_H*ATTN_N*ATTN_D) {
-            o_ref_file << o_ref[i] << ' ';
-            o_file << o[i] << ' ';
-            diff_file << diff << ' ';
-        }
-        if(i % 64 == 63) {
-            o_ref_file << '\n';
-            o_file << '\n';
-            diff_file << '\n';
-        }
-        if(abs(diff) > 0.1 || isnan(diff) || isinf(diff)) {
-            good = false;
-            if(isnan(diff) || isinf(diff)) std::cout << "NaN/inf detected at " << i << std::endl;
-        }
-        total_error += diff;
-    }
-
-    std::cout << "Average execution time: " << std::chrono::duration_cast<std::chrono::microseconds>(finish - start).count() / ITER << " us" << std::endl;
-    std::cout << "Avg error: " << total_error / TOTAL_ELEMENTS_VO << std::endl;
-    if(good) std::cout << "Correct :)\n";
-    else std::cout << "Incorrect :(\n";
-    // Compute and print average TFLOPs achieved
-    double avg_time_s = (double)(std::chrono::duration_cast<std::chrono::microseconds>(finish - start).count()) / (ITER * 1e6);
-    double avg_tflops = (ATTN_FLOPS / avg_time_s) / 1e12;
-    std::cout << "Average TFLOPs achieved: " << avg_tflops << std::endl;
-
+  }
 #ifdef KH_TEST_SOLUTION
-    // --- Solution testing block ---
-    bf16 *d_o_solution;
-    cudaMalloc(&d_o_solution, TOTAL_ELEMENTS_VO * sizeof(bf16));
-
-    // Run solution kernel
-    Mamba2Forward(
-        reinterpret_cast<__nv_bfloat16*>(d_q),
-        reinterpret_cast<__nv_bfloat16*>(d_k),
-        reinterpret_cast<__nv_bfloat16*>(d_v),
-        reinterpret_cast<__nv_bfloat16*>(d_o_solution),
-        d_a,
-        ATTN_B, ATTN_H, ATTN_N);
-    cudaDeviceSynchronize();
-    CudaCheckError();
-
-    // Copy solution output to host and compare against TK output (o[])
-    bf16 *sol_bf = new bf16[TOTAL_ELEMENTS_VO];
-    float *sol_f = new float[TOTAL_ELEMENTS_VO];
-    cudaMemcpy(sol_bf, d_o_solution, TOTAL_ELEMENTS_VO * sizeof(bf16), cudaMemcpyDeviceToHost);
-    for (int i = 0; i < TOTAL_ELEMENTS_VO; i++) {
-        sol_f[i] = __bfloat162float(sol_bf[i]);
+  bf16* sol=alloc<bf16>(count,99);
+  kh_poison(sol,count*sizeof(bf16));
+  auto solution=[&](){ Mamba2Forward(q,k,v,sol,decay,B,H,N); KH_CHECK(cudaGetLastError()); };
+  solution(); KH_CHECK(cudaDeviceSynchronize());
+  std::vector<bf16> actual(count);
+  KH_CHECK(cudaMemcpy(actual.data(),sol,count*sizeof(bf16),cudaMemcpyDeviceToHost));
+  double error2=0,magnitude2=0;
+  for(size_t i=0;i<count;++i) {
+    float x=float(actual[i]),y=float(expected[i]);
+    error2+=double(x-y)*(x-y);magnitude2+=double(y)*y;
+    if(!std::isfinite(x)||std::abs(x-y)>0.012f+0.06f*std::abs(y)) {
+      fprintf(stderr,"Incorrect at %zu: got %g expected %g\n",i,x,y);return 1;
     }
-
-    printf("\n=== mamba2: B=%d, H=%d, N=%d, D=%d ===\n", ATTN_B, ATTN_H, ATTN_N, ATTN_D);
-    constexpr float abs_tol = 0.1f;
-    constexpr float rel_tol = 0.05f;
-    bool sol_correct = true;
-    int sol_diff_counter = 0;
-    float sol_max_diff = 0.0f;
-    for (int i = 0; i < TOTAL_ELEMENTS_VO; i++) {
-        float diff = abs(sol_f[i] - o[i]);
-        if (isnan(diff) || isinf(sol_f[i])) {
-            sol_correct = false;
-            sol_diff_counter++;
-        } else if (diff > fmax(abs_tol, abs(o[i]) * rel_tol)) {
-            sol_correct = false;
-            sol_diff_counter++;
-        }
-        sol_max_diff = fmax(sol_max_diff, diff);
-    }
-
-    if (sol_correct) {
-        printf("Passed\n");
-    } else {
-        printf("Failed (%d elements differ, max diff: %f)\n", sol_diff_counter, sol_max_diff);
-    }
-
-    // CUDA event timing
-    const int WARMUP = 3;
-    const int TIMED = 10;
-    cudaEvent_t ev_start, ev_stop;
-    cudaEventCreate(&ev_start);
-    cudaEventCreate(&ev_stop);
-
-    // --- Time TK reference kernel ---
-    for (int i = 0; i < WARMUP; i++) {
-        prototype::lcsf::kernel<mamba2_fwd_template><<<grid, BLOCK_SIZE, mem_size>>>(globals);
-    }
-    cudaDeviceSynchronize();
-
-    float ref_total_ms = 0.0f;
-    float ref_min_ms = 1e9f;
-    for (int i = 0; i < TIMED; i++) {
-        cudaEventRecord(ev_start);
-        prototype::lcsf::kernel<mamba2_fwd_template><<<grid, BLOCK_SIZE, mem_size>>>(globals);
-        cudaEventRecord(ev_stop);
-        cudaEventSynchronize(ev_stop);
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, ev_start, ev_stop);
-        ref_total_ms += ms;
-        if (ms < ref_min_ms) ref_min_ms = ms;
-    }
-    float ref_avg_ms = ref_total_ms / TIMED;
-
-    // --- Time solution kernel ---
-    for (int i = 0; i < WARMUP; i++) {
-        Mamba2Forward(
-            reinterpret_cast<__nv_bfloat16*>(d_q),
-            reinterpret_cast<__nv_bfloat16*>(d_k),
-            reinterpret_cast<__nv_bfloat16*>(d_v),
-            reinterpret_cast<__nv_bfloat16*>(d_o_solution),
-            d_a,
-            ATTN_B, ATTN_H, ATTN_N);
-    }
-    cudaDeviceSynchronize();
-
-    float sol_total_ms = 0.0f;
-    float sol_min_ms = 1e9f;
-    for (int i = 0; i < TIMED; i++) {
-        cudaEventRecord(ev_start);
-        Mamba2Forward(
-            reinterpret_cast<__nv_bfloat16*>(d_q),
-            reinterpret_cast<__nv_bfloat16*>(d_k),
-            reinterpret_cast<__nv_bfloat16*>(d_v),
-            reinterpret_cast<__nv_bfloat16*>(d_o_solution),
-            d_a,
-            ATTN_B, ATTN_H, ATTN_N);
-        cudaEventRecord(ev_stop);
-        cudaEventSynchronize(ev_stop);
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, ev_start, ev_stop);
-        sol_total_ms += ms;
-        if (ms < sol_min_ms) sol_min_ms = ms;
-    }
-    float sol_avg_ms = sol_total_ms / TIMED;
-
-    printf("Ref time: %.4f ms (avg over %d trials, min: %.4f ms)\n", ref_avg_ms, TIMED, ref_min_ms);
-    printf("Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n", sol_avg_ms, TIMED, sol_min_ms);
-    printf("Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
-
-    cudaEventDestroy(ev_start);
-    cudaEventDestroy(ev_stop);
-    delete[] sol_bf;
-    delete[] sol_f;
-    cudaFree(d_o_solution);
+  }
+  if(std::sqrt(error2/(magnitude2+1e-30))>0.01) {fputs("Incorrect normalized RMS\n",stderr);return 1;}
 #endif
-
-    cudaFree(d_q);
-    cudaFree(d_k);
-    cudaFree(d_v);
-    cudaFree(d_o);
-    cudaFree(d_a);
-
-    delete[] q, k, v, o, o_ref;
-    delete[] q_bf, k_bf, v_bf, o_bf;
-    delete[] a, a_in;
-
-    return 0;
+  float rt=measure("Ref",reference);
+#ifdef KH_TEST_SOLUTION
+  float st=measure("Kernel",solution); printf("Speedup: %.6fx\n",rt/st);
+#endif
+  puts("Passed");
+  for(void* ptr:kh_buffers) KH_CHECK(cudaFree(ptr));
 }

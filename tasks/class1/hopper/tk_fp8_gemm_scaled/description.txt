@@ -1,43 +1,16 @@
-# Task: tk_fp8_gemm_scaled
+Implement a CUDA kernel for Hopper SM90 (H200).
 
-## Target Hardware
-NVIDIA Hopper GPU (SM90).
+Token/channel scaled FP8 GEMM. A E4M3 row-major [M,K], B E4M3 row-major [N,K], C fp32 row-major [M,N].
+A_scale fp32 [M], B_scale fp32 [N]. C[m,n] = A_scale[m]*B_scale[n]*sum_k float(A[m,k])*float(B[n,k]).
+Accumulate in fp32. The oracle uses the actual quantized operands and scales, not original unquantized inputs.
 
-
-FP8 (E4M3) General Matrix Multiply with per-row/per-column scaling on H100, matching ThunderKittens performance.
-
-## Function Signature
-
-Implement in solution.h:
-
-```cuda
-#pragma once
-#include <cuda_runtime.h>
-#include <cuda_fp8.h>
-
+Required public API:
 void Fp8GemmScaled(__nv_fp8_e4m3 *A, __nv_fp8_e4m3 *B, float *C, float *A_scale, float *B_scale, int M, int N, int K);
-```
 
-## Operation
+Default cases (label, M, N, K):
+run_benchmark<matmul_template<8>>("custom",atoi(argv[1]),atoi(argv[2]),atoi(argv[3]));
+run_benchmark<matmul_template<8>>("fp8_scaled_decode", 128, 8192, 8192);
+run_benchmark<matmul_template<8>>("fp8_scaled_prefill", 8192, 28672, 8192);
 
-C = diag(A_scale) * (A * B^T) * diag(B_scale)
-
-Where:
-- A is M×K (row-major, FP8 E4M3)
-- B is N×K (to be transposed, i.e. column-major, FP8 E4M3)
-- C is M×N (row-major, float)
-- A_scale is a float vector of length M (per-row scale for A)
-- B_scale is a float vector of length N (per-column scale for B)
-
-The FP8 inputs are pre-scaled: A_quantized = A_original / A_scale, B_quantized = B_original / B_scale.
-The kernel must dequantize by multiplying the raw FP8 dot product by the corresponding scales.
-
-## Build & Test
-
-```bash
-# Generate test data (no external data needed - self-contained)
-make test
-./test
-```
-
-Requires H100 GPU (SM90a). ThunderKittens headers on include path.
+The harness generates fractional random inputs, poisons output-only buffers, and rejects nonfinite results.
+Reference and solution use the same cold-L2 timing policy and per-case minimum; every reported case contributes to the geometric-mean speedup.

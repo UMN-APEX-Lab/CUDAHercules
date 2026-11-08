@@ -72,6 +72,7 @@ def load_task_def(task_dir: str) -> dict:
         "FUNCTION_SIGNATURE": getattr(module, "FUNCTION_SIGNATURE"),
         "SCALAR_ARGS": getattr(module, "SCALAR_ARGS", {}),
         "TOLERANCES": getattr(module, "TOLERANCES", {"atol": 1e-4, "rtol": 1e-4}),
+        "TIMING_STATISTIC": getattr(module, "TIMING_STATISTIC", "mean"),
         "HAS_CUDA_REFERENCE": getattr(module, "HAS_CUDA_REFERENCE", False),
         "REFERENCE_EXTRA_INCLUDES": getattr(module, "REFERENCE_EXTRA_INCLUDES", []),
         "REFERENCE_EXTRA_CUDA_FLAGS": getattr(module, "REFERENCE_EXTRA_CUDA_FLAGS", []),
@@ -255,14 +256,19 @@ def check_correctness(
     Returns:
         (all_correct, per_output_results)
     """
-    atol = tolerances.get("atol", 1e-4)
-    rtol = tolerances.get("rtol", 1e-4)
-
     per_output = {}
-    for (ref_name, ref_tensor), (sol_name, sol_tensor) in zip(ref_outputs, sol_outputs):
+    solutions = dict(sol_outputs)
+    for ref_name, ref_tensor in ref_outputs:
         name = ref_name
         if checked_outputs is not None and name not in checked_outputs:
             continue
+        if name not in solutions:
+            per_output[name] = {"correct": False, "error": "Missing output"}
+            continue
+        sol_tensor = solutions[name]
+        output_tol = tolerances.get("per_output", {}).get(name, tolerances)
+        atol = output_tol.get("atol", 1e-4)
+        rtol = output_tol.get("rtol", 1e-4)
 
         if ref_tensor.shape != sol_tensor.shape:
             per_output[name] = {
@@ -275,11 +281,24 @@ def check_correctness(
         ref_f = ref_tensor.float()
         sol_f = sol_tensor.float()
 
-        correct = torch.allclose(ref_f, sol_f, atol=atol, rtol=rtol)
+        # Matching infinities are meaningful for masked logits. NaNs never are.
+        invalid = torch.isnan(sol_f) | torch.isnan(ref_f) | torch.isposinf(sol_f) | torch.isposinf(ref_f)
+        correct = not bool(invalid.any()) and torch.allclose(ref_f, sol_f, atol=atol, rtol=rtol, equal_nan=False)
+        rms_limit = output_tol.get("max_normalized_rms", tolerances.get("max_normalized_rms"))
+        normalized_rms = None
+        if rms_limit is not None:
+            finite = torch.isfinite(ref_f)
+            error = (sol_f[finite] - ref_f[finite]).square().mean().sqrt()
+            magnitude = ref_f[finite].square().mean().sqrt().clamp_min(1e-12)
+            normalized_rms = (error / magnitude).item()
+            correct = correct and normalized_rms <= rms_limit
         info = {"correct": correct}
+        if normalized_rms is not None:
+            info["normalized_rms"] = normalized_rms
 
         if not correct:
             diff = (ref_f - sol_f).abs()
+            diff = torch.where(invalid, float("inf"), diff)
             info["max_diff"] = diff.max().item()
             info["mean_diff"] = diff.mean().item()
             # Find position of max diff
@@ -294,7 +313,11 @@ def check_correctness(
 
         per_output[name] = info
 
-    all_correct = all(v["correct"] if isinstance(v, dict) else v for v in per_output.values())
+    if checked_outputs:
+        for name in checked_outputs:
+            if name not in per_output:
+                per_output[name] = {"correct": False, "error": "Missing reference output"}
+    all_correct = bool(per_output) and all(v["correct"] for v in per_output.values())
     return all_correct, per_output
 
 
@@ -423,7 +446,7 @@ def eval_kernel(
         return result
 
     # --- Step 3: Check correctness against CUDA reference ---
-    tolerances = {"atol": atol, "rtol": rtol}
+    tolerances = {**task_def["TOLERANCES"], "atol": atol, "rtol": rtol}
 
     if verbose:
         print(f"[Eval] Checking correctness vs CUDA reference ({num_correct_trials} trials, atol={atol}, rtol={rtol})...")
@@ -456,6 +479,11 @@ def eval_kernel(
 
             # Run solution with timeout to catch infinite-loop kernels
             sol_outputs = task_def["get_outputs"](inputs)
+            for name, tensor in sol_outputs:
+                if tensor.is_floating_point() and (
+                    task_def["CHECKED_OUTPUTS"] is None or name in task_def["CHECKED_OUTPUTS"]
+                ):
+                    tensor.fill_(float("nan"))
             sol_args = _build_call_args(task_def, inputs, sol_outputs)
             old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
             signal.alarm(kernel_timeout_sec)
@@ -564,7 +592,13 @@ def eval_kernel(
                 signal.alarm(0)
                 signal.signal(signal.SIGALRM, old_handler)
 
-        if result.reference_time.mean_ms > 0:
-            result.speedup = result.reference_time.mean_ms / result.solution_time.mean_ms
+        statistic = task_def["TIMING_STATISTIC"]
+        if statistic not in ("mean", "min"):
+            raise ValueError(f"Unsupported timing statistic: {statistic}")
+        ref_ms = getattr(result.reference_time, f"{statistic}_ms")
+        sol_ms = getattr(result.solution_time, f"{statistic}_ms")
+        result.metadata["timing_statistic"] = statistic
+        if ref_ms > 0 and sol_ms > 0:
+            result.speedup = ref_ms / sol_ms
 
     return result

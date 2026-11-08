@@ -15,8 +15,8 @@ static constexpr int NUM_THREADS = (NUM_WORKERS*kittens::WARP_THREADS);
 
 using namespace kittens;
 
-struct based_globals { 
-    // shapes    
+struct based_globals {
+    // shapes
     static constexpr int dv = 64;
     static constexpr int fd = 16;
 
@@ -25,7 +25,7 @@ struct based_globals {
     using v_tile = st_bf<4*16, dv>;
     using o_tile = st_bf<4*16, dv>;
     using kv_a0_tile = sv_bf<dv>; // kv state
-    using kv_a1_tile = st_bf<dv, fd>; 
+    using kv_a1_tile = st_bf<dv, fd>;
     using kv_a2_tile = st_bf<dv, 4*fd>;
 
     // global layouts
@@ -73,7 +73,7 @@ __device__ void accumulate_a0(sv_fl<64> &a0_float, const ST &v) {
 // dst = torch.cat([src * src[:,starting_col+i].unsqueeze(0) for i in range(4)], dim=-1)
 __device__ static void mul_slice_row(rt_bf<1*16,4*16> &dst, const rt_bf<1*16,1*16> &src, const int starting_col) {
 
-    const int lane = kittens::laneid(); // 0...31    
+    const int lane = kittens::laneid(); // 0...31
     // each thread is responsible for two rows
     #pragma unroll
     for(int i = 0; i < 4; i++) {
@@ -96,7 +96,7 @@ __device__ static void mul_slice_row(rt_bf<1*16,4*16> &dst, const rt_bf<1*16,1*1
 // dst = torch.cat([src * src[:,starting_col].unsqueeze(-1) for _ in range(4)], dim=-1)
 __device__ static void mul_slice_col(rt_bf<16,64> &dst, const rt_bf<64,16,col_l> &src, const int target_row) {
 
-    const int lane = kittens::laneid(); // 0...31    
+    const int lane = kittens::laneid(); // 0...31
     // each thread is responsible for two cols
     kittens::warp::copy(dst, reinterpret_cast<const rt_bf<16,64>&>(src));
     #pragma unroll
@@ -120,8 +120,8 @@ void based_linear_attention(const __grid_constant__ based_globals g) {
     const int batch = blockIdx.y;
     const int head  = blockIdx.x;
 
-    int laneid = kittens::laneid(); 
-    int warpid = kittens::warpid(); 
+    int laneid = kittens::laneid();
+    int warpid = kittens::warpid();
     int tic = 0, toc = 1;
     int warpgroupid = warpid/kittens::WARPGROUP_WARPS;
 
@@ -178,7 +178,7 @@ void based_linear_attention(const __grid_constant__ based_globals g) {
         kittens::warp::wait(bar, tic);
 
         // we start by doing the very local computations. Then, we'll follow up later with the rest.
-        // note that local_attn rt shape is 1x4 since it's done by a warpgroup. 
+        // note that local_attn rt shape is 1x4 since it's done by a warpgroup.
         // even though you might think 4x4 since q_s x k_s is (4x1) x (1x4).
         warpgroup::mm_ABt(local_attn, q_s[tic], k_s[tic]); // clear registers -- note mm_ABt, not mma_ABt.
         if (warpid == 0 && block+1<n_blocks) { // go get the next QKV from HBM
@@ -235,7 +235,7 @@ void based_linear_attention(const __grid_constant__ based_globals g) {
         // temperature scaling; divide by d
         kittens::warp::mul(q_src, q_src, __float2bfloat16(0.25));
         warpgroup::mma_async_wait(); // tmp
-        
+
         warpgroup::mma_ABt(o, q_src, a1_trans_s); // incorporate a1 onto o (SA: FLAG WAS q_smem[tic] HERE)
         // a1 kv state
         warpgroup::mma_AtB(a1_trans, v_s_2[tic], k_s[tic]); // we now have 4 1x4 registers that need to eventually be summed.
@@ -245,7 +245,7 @@ void based_linear_attention(const __grid_constant__ based_globals g) {
         }
         warpgroup::mma_async_wait(); // tmp
         warpgroup::store(a1_trans_s, a1_trans);
-        kittens::warp::mul(q_src, q_src, __float2bfloat16(0.70710678118)); // divide by 2 for A2 here; the mul_slices 
+        kittens::warp::mul(q_src, q_src, __float2bfloat16(0.70710678118)); // divide by 2 for A2 here; the mul_slices
         rt_bf<64,16,col_l> k_src;
         kittens::warp::load(k_src, k_s[tic]);
 
@@ -258,7 +258,7 @@ void based_linear_attention(const __grid_constant__ based_globals g) {
             warpgroup::mma_AB(o, q, a2_s[t]); // incorporate a1 onto o
             warpgroup::mma_async_wait<1>(); // ding dong! o matmuls have now arrived, too.
             // Note: we originally have k_src_tmp and transpose it (line 283 above)
-            // this is becuase AtB function is only usable if A is in SMEM. 
+            // this is becuase AtB function is only usable if A is in SMEM.
             // but we'd like to keep k in register, so we just transpose it upfront
             mul_slice_col(k, k_src, t*4+warpid);
             warpgroup::mma_AB(a2[t], k, v_s[tic]); // incorporate KtV onto a2
@@ -301,7 +301,7 @@ based_globals based_init(
     int ATTN_B, int ATTN_H, int ATTN_N
 ) {
     // global pointers
-    int ATTN_D = 64; 
+    int ATTN_D = 64;
     int ATTN_D_SMALL = 16;
 
     using globals = based_globals;
@@ -311,7 +311,7 @@ based_globals based_init(
     using v_tile     = globals::v_tile;
     using o_tile     = globals::o_tile;
     using kv_a0_tile = globals::kv_a0_tile; // kv state
-    using kv_a1_tile = globals::kv_a1_tile; 
+    using kv_a1_tile = globals::kv_a1_tile;
     using kv_a2_tile = globals::kv_a2_tile;
 
     // global layouts
@@ -332,101 +332,11 @@ based_globals based_init(
     kv_a2_gl kv_a2{d_kv_a2, ATTN_B, ATTN_H, nullptr, nullptr};
 
     globals g{
-        q_arg, k_arg, v_arg, o_arg, 
+        q_arg, k_arg, v_arg, o_arg,
         kv_a0, kv_a1, kv_a2, ATTN_N
     };
     return g;
 }
 
 
-#ifdef TK_COMPILE_BASED
-#include "pyutils/torchutils.cuh"
-#include <ATen/Functions.h>
-#include <iostream>
-void dispatch_based( 
-    bf16 *d_q, bf16 *d_k, bf16 *d_v, bf16 *d_o,
-    bf16 *d_kv_a2, bf16 *d_kv_a1, bf16 *d_kv_a0,
-    int ATTN_B, int ATTN_H, int ATTN_N
-){
-    based_globals g = based_init(
-        d_q, d_k, d_v, d_o, 
-        d_kv_a2, d_kv_a1, d_kv_a0,
-        ATTN_B, ATTN_H, ATTN_N
-    );
-
-    // launch
-    unsigned long mem_size = 98000;
-    cudaDeviceSynchronize();
-    cudaFuncSetAttribute(
-        based_linear_attention,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        mem_size
-    );
-    dim3 grid(ATTN_H, ATTN_B);
-    based_linear_attention<<<grid,NUM_THREADS,mem_size>>>(g);
-    CHECK_CUDA_ERROR(cudaGetLastError());
-    cudaDeviceSynchronize();
-}
-
-std::tuple<at::Tensor, at::Tensor> based(
-    const at::Tensor q, 
-    const at::Tensor k,
-    const at::Tensor v
-) {
-    CHECK_INPUT(q);
-    CHECK_INPUT(k);
-    CHECK_INPUT(v);
-
-    int B = q.size(0);
-    int H = q.size(1);
-    int DV = v.size(3);
-    int N = q.size(2);
-    int FD = k.size(3);
-
-    // checks
-    TORCH_CHECK(k.size(0) == B, "k batch?");
-    TORCH_CHECK(k.size(1) == H, "k heads?");
-    TORCH_CHECK(k.size(2) == N, "k length?");
-
-    TORCH_CHECK(v.size(0) == B, "v batch?");
-    TORCH_CHECK(v.size(1) == H, "v heads?");
-    TORCH_CHECK(v.size(2) == N, "v length?");
-
-    // allocate output
-    at::Tensor out = at::empty({B, H, N, DV}, v.options());
-    at::Tensor kv_a0 = at::empty({B, H, 1,  DV}, v.options());
-    at::Tensor kv_a1 = at::empty({B, H, DV, FD}, v.options());
-    at::Tensor kv_a2 = at::empty({B, H, FD*FD, DV}, v.options());
-
-    // convert to bf16
-    c10::BFloat16 *q_bf16 = q.data_ptr<c10::BFloat16>();
-    c10::BFloat16 *k_bf16 = k.data_ptr<c10::BFloat16>();
-    c10::BFloat16 *v_bf16 = v.data_ptr<c10::BFloat16>();
-    
-    bf16 *d_q = reinterpret_cast<bf16*>(q_bf16);
-    bf16 *d_k = reinterpret_cast<bf16*>(k_bf16);
-    bf16 *d_v = reinterpret_cast<bf16*>(v_bf16);
-    bf16 *d_o = reinterpret_cast<bf16*>(out.data_ptr<c10::BFloat16>());
-    bf16 *d_kv_a0 = reinterpret_cast<bf16*>(kv_a0.data_ptr<c10::BFloat16>());
-    bf16 *d_kv_a1 = reinterpret_cast<bf16*>(kv_a1.data_ptr<c10::BFloat16>());
-    bf16 *d_kv_a2 = reinterpret_cast<bf16*>(kv_a2.data_ptr<c10::BFloat16>());
-
-    dispatch_based(
-        d_q, d_k, d_v, d_o, 
-        d_kv_a2, d_kv_a1, d_kv_a0, 
-        B, H, N
-    );
-
-    kv_a1 = kv_a1.transpose(2, 3);
-    at::Tensor kv_concat = at::cat({kv_a0, kv_a1, kv_a2}, /*dim=*/2);
-
-    CHECK_CUDA_ERROR(cudaGetLastError());
-    return std::make_tuple(out, kv_concat);
-    cudaDeviceSynchronize();
-}
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("based", based, "Based forward. Takes tensors (q, k, v). q, k, v are bf16 (B,H,N,64). Returns (B,H,N,64) in bf16.");
-}
-#else
 #include "harness.impl"
-#endif

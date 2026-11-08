@@ -41,7 +41,8 @@ __global__ void based_naive_causal_attention_kernel(
             dot += __bfloat162float(q_bh[n * BASED_D_QK + dk]) *
                    __bfloat162float(k_bh[m * BASED_D_QK + dk]);
         }
-        float score = dot / sqrtf((float)BASED_D_QK);
+        float x = dot / sqrtf((float)BASED_D_QK);
+        float score = 1.0f + x + 0.5f*x*x;
         acc += score * __bfloat162float(v_bh[m * BASED_D_VO + d]);
         score_sum += score;
     }

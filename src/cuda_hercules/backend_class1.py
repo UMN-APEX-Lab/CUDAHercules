@@ -22,7 +22,7 @@ import torch
 from .backend_base import Backend
 from .task_schema import TaskConfig
 from .result import PerfMetrics
-from .utils import get_project_root
+from .utils import get_project_root, task_source_hash
 
 UNSUPPORTED_ARCH_PREFIX = "UNSUPPORTED_ARCH:"
 
@@ -242,33 +242,45 @@ class Class1MakeBackend(Backend):
 
         # Check for cached reference benchmarks
         cached = _load_ref_benchmarks_c1().get(config.task_id, {})
+        if "/hopper/" in config.task_id and cached.get("source_hash") != task_source_hash(
+            os.path.join(get_project_root(), config.runner.workdir)
+        ):
+            cached = {}
         cached_per_size = cached.get("per_size", [])
 
         # Parse per-size blocks: "=== name ===", then Ref/Kernel/Speedup lines
-        size_pattern = re.compile(
-            r"===\s*(.+?)\s*===.*?"
-            r"Ref time:.*?min:\s*([\d.]+)\s*ms.*?"
-            r"Kernel time:.*?min:\s*([\d.]+)\s*ms.*?"
-            r"Speedup:\s*([\d.]+)x",
-            re.DOTALL,
-        )
-
         per_size = []
-        for i, m in enumerate(size_pattern.finditer(self._stdout)):
-            ref_min = float(m.group(2))
+        blocks = re.split(r"===\s*(.+?)\s*===", self._stdout)
+        incomplete_case = False
+        number = r"([0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?)"
+        for name, body in zip(blocks[1::2], blocks[2::2]):
+            # Timing order varies (DeepGEMM prints Kernel before Ref). Each
+            # case is parsed independently, so missing cases cannot be merged.
+            ref = re.search(r"Ref time:[^\n]*min:\s*" + number + r"\s*ms", body)
+            kernel = re.search(r"Kernel time:[^\n]*min:\s*" + number + r"\s*ms", body)
+            if not ref or not kernel:
+                incomplete_case = True
+                continue
+            i = len(per_size)
+            ref_min = float(ref.group(1))
             # Override ref time with cached benchmark if available
             if i < len(cached_per_size):
                 ref_min = cached_per_size[i]["ref_min_ms"]
 
-            kernel_min = float(m.group(3))
+            kernel_min = float(kernel.group(1))
             speedup = ref_min / kernel_min if kernel_min > 0 else 0.0
             entry = {
-                "name": m.group(1).strip(),
+                "name": name.strip(),
                 "ref_min_ms": ref_min,
                 "kernel_min_ms": kernel_min,
                 "speedup": speedup,
             }
             per_size.append(entry)
+
+        if len(blocks) > 1 and incomplete_case:
+            # A partial run must not receive a score from its surviving cases
+            # or the legacy parser's first matching pair of timing lines.
+            return PerfMetrics()
 
         metrics.per_size = per_size
 

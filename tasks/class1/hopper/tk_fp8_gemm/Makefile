@@ -6,10 +6,10 @@ ARCH     = -gencode arch=compute_90a,code=sm_90a
 LIBS     = -lcuda -lcudadevrt -lcudart_static -lrt -lpthread -ldl
 
 ref: fp8_h100_gemm.cu
-	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_HOPPER $< -o $@
+	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_HOPPER $< -o $@ -lcublas
 
 test: fp8_h100_gemm.cu solution.h
-	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_HOPPER -DKH_TEST_SOLUTION $< -o $@
+	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_HOPPER -DKH_TEST_SOLUTION $< -o $@ -lcublas
 
 clean:
 	rm -f ref test

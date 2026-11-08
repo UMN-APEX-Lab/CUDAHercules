@@ -1,35 +1,16 @@
-# Task: tk_bf16_gemm
+Implement a CUDA kernel for Hopper SM90 (H200).
 
-## Target Hardware
-NVIDIA Hopper GPU (SM90).
+BF16 GEMM with fp32 accumulation and BF16 output. A row-major [M,K], B row-major [K,N], C row-major [M,N].
+C=bf16(A@B). The output is checked with both a rounding-aware elementwise bound and normalized RMS error.
+Do not quantize BF16 inputs to FP8. All output elements must be written.
 
-
-BF16 General Matrix Multiply on H100, matching ThunderKittens performance.
-
-## Function Signature
-
-Implement in solution.h:
-
-```cuda
-#pragma once
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
-
+Required public API:
 void Bf16Gemm(__nv_bfloat16 *A, __nv_bfloat16 *B, __nv_bfloat16 *C, int M, int N, int K);
-```
 
-## Operation
+Default cases (label, M, N, K):
+run_benchmark<matmul_template<2,4,8>>("custom",atoi(argv[1]),atoi(argv[2]),atoi(argv[3]));
+run_benchmark<matmul_template<2,4,8>>("qwen_decode", 128, 5120, 5120);
+run_benchmark<matmul_template<2,4,8>>("qwen_prefill", 8192, 27648, 5120);
 
-C = A * B
-
-Where A is M×K, B is K×N, C is M×N. All row-major, BF16.
-
-## Build & Test
-
-```bash
-# Generate test data (no external data needed - self-contained)
-make test
-./test
-```
-
-Requires H100 GPU (SM90a). ThunderKittens headers on include path.
+The harness generates fractional random inputs, poisons output-only buffers, and rejects nonfinite results.
+Reference and solution use the same cold-L2 timing policy and per-case minimum; every reported case contributes to the geometric-mean speedup.

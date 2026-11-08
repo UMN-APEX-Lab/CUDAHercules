@@ -1,3 +1,6 @@
+#include <tuple>
+#include "hopper_validation.cuh"
+#include <cuda_bf16.h>
 /***************************************************************************************************
  * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -35,32 +38,32 @@
     This example implements a non-persistent warp-specialized GEMM kernel for the Hopper
     architecture with programmatic dependent launch (PDL) enabling prefetching weights into
     L2 cache.
-    
+
     For more information about dependent launch refer to the CUDA programming guide:
     https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization
 
-    In some cases, PDL can result in a window where a previous kernel is not actively utilizing 
+    In some cases, PDL can result in a window where a previous kernel is not actively utilizing
     DRAM, and the next kernel sits idle until the previous finishes. During this window, the next
     kernel can begin loading a non-dependent operand (i.e. weights in a linear projection are
     typically static) and cache it in L2.
 
     The kernel and collective mainloop assume operand `A` corresponds to weights and operand `B`
     corresponds to activations (so we can have very small batch/token count).
-    After initialization, the prefetch warp starts loading K tiles of `A` into an unused portion 
+    After initialization, the prefetch warp starts loading K tiles of `A` into an unused portion
     of shared memory, and loads up to half of all K tiles that the same CTA would eventually load.
-    The exact number of K tiles loaded is determined by `args.mainloop.prefetch_ratio` \in 
+    The exact number of K tiles loaded is determined by `args.mainloop.prefetch_ratio` \in
     [0.0, 1.0]. Smaller values result in less prefetching, and larger values result in more.
     Negative values result in a "best-effort" prefetch, meaning prefetcher will stop issuing weight
-    loads as soon as the activation DMA warp starts loading (as soon as it is signaled that the 
+    loads as soon as the activation DMA warp starts loading (as soon as it is signaled that the
     previous kernel has flushed its memory.)
 
     The DMA warp responsible for loading `A` will also begin loading K tiles until it fills up
     the available shared memory.
-    The DMA warp responsible for loading `B` will wait until activations are flushed to global 
+    The DMA warp responsible for loading `B` will wait until activations are flushed to global
     memory by the preceding kernel.
 
-    Another mainloop parameter, `args.mainloop.overlap_ratio` \in [0.0, 1.0] determines how early 
-    the next kernel (the one doing the prefetch) is launched. Smaller values result in greater 
+    Another mainloop parameter, `args.mainloop.overlap_ratio` \in [0.0, 1.0] determines how early
+    the next kernel (the one doing the prefetch) is launched. Smaller values result in greater
     overlap, and larger values result in smaller overlap. Negative values disable PDL completely,
     meaning there will be no overlap. This will make prefetch ineffective.
 
@@ -152,7 +155,7 @@ using         LayoutB     = cutlass::layout::ColumnMajor;                   // L
 constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;    // Memory access granularity/alignment of B matrix in units of elements (up to 16 bytes)
 
 // C matrix configuration
-using         ElementC    = cutlass::float_e4m3_t;                          // Element type for C and D matrix operands
+using         ElementC    = cutlass::bfloat16_t;                          // Element type for C and D matrix operands
 using         LayoutC     = cutlass::layout::ColumnMajor;                   // Layout type for C and D matrix operands
 constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
 
@@ -290,9 +293,27 @@ bool initialize_tensor(
     scope_min = -8;
   }
   cutlass::reference::host::TensorFillRandomUniform(
-    view, seed, scope_max, scope_min, 0);
+    view, seed, scope_max, scope_min, -1);
 
   return true;
+}
+
+cutlass::DeviceAllocation<float> activation_source;
+__global__ void init_activations(float* x,size_t count) {
+  size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(i<count) x[i]=2.0f*kh_random(i,9123);
+}
+__global__ void silu_predecessor(const float* x,ElementA* a,size_t count) {
+#if __CUDA_ARCH__ >= 900
+  // Permit the dependent reference to prefetch weights while SiLU runs.
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+  size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+  if(i<count) {float v=x[i];a[i]=ElementA(v/(1.0f+expf(-v)));}
+}
+void preprocess_activation() {
+  size_t count=activation_source.size();
+  silu_predecessor<<<(count+255)/256,256>>>(activation_source.get(),tensor_A.device_data(),count);
 }
 
 /// Initialize operands to be used in the GEMM and reference GEMM
@@ -308,6 +329,8 @@ void initialize(const Options &options) {
   auto b_coord = cutlass::make_Coord(options.k, options.n * options.l);
 
   tensor_A.resize(a_coord);
+  activation_source.reset(size_t(options.m)*options.k);
+  init_activations<<<(activation_source.size()+255)/256,256>>>(activation_source.get(),activation_source.size());
   tensor_B.resize(b_coord);
   tensor_C.resize(c_coord);
   tensor_D.resize(c_coord);
@@ -397,10 +420,15 @@ bool verify(const Options &options) {
 
 /// Run CUTLASS reference GEMM once with current tensors/options
 cudaError_t RunCutlassReference(Options &options) {
-  Gemm gemm;
+  auto key=std::make_tuple(options.m,options.n,options.k,options.alpha,options.beta,tensor_A.device_data(),tensor_B.device_data(),tensor_D.device_data());
+  static decltype(key) previous{};
+  static bool ready=false;
+  static Gemm gemm;
   auto arguments = args_from_options(options);
   size_t workspace_size = Gemm::get_workspace_size(arguments);
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+  static cutlass::device_memory::allocation<uint8_t> workspace;
+  if (!ready || key!=previous) {
+    workspace.reset(workspace_size);
 
   cutlass::Status status = gemm.can_implement(arguments);
   if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
@@ -408,7 +436,10 @@ cudaError_t RunCutlassReference(Options &options) {
   status = gemm.initialize(arguments, workspace.get());
   if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
 
-  status = gemm.run(nullptr, nullptr, /* launch_with_pdl = */ options.overlap_ratio >= 0);
+    previous=key;ready=true;
+  }
+  preprocess_activation();
+  cutlass::Status status = gemm.run(nullptr, nullptr, /* launch_with_pdl = */ options.overlap_ratio >= 0);
   if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
 
   return cudaSuccess;
@@ -435,6 +466,7 @@ cudaError_t TestCorrectness(Options &options) {
   cutlass::HostTensor<ElementD, LayoutD> tensor_sol_D;
   tensor_sol_D.resize(c_coord);
   tensor_sol_D.sync_device();
+  kh_poison(tensor_sol_D.device_data(), tensor_sol_D.capacity()*sizeof(ElementD));
 
   // The solution uses __nv_fp8_e4m3 / __nv_fp8_e5m2 raw pointers
   // A is row-major [M, K] (lda = K), B is col-major [K, N] (ldb = K), D is col-major [M, N] (ldd = M)
@@ -442,13 +474,14 @@ cudaError_t TestCorrectness(Options &options) {
   int ldb_sol = options.k;
   int ldd_sol = options.m;
 
+  preprocess_activation();
   cudaError_t sol_result = HopperGemmPrefetch(
     options.m, options.n, options.k,
     options.alpha,
     reinterpret_cast<__nv_fp8_e4m3 const*>(tensor_A.device_data()), lda_sol,
     reinterpret_cast<__nv_fp8_e5m2 const*>(tensor_B.device_data()), ldb_sol,
     options.beta,
-    reinterpret_cast<__nv_fp8_e4m3*>(tensor_sol_D.device_data()), ldd_sol);
+    reinterpret_cast<__nv_bfloat16*>(tensor_sol_D.device_data()), ldd_sol);
 
   if (sol_result != cudaSuccess) {
     std::cerr << "Solution kernel failed: " << cudaGetErrorString(sol_result) << std::endl;
@@ -466,7 +499,7 @@ cudaError_t TestCorrectness(Options &options) {
   for (int i = 0; i < total; ++i) {
     float ref_val = float(tensor_D.host_data()[i]);
     float sol_val = float(tensor_sol_D.host_data()[i]);
-    max_diff = std::fmax(max_diff, std::fabs(sol_val - ref_val));
+    max_diff = std::fmax(max_diff, kh_abs(sol_val - ref_val));
   }
   // FP8 E4M3 has limited precision
   if (max_diff > 1.0f) {
@@ -495,6 +528,7 @@ void Profile(Options &options, int iterations) {
   // Profile reference
   float ref_total_ms = 0, ref_min_ms = 1e30f;
   for (int iter = 0; iter < iterations; ++iter) {
+    kh_cold_l2();
     cudaEventRecord(start);
     RunCutlassReference(options);
     cudaEventRecord(stop);
@@ -512,26 +546,28 @@ void Profile(Options &options, int iterations) {
   int total_D = options.m * options.n;
 
   // Save reference output for correctness check
-  __nv_fp8_e4m3 *D_ref_saved;
-  cudaMalloc(&D_ref_saved, total_D * sizeof(__nv_fp8_e4m3));
-  cudaMemcpy(D_ref_saved, tensor_D.device_data(), total_D * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToDevice);
+  __nv_bfloat16 *D_ref_saved;
+  cudaMalloc(&D_ref_saved, total_D * sizeof(__nv_bfloat16));
+  cudaMemcpy(D_ref_saved, tensor_D.device_data(), total_D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
+  kh_poison(tensor_D.device_data(), total_D * sizeof(__nv_bfloat16));
 
   // Run solution once for correctness check
+  preprocess_activation();
   HopperGemmPrefetch(options.m, options.n, options.k, options.alpha,
     reinterpret_cast<__nv_fp8_e4m3 const*>(tensor_A.device_data()), lda_sol,
     reinterpret_cast<__nv_fp8_e5m2 const*>(tensor_B.device_data()), ldb_sol,
     options.beta,
-    reinterpret_cast<__nv_fp8_e4m3*>(tensor_D.device_data()), ldd_sol);
+    reinterpret_cast<__nv_bfloat16*>(tensor_D.device_data()), ldd_sol);
   cudaDeviceSynchronize();
 
   {
-    std::vector<__nv_fp8_e4m3> h_sol(total_D), h_ref(total_D);
-    cudaMemcpy(h_sol.data(), tensor_D.device_data(), total_D * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ref.data(), D_ref_saved, total_D * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+    std::vector<__nv_bfloat16> h_sol(total_D), h_ref(total_D);
+    cudaMemcpy(h_sol.data(), tensor_D.device_data(), total_D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_ref.data(), D_ref_saved, total_D * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
     cudaFree(D_ref_saved);
     float max_diff = 0;
     for (int i = 0; i < total_D; ++i)
-      max_diff = std::fmax(max_diff, std::fabs(float(h_sol[i]) - float(h_ref[i])));
+      max_diff = std::fmax(max_diff, kh_abs(float(h_sol[i]) - float(h_ref[i])));
     if (max_diff > 1.0f) {
       fprintf(stderr, "Solution incorrect in Profile: max_diff=%.6f\n", max_diff);
       std::cout << "Incorrect" << std::endl;
@@ -542,23 +578,26 @@ void Profile(Options &options, int iterations) {
 
   // Warmup solution
   for (int i = 0; i < 3; i++) {
-    HopperGemmPrefetch(options.m, options.n, options.k, options.alpha,
+    preprocess_activation();
+  HopperGemmPrefetch(options.m, options.n, options.k, options.alpha,
       reinterpret_cast<__nv_fp8_e4m3 const*>(tensor_A.device_data()), lda_sol,
       reinterpret_cast<__nv_fp8_e5m2 const*>(tensor_B.device_data()), ldb_sol,
       options.beta,
-      reinterpret_cast<__nv_fp8_e4m3*>(tensor_D.device_data()), ldd_sol);
+      reinterpret_cast<__nv_bfloat16*>(tensor_D.device_data()), ldd_sol);
   }
   cudaDeviceSynchronize();
 
   // Profile solution
   float sol_total_ms = 0, sol_min_ms = 1e30f;
   for (int iter = 0; iter < iterations; ++iter) {
+    kh_cold_l2();
     cudaEventRecord(start);
-    HopperGemmPrefetch(options.m, options.n, options.k, options.alpha,
+    preprocess_activation();
+  HopperGemmPrefetch(options.m, options.n, options.k, options.alpha,
       reinterpret_cast<__nv_fp8_e4m3 const*>(tensor_A.device_data()), lda_sol,
       reinterpret_cast<__nv_fp8_e5m2 const*>(tensor_B.device_data()), ldb_sol,
       options.beta,
-      reinterpret_cast<__nv_fp8_e4m3*>(tensor_D.device_data()), ldd_sol);
+      reinterpret_cast<__nv_bfloat16*>(tensor_D.device_data()), ldd_sol);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     float ms;
@@ -629,9 +668,9 @@ int main(int argc, char const **args) {
     configs.push_back({"custom", options.m, options.n, options.k});
   } else {
     configs = {
-      {"small",   1024, 1024, 1024},
-      {"medium",  4096, 4096, 4096},
-      {"large",   8192, 8192, 8192},
+      {"decode_16",16,8192,8192},
+      {"decode_64",64,28672,8192},
+      {"decode_128",128,8192,28672},
     };
   }
 

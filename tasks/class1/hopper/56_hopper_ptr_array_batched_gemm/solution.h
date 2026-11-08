@@ -21,7 +21,7 @@ __global__ void naive_batched_gemm_kernel(
       float b_val = __half2float(B[k + j * ldb]);
       acc += a_val * b_val;
     }
-    float d_val = alpha * acc + beta * __half2float(D[i + j * ldd]);
+    float d_val = alpha * acc + (beta == 0 ? 0.0f : beta * __half2float(D[i + j * ldd]));
     D[i + j * ldd] = __float2half(d_val);
   }
 }

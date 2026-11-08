@@ -1,6 +1,7 @@
 #pragma once
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <cmath>
 
 // Naive MQA logits kernel.
 // Each thread handles one (q, kv) output position.
@@ -24,7 +25,7 @@ __global__ void naive_mqa_logits_kernel(
     int k_end   = ke[q_idx];
 
     if (kv_idx < k_start || kv_idx >= k_end) {
-        logits[q_idx * seq_len_kv + kv_idx] = -__FLT_MAX__;
+        logits[q_idx * seq_len_kv + kv_idx] = -INFINITY;
         return;
     }
 

@@ -6,10 +6,10 @@
 #include "solution.h"
 #endif
 
-#define ATTN_B 32
-#define ATTN_N 2048
-#define ATTN_H 16 // launches
-#define ATTN_D 64 // make sure to change in the kernel rotary.cu as well
+#define ATTN_B 1
+#define ATTN_N 16384
+#define ATTN_H 72 // launches
+#define ATTN_D 128 // make sure to change in the kernel rotary.cu as well
 using rope_t = rotary_template<ATTN_D>;
 
 const int ATTN_D_2 = ATTN_D / 2;
@@ -61,11 +61,11 @@ void launch_tk_rotary(bf16 *d_o, bf16 *d_x, bf16 *d_sin_in, bf16 *d_cos_in) {
     );
 
     constexpr int BATCHES_PER_BLOCK = 4;
-    rope_t::layout::seq_global Og{d_o, ATTN_B, ATTN_H, ATTN_N, nullptr};
-    rope_t::layout::seq_global Xg{d_x, ATTN_B, ATTN_H, ATTN_N, nullptr};
-    rope_t::layout::rope_global SINg{d_sin_in, nullptr, nullptr, ATTN_N, nullptr};
-    rope_t::layout::rope_global COSg{d_cos_in, nullptr, nullptr, ATTN_N, nullptr};
-    rope_t::layout::globals g{Og, Xg, SINg, COSg, BATCHES_PER_BLOCK};
+    static rope_t::layout::seq_global Og{d_o, ATTN_B, ATTN_H, ATTN_N, nullptr};
+    static rope_t::layout::seq_global Xg{d_x, ATTN_B, ATTN_H, ATTN_N, nullptr};
+    static rope_t::layout::rope_global SINg{d_sin_in, nullptr, nullptr, ATTN_N, nullptr};
+    static rope_t::layout::rope_global COSg{d_cos_in, nullptr, nullptr, ATTN_N, nullptr};
+    static rope_t::layout::globals g{Og, Xg, SINg, COSg, BATCHES_PER_BLOCK};
 
     constexpr int ROWS_PER_BLOCK = rope_t::NUM_CONSUMER_WARPS * rope_t::layout::seq_tile::rows;
     dim3 grid((ATTN_N+ROWS_PER_BLOCK-1)/ROWS_PER_BLOCK, (ATTN_B+BATCHES_PER_BLOCK-1)/BATCHES_PER_BLOCK);
@@ -136,7 +136,7 @@ int main(int argc, char **argv) {
         for(int pos = 0; pos < ATTN_N; pos++) {
             for(int d = 0; d < ATTN_D_2; d++) {
                 float freq = 1.0f / powf(base, (float)(2 * d) / (float)ATTN_D);
-                float angle = pos * freq;
+                float angle = (pos + 8192) * freq;
                 cos_in[pos * ATTN_D_2 + d] = cosf(angle);
                 sin_in[pos * ATTN_D_2 + d] = sinf(angle);
             }
@@ -145,7 +145,7 @@ int main(int argc, char **argv) {
 
     // set the inputs
     for(int i = 0; i < TOTAL_ELEMENTS_X; i++) {
-        x_bf[i] = __float2bfloat16(x[i % TOTAL_UNIQUE_ELEMENTS_X]);
+        x_bf[i] = __float2bfloat16(kh_random(i,42));
         // if (i < 5) { std::cout << x[i % TOTAL_UNIQUE_ELEMENTS_X] << std::endl; }
     }
     for(int i = 0; i < TOTAL_ELEMENTS_COS_IN; i++) {
@@ -179,14 +179,60 @@ int main(int argc, char **argv) {
     cudaMemcpy(o_bf, d_o, TOTAL_ELEMENTS_O * sizeof(bf16), cudaMemcpyDeviceToHost);
     for(int i = 0; i < TOTAL_ELEMENTS_O; i++) { o[i] = __bfloat162float(o_bf[i]); }
 
+    // Independent split-half RoPE oracle, with independent batch/head inputs.
+    for(int sample=0;sample<4096;++sample) {
+      size_t idx=kh_hash(sample+7771u)%TOTAL_ELEMENTS_X;
+      int d=idx%ATTN_D,n=(idx/ATTN_D)%ATTN_N,offset=d%ATTN_D_2;
+      size_t mate=d<ATTN_D_2?idx+ATTN_D_2:idx-ATTN_D_2;
+      float co=float(cos_in_bf[n*ATTN_D_2+offset]),si=float(sin_in_bf[n*ATTN_D_2+offset]);
+      float expected=float(x_bf[idx])*co+(d<ATTN_D_2?-1.0f:1.0f)*float(x_bf[mate])*si;
+      expected=float(__float2bfloat16(expected));
+      if(!std::isfinite(o[idx])||std::abs(o[idx]-expected)>0.008f) {
+        fprintf(stderr,"RoPE oracle mismatch at %zu: got %g expected %g\n",idx,o[idx],expected);return 1;
+      }
+    }
     // Calculate efficiency
     long long f = flops(ATTN_B, ATTN_N, ATTN_D, ATTN_H);
     std::cout << "FLOPS: " << f << std::endl;
 
+    printf("\n=== rotary: B=%d, H=%d, N=%d, D=%d ===\n",ATTN_B,ATTN_H,ATTN_N,ATTN_D);
+    // CUDA event timing
+    const int WARMUP = 3;
+    const int TIMED = 10;
+    cudaEvent_t ev_start, ev_stop;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+
+    // --- Time TK reference kernel ---
+    for (int i = 0; i < WARMUP; i++) {
+        launch_tk_rotary(d_o, d_x, d_sin_in, d_cos_in);
+    }
+    cudaDeviceSynchronize();
+
+    float ref_total_ms = 0.0f;
+    float ref_min_ms = 1e9f;
+    for (int i = 0; i < TIMED; i++) {
+        kh_cold_l2();
+        cudaEventRecord(ev_start);
+        launch_tk_rotary(d_o, d_x, d_sin_in, d_cos_in);
+        cudaEventRecord(ev_stop);
+        cudaEventSynchronize(ev_stop);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, ev_start, ev_stop);
+        ref_total_ms += ms;
+        if (ms < ref_min_ms) ref_min_ms = ms;
+    }
+    float ref_avg_ms = ref_total_ms / TIMED;
+
+    printf("Ref time: %.6f ms (avg over %d trials, min: %.6f ms)\n",ref_avg_ms,TIMED,ref_min_ms);
+#ifndef KH_TEST_SOLUTION
+    puts("Passed");
+#endif
 #ifdef KH_TEST_SOLUTION
     // --- Solution testing block ---
     bf16 *d_o_solution;
     cudaMalloc(&d_o_solution, TOTAL_ELEMENTS_O * sizeof(bf16));
+    kh_poison(d_o_solution,TOTAL_ELEMENTS_O*sizeof(bf16));
 
     // Run solution kernel
     FusedRotary(
@@ -206,14 +252,16 @@ int main(int argc, char **argv) {
         sol_f[i] = __bfloat162float(sol_bf[i]);
     }
 
-    printf("\n=== rotary: B=%d, H=%d, N=%d, D=%d ===\n", ATTN_B, ATTN_H, ATTN_N, ATTN_D);
+
     bool sol_correct = true;
     int sol_diff_counter = 0;
     float sol_max_diff = 0.0f;
-    constexpr float TOLERANCE = 0.1f;
+    constexpr float TOLERANCE = 0.024f;
+    double sum_error2=0,sum_ref2=0;
 
     for (int i = 0; i < TOTAL_ELEMENTS_O; i++) {
         float diff = fabsf(sol_f[i] - o[i]);
+        sum_error2+=double(diff)*diff;sum_ref2+=double(o[i])*o[i];
         if (isnan(diff) || isinf(sol_f[i]) || diff > TOLERANCE) {
             sol_correct = false;
             sol_diff_counter++;
@@ -221,6 +269,7 @@ int main(int argc, char **argv) {
         sol_max_diff = fmaxf(sol_max_diff, diff);
     }
 
+    sol_correct &= sqrt(sum_error2/(sum_ref2+1e-30))<0.004;
     if (sol_correct) {
         printf("Passed\n");
     } else {
@@ -228,33 +277,6 @@ int main(int argc, char **argv) {
         printf("Incorrect\n");
         return -1;
     }
-
-    // CUDA event timing
-    const int WARMUP = 3;
-    const int TIMED = 10;
-    cudaEvent_t ev_start, ev_stop;
-    cudaEventCreate(&ev_start);
-    cudaEventCreate(&ev_stop);
-
-    // --- Time TK reference kernel ---
-    for (int i = 0; i < WARMUP; i++) {
-        launch_tk_rotary(d_o, d_x, d_sin_in, d_cos_in);
-    }
-    cudaDeviceSynchronize();
-
-    float ref_total_ms = 0.0f;
-    float ref_min_ms = 1e9f;
-    for (int i = 0; i < TIMED; i++) {
-        cudaEventRecord(ev_start);
-        launch_tk_rotary(d_o, d_x, d_sin_in, d_cos_in);
-        cudaEventRecord(ev_stop);
-        cudaEventSynchronize(ev_stop);
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, ev_start, ev_stop);
-        ref_total_ms += ms;
-        if (ms < ref_min_ms) ref_min_ms = ms;
-    }
-    float ref_avg_ms = ref_total_ms / TIMED;
 
     // --- Time solution kernel ---
     for (int i = 0; i < WARMUP; i++) {
@@ -270,6 +292,7 @@ int main(int argc, char **argv) {
     float sol_total_ms = 0.0f;
     float sol_min_ms = 1e9f;
     for (int i = 0; i < TIMED; i++) {
+        kh_cold_l2();
         cudaEventRecord(ev_start);
         FusedRotary(
             reinterpret_cast<__nv_bfloat16*>(d_o_solution),
@@ -286,17 +309,16 @@ int main(int argc, char **argv) {
     }
     float sol_avg_ms = sol_total_ms / TIMED;
 
-    printf("Ref time: %.4f ms (avg over %d trials, min: %.4f ms)\n", ref_avg_ms, TIMED, ref_min_ms);
+
     printf("Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n", sol_avg_ms, TIMED, sol_min_ms);
     printf("Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
 
-    cudaEventDestroy(ev_start);
-    cudaEventDestroy(ev_stop);
     delete[] sol_bf;
     delete[] sol_f;
     cudaFree(d_o_solution);
 #endif
 
+    cudaEventDestroy(ev_start);cudaEventDestroy(ev_stop);
     cudaFree(d_x);
     cudaFree(d_sin_in);
     cudaFree(d_cos_in);

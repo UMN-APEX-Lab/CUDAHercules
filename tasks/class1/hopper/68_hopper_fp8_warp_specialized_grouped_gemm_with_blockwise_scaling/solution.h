@@ -1,6 +1,7 @@
 #pragma once
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
+#include <cuda_bf16.h>
 
 // Naive FP8 blockwise scaling grouped GEMM kernel
 // Processes one problem at a time. A row-major, B col-major, D col-major.
@@ -10,7 +11,7 @@ __global__ void naive_fp8_blockwise_grouped_gemm_kernel(
     float const *scale_A,
     __nv_fp8_e4m3 const *B, int ldb,
     float const *scale_B,
-    __nv_fp8_e4m3 *D, int ldd,
+    __nv_bfloat16 *D, int ldd,
     int block_size) {
   int i = threadIdx.x + blockIdx.x * blockDim.x;
   int j = threadIdx.y + blockIdx.y * blockDim.y;
@@ -21,8 +22,8 @@ __global__ void naive_fp8_blockwise_grouped_gemm_kernel(
       int k_start = kb * block_size;
       int k_end = k_start + block_size;
       if (k_end > K) k_end = K;
-      float sa = scale_A[i * num_blocks + kb];
-      float sb = scale_B[j * num_blocks + kb];
+      float sa = scale_A[i + kb * M];
+      float sb = scale_B[j/128 + kb*((N+127)/128)];
       float block_acc = 0.0f;
       for (int k = k_start; k < k_end; ++k) {
         block_acc += float(A[i * lda + k]) * float(B[k + j * ldb]);
@@ -30,7 +31,7 @@ __global__ void naive_fp8_blockwise_grouped_gemm_kernel(
       acc += sa * sb * block_acc;
     }
     // D col-major: D[i + j * ldd]
-    D[i + j * ldd] = __nv_fp8_e4m3(alpha * acc);
+    D[i + j * ldd] = __float2bfloat16(alpha * acc);
   }
 }
 
@@ -43,14 +44,14 @@ __global__ void dispatch_grouped_gemm(
     float const **scale_A_ptrs,
     __nv_fp8_e4m3 const **B_ptrs, int const *ldbs,
     float const **scale_B_ptrs,
-    __nv_fp8_e4m3 **D_ptrs, int const *ldds,
+    __nv_bfloat16 **D_ptrs, int const *ldds,
     int block_size,
     int problem_idx) {
   int M = Ms[problem_idx], N = Ns[problem_idx], K = Ks[problem_idx];
   int lda = ldas[problem_idx], ldb = ldbs[problem_idx], ldd = ldds[problem_idx];
   __nv_fp8_e4m3 const *A = A_ptrs[problem_idx];
   __nv_fp8_e4m3 const *B = B_ptrs[problem_idx];
-  __nv_fp8_e4m3 *D = D_ptrs[problem_idx];
+  __nv_bfloat16 *D = D_ptrs[problem_idx];
   float const *sA = scale_A_ptrs[problem_idx];
   float const *sB = scale_B_ptrs[problem_idx];
 
@@ -63,15 +64,15 @@ __global__ void dispatch_grouped_gemm(
       int k_start = kb * block_size;
       int k_end = k_start + block_size;
       if (k_end > K) k_end = K;
-      float sa = sA[i * num_blocks + kb];
-      float sb = sB[j * num_blocks + kb];
+      float sa = sA[i + kb*M];
+      float sb = sB[j/128 + kb*((N+127)/128)];
       float block_acc = 0.0f;
       for (int k = k_start; k < k_end; ++k) {
         block_acc += float(A[i * lda + k]) * float(B[k + j * ldb]);
       }
       acc += sa * sb * block_acc;
     }
-    D[i + j * ldd] = __nv_fp8_e4m3(alpha * acc);
+    D[i + j * ldd] = __float2bfloat16(alpha * acc);
   }
 }
 
@@ -83,7 +84,7 @@ cudaError_t HopperFp8BlockwiseGroupedGemm(
     float const **scale_A_ptrs,
     __nv_fp8_e4m3 const **B_ptrs, int const *ldbs,
     float const **scale_B_ptrs,
-    __nv_fp8_e4m3 **D_ptrs, int const *ldds,
+    __nv_bfloat16 **D_ptrs, int const *ldds,
     int block_size) {
   // Read problem sizes from device
   std::vector<int> h_Ms(problem_count), h_Ns(problem_count);

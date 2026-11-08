@@ -35,8 +35,8 @@ major, minor = out.strip().split('.')
 print(int(major)*10 + int(minor))
 ")
 echo "  SM: $SM"
-if [ "$SM" -lt 90 ]; then
-    echo "ERROR: Hopper tasks require SM >= 90, got SM $SM"
+if [ "$SM" -ne 90 ]; then
+    echo "ERROR: Hopper sm_90a tasks require SM 90, got SM $SM"
     exit 1
 fi
 

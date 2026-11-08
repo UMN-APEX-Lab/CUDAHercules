@@ -368,7 +368,7 @@ def compile_cuda_module(
     if extra_cuda_cflags:
         default_cuda_cflags.extend(extra_cuda_cflags)
 
-    default_cflags = ["-O3", "-std=c++17"]
+    default_cflags = ["-O3", "-std=c++20"]
     if extra_cflags:
         default_cflags.extend(extra_cflags)
 

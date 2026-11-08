@@ -8,8 +8,8 @@ LIBS     = -lcuda -lcudadevrt -lcudart_static -lrt -lpthread -ldl
 ref: mamba2.cu harness.impl
 	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_HOPPER $< -o $@
 
-test: mamba2.cu harness.impl solution.h
-	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_HOPPER -DKH_TEST_SOLUTION $< -o $@
+test: solution_wrapper.cu solution_api.h mamba2.cu harness.impl solution.h
+	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_HOPPER -DKH_TEST_SOLUTION mamba2.cu solution_wrapper.cu -o $@
 
 clean:
 	rm -f ref test

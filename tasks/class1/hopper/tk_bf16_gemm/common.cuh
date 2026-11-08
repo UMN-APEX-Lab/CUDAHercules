@@ -1,3 +1,4 @@
+#include "hopper_gemm_oracle.cuh"
 #pragma once
 
 #include <iostream>
@@ -92,9 +93,7 @@ __global__ void reference_gemm_kernel(OutputT* D, InputT const* A, InputT const*
 
 template <typename InputT, typename OutputT, bool transpose_b = true>
 static inline void reference_gemm(OutputT* D, InputT const* A, InputT const* B, int M, int N, int K) {
-    dim3 block(16, 16);
-    dim3 grid((N + 15) / 16, (M + 15) / 16);
-    reference_gemm_kernel<InputT, OutputT, transpose_b><<<grid, block>>>(D, A, B, M, N, K);
+    kh_gemm_oracle<InputT, OutputT, transpose_b>(D,A,B,M,N,K);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////

@@ -1,38 +1,30 @@
-# Task: fa3_bwd_hdim96_fp16_causal
+Implement Hopper SM90 bwd attention, float16, head dimension 96.
+Q: contiguous [1, 16, 4096, 96]; K,V: contiguous [1, 16, 4096, 96].
+Query head h uses KV head floor(h / (16//16)). O has Q's shape/dtype.
+Compute P = softmax(Q K^T / sqrt(96)), O = P V; right-aligned causal: key j is visible iff j <= i + Sk - Sq.
+LSE is fp32 natural-log sum-exp, shape [B,H,Sq], not log2.
+Reference and solution use cold L2 and the minimum of identical timing trials.
+Accumulate dot products and softmax in fp32. Do not quantize inputs to FP8.
+Given O (rounded to float16), dO and natural-log LSE, compute dQ,dK,dV.
+Use delta = sum(dO * O) per row; dS = P * (dO V^T - delta).
+dQ = scale*dS*K; dK = scale*dS^T*Q; dV = P^T*dO.
+Scratch dsoftmax_sum is [B,H,round_up(Sq,64)] fp32 and dq_accum is
+[B,H,round_up(Sq,64),D] fp32. Scratch contents on entry are unspecified;
+only the three gradients are checked. All gradient elements must be written.
 
-## Target Hardware
-NVIDIA Hopper GPU (SM90).
-
-## Description
-
-Implement a CUDA kernel for Flash Attention 3 backward pass (Hopper SM90).
-
-Given forward outputs (O, lse) and upstream gradient dO, compute:
-  dQ, dK, dV — gradients of Q, K, V
-
-scale = 1/sqrt(D) = 0.102062
-Causal masking enabled.
-
-Only dQ, dK, dV are checked. dsoftmax_sum ([B, H, Sq] fp32) and dq_accum
-([B, H, Sq, D] fp32) are scratch workspaces you may use however you like
-(or ignore); their contents on entry are unspecified and are not checked.
-
-
-## Function Signature
-
-```c
+Required entry point:
 void launch_fa3_bwd(
-    const void* Q,          // [B, H, Sq, D] fp16
-    const void* K,          // [B, H, Sk, D] fp16
-    const void* V,          // [B, H, Sk, D] fp16
-    const void* O,          // [B, H, Sq, D] fp16
-    const void* dO,         // [B, H, Sq, D] fp16
-    void* dQ,               // [B, H, Sq, D] fp16
-    void* dK,               // [B, H, Sk, D] fp16
-    void* dV,               // [B, H, Sk, D] fp16
-    const float* lse,       // [B, H, Sq]
-    float* dsoftmax_sum,    // [B, H, Sq] fp32 scratch workspace (not checked)
-    float* dq_accum,        // [B, H, Sq, D] fp32 scratch workspace (not checked)
+    const void* Q,
+    const void* K,
+    const void* V,
+    const void* O,
+    const void* dO,
+    void* dQ,
+    void* dK,
+    void* dV,
+    const float* lse,
+    float* dsoftmax_sum,
+    float* dq_accum,
     int B,
     int H,
     int Sq,
@@ -41,5 +33,3 @@ void launch_fa3_bwd(
     float scale,
     cudaStream_t stream
 );
-
-```

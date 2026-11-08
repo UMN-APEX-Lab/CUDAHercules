@@ -1,51 +1,16 @@
-# Task: tk_hedgehog
+Implement a CUDA kernel for Hopper SM90 (H200).
 
-## Target Hardware
-NVIDIA Hopper GPU (SM90).
+Hedgehog hybrid normalized attention, BF16 Q,K,V,O[B=8,H=32,N=8192,128].
+Q_map,K_map are BF16 [H,128,64]. phi(x,map)=concat(softmax(x@map),softmax(-(x@map))).
+For query i, window keys are max(0,64*floor(i/64)-64)..i (previous and current 64-token blocks).
+Window weights = beta[h]*exp(dot(Q_i,K_j)/sqrt(128)-max_window_logit_i).
+For older keys use alpha[h]*dot(phi(Q_i,Q_map),phi(K_j,K_map)); alpha/beta are positive fp32 [H].
+Normalize by the sum of all window and linear weights (+1e-6), multiply V and round O to BF16.
+Accumulate in fp32. The reference uses BF16 tensor-core intermediates; the published tolerance accounts for their rounding.
 
+Required public API:
+void HedgehogAttention(__nv_bfloat16* Q,__nv_bfloat16* K,__nv_bfloat16* V,__nv_bfloat16* O,
+    __nv_bfloat16* Q_map,__nv_bfloat16* K_map,float* alphas,float* betas,int B,int H,int N);
 
-Hedgehog Attention on H100, matching ThunderKittens performance.
-
-Hybrid attention combining sliding window (softmax) + linear attention with learned feature maps.
-D=128 (head dim), hardcoded.
-
-## Function Signature
-
-Implement in solution.h:
-
-```cuda
-#pragma once
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
-
-void HedgehogAttention(
-    __nv_bfloat16 *Q, __nv_bfloat16 *K, __nv_bfloat16 *V, __nv_bfloat16 *O,
-    __nv_bfloat16 *Q_map, __nv_bfloat16 *K_map,
-    float *alphas, float *betas,
-    int B, int H, int N);
-```
-
-## Operation
-
-For each position, combines:
-1. Sliding window attention: standard softmax attention on recent context (weighted by betas)
-2. Linear attention: uses learned feature maps Q_map/K_map with KV state (weighted by alphas)
-
-Where:
-- Q, K, V: [B, H, N, 128] bf16
-- O: [B, H, N, 128] bf16 output
-- Q_map: [H, 128, 64] bf16 learned query feature map
-- K_map: [H, 128, 64] bf16 learned key feature map
-- alphas: [H] float, linear attention weight per head
-- betas: [H] float, sliding window weight per head
-
-## Build & Test
-
-```bash
-conda activate attn
-python gentests.py randn
-make test
-./test randn.txt
-```
-
-Requires H100 GPU (SM90a). ThunderKittens headers on include path.
+The harness generates fractional random inputs, poisons output-only buffers, and rejects nonfinite results.
+Reference and solution use the same cold-L2 timing policy and per-case minimum; every reported case contributes to the geometric-mean speedup.

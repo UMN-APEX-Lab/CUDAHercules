@@ -1,3 +1,6 @@
+#include "hopper_validation.cuh"
+#include "hopper_block_scaled_oracle.cuh"
+#include <cuda_bf16.h>
 /***************************************************************************************************
  * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -120,7 +123,7 @@ using         LayoutB     = cutlass::layout::ColumnMajor;                   // L
 constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;    // Memory access granularity/alignment of B matrix in units of elements (up to 16 bytes)
 
 // C matrix configuration
-using         ElementC    = cutlass::float_e4m3_t;                          // Element type for C and D matrix operands
+using         ElementC    = cutlass::bfloat16_t;                          // Element type for C and D matrix operands
 using         LayoutC     = cutlass::layout::ColumnMajor;                   // Layout type for C and D matrix operands
 constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
 
@@ -250,7 +253,7 @@ cutlass::DeviceAllocation<ElementAccumulator*> beta_device;
 cutlass::DeviceAllocation<ElementAccumulator> block_alpha;
 cutlass::DeviceAllocation<ElementAccumulator> block_beta;
 
-#endif // defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED) && defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED) 
+#endif // defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED) && defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// Testbed utility types
@@ -311,7 +314,7 @@ bool initialize_block(
     _scope_min = scope_min;
   }
   cutlass::reference::device::BlockFillRandomUniform(
-    block.get(), block.size(), seed, (Element) _scope_max, (Element) _scope_min, 0);
+    block.get(), block.size(), seed, (Element) _scope_max, (Element) _scope_min, -1);
 
   return true;
 }
@@ -337,7 +340,7 @@ void allocate(const OptionType &options) {
   stride_B_host.clear();
   stride_C_host.clear();
   stride_D_host.clear();
-  
+
   for (int32_t i = 0; i < options.groups; ++i) {
 
     auto problem = options.problem_sizes_host.at(i);
@@ -489,8 +492,8 @@ void initialize(const OptionType &options) {
   initialize_block(block_A, seed + 2022);
   initialize_block(block_B, seed + 2023);
   initialize_block(block_C, seed + 2024);
-  initialize_block(blockscale_block_A, seed + 2025, -1, 1);
-  initialize_block(blockscale_block_B, seed + 2026, -1, 1);
+  initialize_block(blockscale_block_A, seed + 2025, 0.125f, 1.875f);
+  initialize_block(blockscale_block_B, seed + 2026, 0.125f, 1.875f);
 
   block_alpha.copy_from_host(alpha_host.data());
   block_beta.copy_from_host(beta_host.data());
@@ -617,8 +620,8 @@ bool verify(const OptionType &options) {
 
     cutlass::reference::host::GettBlockScalingMainloopParams<
       ElementAccumulator,
-      decltype(A), 
-      decltype(SFA), 
+      decltype(A),
+      decltype(SFA),
       decltype(B),
       decltype(SFB)
     > mainloop_params{A, SFA, B, SFB};
@@ -647,7 +650,7 @@ bool verify(const OptionType &options) {
       block_D_host_ref.data() + offset_D.at(group_idx) + m * n,
       block_D_host_kernel.data() + offset_D.at(group_idx)
     );
-    
+
     passed &= this_group_passed;
 
 #if 0
@@ -691,17 +694,25 @@ cudaError_t TestCorrectness(Options<ProblemShape> &options) {
   }
   cudaDeviceSynchronize();
 
-  // CPU verification skipped (non-fatal, not needed for benchmark)
+  for(int group=0;group<options.groups;++group) {
+    auto shape=options.problem_sizes_host[group];
+    kh_sample_block_scaled<true>(get<0>(shape),get<1>(shape),get<2>(shape),options.alpha,
+      block_A.get()+offset_A[group],block_B.get()+offset_B[group],
+      blockscale_block_A.get()+offset_blockscale_A[group],blockscale_block_B.get()+offset_blockscale_B[group],
+      block_D.get()+offset_D[group],0.04,0.016);
+  }
+
 
 #ifdef KH_TEST_SOLUTION
   // Allocate solution output
   cutlass::DeviceAllocation<ElementD> sol_block_D;
   sol_block_D.reset(block_D.size());
+  kh_poison(sol_block_D.get(),sol_block_D.size()*sizeof(ElementD));
 
   // Build host pointer arrays for solution
   std::vector<__nv_fp8_e4m3 const*> sol_A_ptrs(options.groups);
   std::vector<__nv_fp8_e4m3 const*> sol_B_ptrs(options.groups);
-  std::vector<__nv_fp8_e4m3*> sol_D_ptrs(options.groups);
+  std::vector<__nv_bfloat16*> sol_D_ptrs(options.groups);
   std::vector<float const*> sol_sA_ptrs(options.groups);
   std::vector<float const*> sol_sB_ptrs(options.groups);
   std::vector<int> sol_Ms(options.groups), sol_Ns(options.groups), sol_Ks(options.groups);
@@ -719,7 +730,7 @@ cudaError_t TestCorrectness(Options<ProblemShape> &options) {
 
     sol_A_ptrs[i] = reinterpret_cast<__nv_fp8_e4m3 const*>(block_A.get() + offset_A.at(i));
     sol_B_ptrs[i] = reinterpret_cast<__nv_fp8_e4m3 const*>(block_B.get() + offset_B.at(i));
-    sol_D_ptrs[i] = reinterpret_cast<__nv_fp8_e4m3*>(sol_block_D.get() + offset_D.at(i));
+    sol_D_ptrs[i] = reinterpret_cast<__nv_bfloat16*>(sol_block_D.get() + offset_D.at(i));
     sol_sA_ptrs[i] = blockscale_block_A.get() + offset_blockscale_A.at(i);
     sol_sB_ptrs[i] = blockscale_block_B.get() + offset_blockscale_B.at(i);
   }
@@ -727,7 +738,7 @@ cudaError_t TestCorrectness(Options<ProblemShape> &options) {
   // Copy pointer arrays to device
   cutlass::DeviceAllocation<__nv_fp8_e4m3 const*> d_sol_A_ptrs(options.groups);
   cutlass::DeviceAllocation<__nv_fp8_e4m3 const*> d_sol_B_ptrs(options.groups);
-  cutlass::DeviceAllocation<__nv_fp8_e4m3*> d_sol_D_ptrs(options.groups);
+  cutlass::DeviceAllocation<__nv_bfloat16*> d_sol_D_ptrs(options.groups);
   cutlass::DeviceAllocation<float const*> d_sol_sA_ptrs(options.groups);
   cutlass::DeviceAllocation<float const*> d_sol_sB_ptrs(options.groups);
   cutlass::DeviceAllocation<int> d_sol_Ms(options.groups);
@@ -769,6 +780,7 @@ cudaError_t TestCorrectness(Options<ProblemShape> &options) {
   std::vector<ElementD> sol_D_host(sol_block_D.size());
   block_D.copy_to_host(ref_D_host.data());
   sol_block_D.copy_to_host(sol_D_host.data());
+  kh_compare_outputs(sol_D_host,ref_D_host,0.04,0.016,0.006);
 
   for (int g = 0; g < options.groups; g++) {
     auto [m, n, k] = options.problem_sizes_host.at(g);
@@ -777,7 +789,7 @@ cudaError_t TestCorrectness(Options<ProblemShape> &options) {
     for (int i = 0; i < total; ++i) {
       float ref_val = float(ref_D_host[offset_D.at(g) + i]);
       float sol_val = float(sol_D_host[offset_D.at(g) + i]);
-      max_diff = std::fmax(max_diff, std::fabs(sol_val - ref_val));
+      max_diff = std::fmax(max_diff, kh_abs(sol_val - ref_val)/(0.04f+0.016f*kh_abs(ref_val)));
     }
     // FP8 E4M3 output tolerance
     if (max_diff > 1.0f) {
@@ -799,17 +811,24 @@ void Profile(Options<ProblemShape> &options, int iterations) {
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
+  Gemm prepared_gemm;
+  auto prepared_args=args_from_options<typename Gemm::Arguments>(options,true);
+  cutlass::device_memory::allocation<uint8_t> prepared_workspace(Gemm::get_workspace_size(prepared_args));
+  CUTLASS_CHECK(prepared_gemm.can_implement(prepared_args));
+  CUTLASS_CHECK(prepared_gemm.initialize(prepared_args,prepared_workspace.get()));
+
   // Warmup reference
   for (int i = 0; i < 3; i++) {
-    RunCutlassReference(options);
+    CUTLASS_CHECK(prepared_gemm.run());
   }
   cudaDeviceSynchronize();
 
   // Profile reference
   float ref_total_ms = 0, ref_min_ms = 1e30f;
   for (int iter = 0; iter < iterations; ++iter) {
+    kh_cold_l2();
     cudaEventRecord(start);
-    RunCutlassReference(options);
+    CUTLASS_CHECK(prepared_gemm.run());
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     float ms;
@@ -824,7 +843,7 @@ void Profile(Options<ProblemShape> &options, int iterations) {
   // Build solution pointer arrays (same as in TestCorrectness)
   std::vector<__nv_fp8_e4m3 const*> sol_A_ptrs(options.groups);
   std::vector<__nv_fp8_e4m3 const*> sol_B_ptrs(options.groups);
-  std::vector<__nv_fp8_e4m3*> sol_D_ptrs(options.groups);
+  std::vector<__nv_bfloat16*> sol_D_ptrs(options.groups);
   std::vector<float const*> sol_sA_ptrs(options.groups);
   std::vector<float const*> sol_sB_ptrs(options.groups);
   std::vector<int> sol_Ms(options.groups), sol_Ns(options.groups), sol_Ks(options.groups);
@@ -836,14 +855,14 @@ void Profile(Options<ProblemShape> &options, int iterations) {
     sol_ldas[i] = k; sol_ldbs[i] = k; sol_ldds[i] = m;
     sol_A_ptrs[i] = reinterpret_cast<__nv_fp8_e4m3 const*>(block_A.get() + offset_A.at(i));
     sol_B_ptrs[i] = reinterpret_cast<__nv_fp8_e4m3 const*>(block_B.get() + offset_B.at(i));
-    sol_D_ptrs[i] = reinterpret_cast<__nv_fp8_e4m3*>(block_D.get() + offset_D.at(i));
+    sol_D_ptrs[i] = reinterpret_cast<__nv_bfloat16*>(block_D.get() + offset_D.at(i));
     sol_sA_ptrs[i] = blockscale_block_A.get() + offset_blockscale_A.at(i);
     sol_sB_ptrs[i] = blockscale_block_B.get() + offset_blockscale_B.at(i);
   }
 
   cutlass::DeviceAllocation<__nv_fp8_e4m3 const*> d_sol_A_ptrs(options.groups);
   cutlass::DeviceAllocation<__nv_fp8_e4m3 const*> d_sol_B_ptrs(options.groups);
-  cutlass::DeviceAllocation<__nv_fp8_e4m3*> d_sol_D_ptrs(options.groups);
+  cutlass::DeviceAllocation<__nv_bfloat16*> d_sol_D_ptrs(options.groups);
   cutlass::DeviceAllocation<float const*> d_sol_sA_ptrs(options.groups);
   cutlass::DeviceAllocation<float const*> d_sol_sB_ptrs(options.groups);
   cutlass::DeviceAllocation<int> d_sol_Ms(options.groups);
@@ -870,6 +889,7 @@ void Profile(Options<ProblemShape> &options, int iterations) {
   cutlass::DeviceAllocation<ElementD> D_ref_saved;
   D_ref_saved.reset(block_D.size());
   cudaMemcpy(D_ref_saved.get(), block_D.get(), total_D_bytes, cudaMemcpyDeviceToDevice);
+  kh_poison(block_D.get(),total_D_bytes);
 
   // Run solution once for correctness check
   HopperFp8BlockwiseGroupedGemm(
@@ -884,12 +904,13 @@ void Profile(Options<ProblemShape> &options, int iterations) {
 
   {
     size_t count = block_D.size();
-    std::vector<__nv_fp8_e4m3> h_sol(count), h_ref(count);
-    cudaMemcpy(h_sol.data(), block_D.get(), count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ref.data(), D_ref_saved.get(), count * sizeof(__nv_fp8_e4m3), cudaMemcpyDeviceToHost);
+    std::vector<__nv_bfloat16> h_sol(count), h_ref(count);
+    cudaMemcpy(h_sol.data(), block_D.get(), count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_ref.data(), D_ref_saved.get(), count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    kh_compare_outputs(h_sol,h_ref,0.04,0.016,0.006);
     float max_diff = 0;
     for (size_t i = 0; i < count; ++i)
-      max_diff = std::fmax(max_diff, std::fabs(float(h_sol[i]) - float(h_ref[i])));
+      max_diff = std::fmax(max_diff, kh_abs(float(h_sol[i]) - float(h_ref[i]))/(0.04f+0.016f*kh_abs(float(h_ref[i]))));
     if (max_diff > 1.0f) {
       fprintf(stderr, "Solution incorrect in Profile: max_diff=%.6f\n", max_diff);
       std::cout << "Incorrect" << std::endl;
@@ -914,6 +935,7 @@ void Profile(Options<ProblemShape> &options, int iterations) {
   // Profile solution
   float sol_total_ms = 0, sol_min_ms = 1e30f;
   for (int iter = 0; iter < iterations; ++iter) {
+    kh_cold_l2();
     cudaEventRecord(start);
     HopperFp8BlockwiseGroupedGemm(
       options.groups,
@@ -995,9 +1017,9 @@ int main(int argc, char const **args) {
     configs.push_back({"custom", options.m, options.n, options.k, options.groups});
   } else {
     configs = {
-      {"small",    128,  128,  128,  4},
-      {"medium",   512,  512,  512, 16},
-      {"large",   2048, 2048, 2048,  4},
+      {"moe_decode",128,1536,2048,16},
+      {"moe_prefill",1024,1536,2048,32},
+      {"moe_large",2048,1536,2048,16},
     };
   }
 
@@ -1013,8 +1035,8 @@ int main(int argc, char const **args) {
     options.problem_sizes_host.clear();
     options.problem_sizes_after_alignment_host.clear();
     for (int i = 0; i < cfg.groups; i++) {
-      options.problem_sizes_host.push_back({cfg.m, cfg.n, cfg.k});
-      options.problem_sizes_after_alignment_host.push_back({cfg.m, cfg.n, cfg.k});
+      options.problem_sizes_host.push_back({i%7==6?0:std::max(16,((cfg.m*(i%5+1)/3)/16)*16),cfg.n,cfg.k});
+      options.problem_sizes_after_alignment_host.push_back(options.problem_sizes_host.back());
     }
 
     if (TestCorrectness(options) != cudaSuccess) {

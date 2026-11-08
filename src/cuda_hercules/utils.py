@@ -96,6 +96,26 @@ def get_project_root() -> str:
     raise RuntimeError("Could not find CUDA-Hercules project root")
 
 
+def task_source_hash(task_dir: str) -> str:
+    """Fingerprint task sources, local dependency symlinks, and its contract.
+
+    Build products and Python bytecode are excluded. This invalidates Hopper
+    timing caches after shapes, precision, or shared validation headers change.
+    """
+    import hashlib
+    from pathlib import Path
+    task = Path(task_dir)
+    digest = hashlib.sha256()
+    for path in sorted(task.rglob("*")):
+        if path.is_file() and (
+            path.suffix in (".cu", ".h", ".hpp", ".cuh", ".impl", ".py", ".yaml", ".txt")
+            or path.name == "Makefile"
+        ):
+            digest.update(str(path.relative_to(task)).encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def get_gpu_name() -> str:
     """Get the name of the current CUDA GPU."""
     import torch

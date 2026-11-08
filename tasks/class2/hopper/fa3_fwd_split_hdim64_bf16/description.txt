@@ -1,30 +1,22 @@
-# Task: fa3_fwd_split_hdim64_bf16
+Implement Hopper SM90 fwd_split attention, bfloat16, head dimension 64.
+Q: contiguous [8, 32, 4, 64]; K,V: contiguous [8, 4, 16421, 64].
+Query head h uses KV head floor(h / (32//4)). O has Q's shape/dtype.
+Compute P = softmax(Q K^T / sqrt(64)), O = P V; non-causal (all keys visible).
+LSE is fp32 natural-log sum-exp, shape [B,H,Sq], not log2.
+Reference and solution use cold L2 and the minimum of identical timing trials.
+Accumulate dot products and softmax in fp32. Do not quantize inputs to FP8.
+num_splits=4; partition KV and combine partial softmax statistics stably.
 
-## Target Hardware
-NVIDIA Hopper GPU (SM90).
-
-## Description
-
-Implement a CUDA kernel for Flash Attention 3 forward pass with split-KV parallelism.
-
-Same as standard forward but the KV sequence is split across 4 parallel workers.
-Each worker computes partial softmax on its chunk, then results are combined.
-
-scale = 1/sqrt(D) = 0.125000
-Non-causal (full attention).
-
-
-## Function Signature
-
-```c
+Required entry point:
 void launch_fa3_fwd_split(
-    const void* Q,     // [B, H, Sq, D] bf16
-    const void* K,     // [B, H, Sk, D] bf16
-    const void* V,     // [B, H, Sk, D] bf16
-    void* O,           // [B, H, Sq, D] bf16
-    float* lse,        // [B, H, Sq]
+    const void* Q,
+    const void* K,
+    const void* V,
+    void* O,
+    float* lse,
     int B,
     int H,
+    int Hkv,
     int Sq,
     int Sk,
     int D,
@@ -32,5 +24,3 @@ void launch_fa3_fwd_split(
     int num_splits,
     cudaStream_t stream
 );
-
-```

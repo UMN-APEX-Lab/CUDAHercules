@@ -1,3 +1,4 @@
+#include "hopper_validation.cuh"
 /***************************************************************************************************
  * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -30,8 +31,8 @@
  **************************************************************************************************/
 
 /*! \file
-    \brief 
-    Hopper Mixed-input Grouped GEMM example using CUTLASS 3 APIs for NVIDIA Hopper architecture. 
+    \brief
+    Hopper Mixed-input Grouped GEMM example using CUTLASS 3 APIs for NVIDIA Hopper architecture.
     See 55_hopper_mixed_dtype_gemm.cu for more details about Mixed-input GEMMs.
 
     Limitations:
@@ -92,8 +93,8 @@
 
 using namespace cute;
 using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int,int,int>>; // <M,N,K> per group
-using MmaType = cutlass::bfloat16_t;
-using QuantType = cutlass::float_e5m2_t;
+using MmaType = cutlass::half_t;
+using QuantType = int8_t;
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -115,8 +116,8 @@ constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;    // M
 using LayoutA_Transpose = typename cutlass::layout::LayoutTranspose<LayoutA>::type;
 using LayoutB_Transpose = typename cutlass::layout::LayoutTranspose<LayoutB>::type;
 
-using ElementZero = cutlass::bfloat16_t;
-using ElementScale = cutlass::bfloat16_t;
+using ElementZero = cutlass::half_t;
+using ElementScale = cutlass::half_t;
 using LayoutScale = cutlass::layout::RowMajor;
 
 // C/D matrix configuration
@@ -182,7 +183,7 @@ using CollectiveMainloopScaleOnly = typename cutlass::gemm::collective::Collecti
   >::CollectiveOp;
 
 using GemmKernelScaleOnly = cutlass::gemm::kernel::GemmUniversal<
-    ProblemShape, 
+    ProblemShape,
     CollectiveMainloopScaleOnly,
     CollectiveEpilogue
 >;
@@ -465,7 +466,7 @@ void initialize(Options &options) {
 /// Populates a Gemm::Arguments structure from the given commandline options
 template <typename Gemm>
 typename Gemm::Arguments args_from_options(Options const& options, bool host_problem_shapes_available = true)
-{ 
+{
   cutlass::KernelHardwareInfo hw_info;
   // Change device_id to another value if you are running on a machine with multiple GPUs and wish
   // to use a GPU other than that with device ID 0.
@@ -517,7 +518,7 @@ typename Gemm::Arguments args_from_options(Options const& options, bool host_pro
       {fusion_args, ptr_C.get(), stride_C.get(), ptr_D.get(), stride_D.get()},
       hw_info
     };
-  } 
+  }
   else {
     std::cerr << "Invalid mode " << options.mode << ". Must be 0, 1 or 2." << std::endl;
     exit(-1);
@@ -652,143 +653,45 @@ int run(Options &options, bool host_problem_shapes_available = true)
   // CPU verification skipped (non-fatal, not needed for benchmark)
 
 #ifdef KH_TEST_SOLUTION
-  // Test solution: build simple-interface data and verify against CPU reference
-  {
-    // The problem sizes were swapped (N,M,K) for CUTLASS. Un-swap for the solution.
-    int PC = options.groups;
-    std::vector<int> h_Ms(PC), h_Ns(PC), h_Ks(PC);
-    std::vector<int> h_ldas(PC), h_ldbs(PC), h_ldds(PC);
-    for (int i = 0; i < PC; ++i) {
-      auto [N_swapped, M_swapped, K_val] = options.problem_sizes_host[i];
-      h_Ms[i] = M_swapped;
-      h_Ns[i] = N_swapped;
-      h_Ks[i] = K_val;
-      h_ldas[i] = K_val;  // A row-major: lda = K
-      h_ldbs[i] = K_val;  // B col-major: ldb = K
-      h_ldds[i] = N_swapped;  // D row-major: ldd = N
-    }
-
-    // Allocate solution D arrays (half)
-    std::vector<__half*> sol_D_ptrs(PC);
-    for (int i = 0; i < PC; ++i) {
-      CUDA_CHECK(cudaMalloc(&sol_D_ptrs[i], h_Ms[i] * h_Ns[i] * sizeof(__half)));
-      CUDA_CHECK(cudaMemset(sol_D_ptrs[i], 0, h_Ms[i] * h_Ns[i] * sizeof(__half)));
-    }
-
-    // Convert A (bf16) -> half, B (fp8) -> int8 for solution interface
-    std::vector<__half*> sol_A_ptrs(PC);
-    std::vector<int8_t*> sol_B_ptrs(PC);
-    for (int i = 0; i < PC; ++i) {
-      int sA = h_Ms[i] * h_Ks[i], sB = h_Ks[i] * h_Ns[i];
-
-      // Copy A bf16 -> host -> convert to half -> copy to device
-      std::vector<__nv_bfloat16> h_A_bf16(sA);
-      cutlass::device_memory::copy_to_host(
-        reinterpret_cast<__nv_bfloat16*>(h_A_bf16.data()),
-        reinterpret_cast<__nv_bfloat16*>(block_A.get() + offset_A[i]),
-        sA);
-      std::vector<__half> h_A_half(sA);
-      for (int j = 0; j < sA; ++j) h_A_half[j] = __float2half(__bfloat162float(h_A_bf16[j]));
-      CUDA_CHECK(cudaMalloc(&sol_A_ptrs[i], sA * sizeof(__half)));
-      CUDA_CHECK(cudaMemcpy(sol_A_ptrs[i], h_A_half.data(), sA * sizeof(__half), cudaMemcpyHostToDevice));
-
-      // Copy B fp8 -> host -> convert to int8 (clamp) -> copy to device
-      std::vector<uint8_t> h_B_fp8(sB);
-      CUDA_CHECK(cudaMemcpy(h_B_fp8.data(), block_B.get() + offset_B[i], sB, cudaMemcpyDeviceToHost));
-      std::vector<int8_t> h_B_int8(sB);
-      for (int j = 0; j < sB; ++j) h_B_int8[j] = static_cast<int8_t>(h_B_fp8[j]);
-      CUDA_CHECK(cudaMalloc(&sol_B_ptrs[i], sB * sizeof(int8_t)));
-      CUDA_CHECK(cudaMemcpy(sol_B_ptrs[i], h_B_int8.data(), sB * sizeof(int8_t), cudaMemcpyHostToDevice));
-    }
-
-    // Copy arrays to device
-    int *dMs, *dNs, *dKs, *dldas, *dldbs, *dldds;
-    __half const **dAp;
-    int8_t const **dBp;
-    __half **dDp;
-    CUDA_CHECK(cudaMalloc(&dMs, PC * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dNs, PC * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dKs, PC * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dldas, PC * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dldbs, PC * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dldds, PC * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dAp, PC * sizeof(void*)));
-    CUDA_CHECK(cudaMalloc(&dBp, PC * sizeof(void*)));
-    CUDA_CHECK(cudaMalloc(&dDp, PC * sizeof(void*)));
-
-    CUDA_CHECK(cudaMemcpy(dMs, h_Ms.data(), PC * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dNs, h_Ns.data(), PC * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dKs, h_Ks.data(), PC * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dldas, h_ldas.data(), PC * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dldbs, h_ldbs.data(), PC * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dldds, h_ldds.data(), PC * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dAp, sol_A_ptrs.data(), PC * sizeof(void*), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dBp, sol_B_ptrs.data(), PC * sizeof(void*), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dDp, sol_D_ptrs.data(), PC * sizeof(void*), cudaMemcpyHostToDevice));
-
-    float sol_alpha = alpha_host[0], sol_beta = 0.0f;
-
-    cudaError_t sol_err = HopperMixedGroupedGemm(
-      PC, dMs, dNs, dKs, sol_alpha, (const __half**)dAp, dldas, (const int8_t**)dBp, dldbs, sol_beta, dDp, dldds);
-    if (sol_err != cudaSuccess) {
-      std::cerr << "Solution kernel failed: " << cudaGetErrorString(sol_err) << std::endl;
-      result.passed = false;
-    } else {
-      CUDA_CHECK(cudaDeviceSynchronize());
-
-      // Verify each group with CPU reference
-      for (int p = 0; p < PC && result.passed; ++p) {
-        int M = h_Ms[p], N = h_Ns[p], K = h_Ks[p];
-        int sD = M * N;
-        std::vector<__half> hD(sD);
-        CUDA_CHECK(cudaMemcpy(hD.data(), sol_D_ptrs[p], sD * sizeof(__half), cudaMemcpyDeviceToHost));
-
-        // Get A and B in float for CPU reference
-        int sA = M * K, sB = K * N;
-        std::vector<__nv_bfloat16> h_A_bf16(sA);
-        cutlass::device_memory::copy_to_host(
-          reinterpret_cast<__nv_bfloat16*>(h_A_bf16.data()),
-          reinterpret_cast<__nv_bfloat16*>(block_A.get() + offset_A[p]),
-          sA);
-        std::vector<uint8_t> h_B_fp8(sB);
-        CUDA_CHECK(cudaMemcpy(h_B_fp8.data(), block_B.get() + offset_B[p], sB, cudaMemcpyDeviceToHost));
-
-        std::vector<float> fA(sA), fB(sB), fD(sD), fRef(sD, 0);
-        for (int j = 0; j < sA; ++j) fA[j] = __bfloat162float(h_A_bf16[j]);
-        for (int j = 0; j < sB; ++j) fB[j] = float(int8_t(h_B_fp8[j]));
-        for (int j = 0; j < sD; ++j) fD[j] = __half2float(hD[j]);
-
-        // CPU: D = alpha * A @ B (A row-major, B col-major)
-        for (int i = 0; i < M; ++i)
-          for (int j = 0; j < N; ++j) {
-            float acc = 0;
-            for (int k = 0; k < K; ++k)
-              acc += fA[i * K + k] * fB[k + j * K];
-            fRef[i * N + j] = sol_alpha * acc;
-          }
-
-        float md = 0;
-        for (int j = 0; j < sD; ++j) md = fmaxf(md, fabsf(fD[j] - fRef[j]));
-        if (md > 1.0f) {
-          std::cerr << "Solution group " << p << " incorrect. Max diff: " << md << std::endl;
-          result.passed = false;
-        }
+  // ConvertOnly uses the very same half/int8 operands for validation and timing.
+  int PC = options.groups;
+  std::vector<int> hM(PC), hN(PC), hK(PC), hlda(PC), hldb(PC), hldd(PC);
+  std::vector<const __half*> hA(PC);
+  std::vector<const int8_t*> hB(PC);
+  std::vector<__half*> hD(PC);
+  for (int p = 0; p < PC; ++p) {
+    auto [N, M, K] = options.problem_sizes_host[p];
+    hM[p]=M; hN[p]=N; hK[p]=K; hlda[p]=K; hldb[p]=K; hldd[p]=N;
+    hA[p]=reinterpret_cast<const __half*>(block_A.get()+offset_A[p]);
+    hB[p]=reinterpret_cast<const int8_t*>(block_B.get()+offset_B[p]);
+    CUDA_CHECK(cudaMalloc(&hD[p], size_t(M)*N*sizeof(__half)));
+    kh_poison(hD[p], size_t(M)*N*sizeof(__half));
+  }
+  cutlass::DeviceAllocation<int> dM(PC),dN(PC),dK(PC),dlda(PC),dldb(PC),dldd(PC);
+  cutlass::DeviceAllocation<const __half*> dA(PC);
+  cutlass::DeviceAllocation<const int8_t*> dB(PC);
+  cutlass::DeviceAllocation<__half*> dD(PC);
+  dM.copy_from_host(hM.data()); dN.copy_from_host(hN.data()); dK.copy_from_host(hK.data());
+  dlda.copy_from_host(hlda.data()); dldb.copy_from_host(hldb.data()); dldd.copy_from_host(hldd.data());
+  dA.copy_from_host(hA.data()); dB.copy_from_host(hB.data()); dD.copy_from_host(hD.data());
+  auto run_solution = [&]() {
+    CUDA_CHECK(HopperMixedGroupedGemm(PC,dM.get(),dN.get(),dK.get(),options.alpha,
+        dA.get(),dlda.get(),dB.get(),dldb.get(),0.0f,dD.get(),dldd.get()));
+  };
+  run_solution();
+  CUDA_CHECK(cudaDeviceSynchronize());
+  for (int p=0; p<PC; ++p) {
+    size_t count=size_t(hM[p])*hN[p];
+    std::vector<__half> actual(count), expected(count);
+    CUDA_CHECK(cudaMemcpy(actual.data(),hD[p],count*sizeof(__half),cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(expected.data(),block_D.get()+offset_D[p],count*sizeof(__half),cudaMemcpyDeviceToHost));
+    for (size_t i=0;i<count;++i) {
+      float x=__half2float(actual[i]), y=__half2float(expected[i]);
+      if (!std::isfinite(x) || !std::isfinite(y) || std::abs(x-y)>0.02f+0.002f*std::abs(y)) {
+        fprintf(stderr,"Group %d element %zu incorrect: got %g expected %g\n",p,i,x,y);
+        return -1;
       }
     }
-
-    // Cleanup solution data
-    for (int i = 0; i < PC; ++i) {
-      cudaFree(sol_A_ptrs[i]);
-      cudaFree(sol_B_ptrs[i]);
-      cudaFree(sol_D_ptrs[i]);
-    }
-    cudaFree(dMs); cudaFree(dNs); cudaFree(dKs);
-    cudaFree(dldas); cudaFree(dldbs); cudaFree(dldds);
-    cudaFree(dAp); cudaFree(dBp); cudaFree(dDp);
-  }
-  if (!result.passed) {
-    std::cout << "Incorrect" << std::endl;
-    return -1;
   }
 #endif
 
@@ -808,6 +711,7 @@ int run(Options &options, bool host_problem_shapes_available = true)
 
   float ref_total_ms = 0, ref_min_ms = 1e30f;
   for (int iter = 0; iter < kIterations; ++iter) {
+    kh_cold_l2();
     cudaEventRecord(ev_start);
     CUTLASS_CHECK(gemm.run());
     cudaEventRecord(ev_stop);
@@ -821,91 +725,19 @@ int run(Options &options, bool host_problem_shapes_available = true)
           ref_total_ms / kIterations, kIterations, ref_min_ms);
 
 #ifdef KH_TEST_SOLUTION
-  // Profile solution
-  {
-    int PC = options.groups;
-    std::vector<int> h_Ms(PC), h_Ns(PC), h_Ks(PC);
-    std::vector<int> h_ldas(PC), h_ldbs(PC), h_ldds(PC);
-    for (int i = 0; i < PC; ++i) {
-      auto [N_swapped, M_swapped, K_val] = options.problem_sizes_host[i];
-      h_Ms[i] = M_swapped; h_Ns[i] = N_swapped; h_Ks[i] = K_val;
-      h_ldas[i] = K_val; h_ldbs[i] = K_val; h_ldds[i] = N_swapped;
-    }
-
-    std::vector<__half*> sol_A_ptrs(PC), sol_D_ptrs(PC);
-    std::vector<int8_t*> sol_B_ptrs(PC);
-    for (int i = 0; i < PC; ++i) {
-      int sA = h_Ms[i] * h_Ks[i], sB = h_Ks[i] * h_Ns[i], sD = h_Ms[i] * h_Ns[i];
-      std::vector<__nv_bfloat16> h_A_bf16(sA);
-      cutlass::device_memory::copy_to_host(
-        reinterpret_cast<__nv_bfloat16*>(h_A_bf16.data()),
-        reinterpret_cast<__nv_bfloat16*>(block_A.get() + offset_A[i]), sA);
-      std::vector<__half> h_A_half(sA);
-      for (int j = 0; j < sA; ++j) h_A_half[j] = __float2half(__bfloat162float(h_A_bf16[j]));
-      CUDA_CHECK(cudaMalloc(&sol_A_ptrs[i], sA * sizeof(__half)));
-      CUDA_CHECK(cudaMemcpy(sol_A_ptrs[i], h_A_half.data(), sA * sizeof(__half), cudaMemcpyHostToDevice));
-
-      std::vector<uint8_t> h_B_fp8(sB);
-      CUDA_CHECK(cudaMemcpy(h_B_fp8.data(), block_B.get() + offset_B[i], sB, cudaMemcpyDeviceToHost));
-      std::vector<int8_t> h_B_int8(sB);
-      for (int j = 0; j < sB; ++j) h_B_int8[j] = static_cast<int8_t>(h_B_fp8[j]);
-      CUDA_CHECK(cudaMalloc(&sol_B_ptrs[i], sB * sizeof(int8_t)));
-      CUDA_CHECK(cudaMemcpy(sol_B_ptrs[i], h_B_int8.data(), sB * sizeof(int8_t), cudaMemcpyHostToDevice));
-
-      CUDA_CHECK(cudaMalloc(&sol_D_ptrs[i], sD * sizeof(__half)));
-    }
-
-    int *dMs, *dNs, *dKs, *dldas, *dldbs, *dldds;
-    __half const **dAp; int8_t const **dBp; __half **dDp;
-    CUDA_CHECK(cudaMalloc(&dMs, PC * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dNs, PC * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dKs, PC * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dldas, PC * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dldbs, PC * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dldds, PC * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dAp, PC * sizeof(void*)));
-    CUDA_CHECK(cudaMalloc(&dBp, PC * sizeof(void*)));
-    CUDA_CHECK(cudaMalloc(&dDp, PC * sizeof(void*)));
-    CUDA_CHECK(cudaMemcpy(dMs, h_Ms.data(), PC * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dNs, h_Ns.data(), PC * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dKs, h_Ks.data(), PC * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dldas, h_ldas.data(), PC * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dldbs, h_ldbs.data(), PC * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dldds, h_ldds.data(), PC * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dAp, sol_A_ptrs.data(), PC * sizeof(void*), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dBp, sol_B_ptrs.data(), PC * sizeof(void*), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dDp, sol_D_ptrs.data(), PC * sizeof(void*), cudaMemcpyHostToDevice));
-
-    float sol_alpha = alpha_host[0], sol_beta = 0.0f;
-
-    // Warmup
-    for (int i = 0; i < 3; i++) {
-      HopperMixedGroupedGemm(PC, dMs, dNs, dKs, sol_alpha, (const __half**)dAp, dldas, (const int8_t**)dBp, dldbs, sol_beta, dDp, dldds);
-    }
-    cudaDeviceSynchronize();
-
-    float sol_total_ms = 0, sol_min_ms = 1e30f;
-    for (int iter = 0; iter < kIterations; ++iter) {
-      cudaEventRecord(ev_start);
-      HopperMixedGroupedGemm(PC, dMs, dNs, dKs, sol_alpha, (const __half**)dAp, dldas, (const int8_t**)dBp, dldbs, sol_beta, dDp, dldds);
-      cudaEventRecord(ev_stop);
-      cudaEventSynchronize(ev_stop);
-      float ms;
-      cudaEventElapsedTime(&ms, ev_start, ev_stop);
-      sol_total_ms += ms;
-      if (ms < sol_min_ms) sol_min_ms = ms;
-    }
-    fprintf(stdout, "Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
-            sol_total_ms / kIterations, kIterations, sol_min_ms);
-    fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
-
-    for (int i = 0; i < PC; ++i) {
-      cudaFree(sol_A_ptrs[i]); cudaFree(sol_B_ptrs[i]); cudaFree(sol_D_ptrs[i]);
-    }
-    cudaFree(dMs); cudaFree(dNs); cudaFree(dKs);
-    cudaFree(dldas); cudaFree(dldbs); cudaFree(dldds);
-    cudaFree(dAp); cudaFree(dBp); cudaFree(dDp);
+  for (int i=0;i<3;++i) run_solution();
+  CUDA_CHECK(cudaDeviceSynchronize());
+  float sol_total_ms=0, sol_min_ms=1e30f;
+  for (int i=0;i<kIterations;++i) {
+    kh_cold_l2();
+    cudaEventRecord(ev_start); run_solution(); cudaEventRecord(ev_stop);
+    CUDA_CHECK(cudaEventSynchronize(ev_stop));
+    float ms; cudaEventElapsedTime(&ms,ev_start,ev_stop);
+    sol_total_ms+=ms; sol_min_ms=std::min(sol_min_ms,ms);
   }
+  fprintf(stdout,"Kernel time: %.6f ms (avg over %d trials, min: %.6f ms)\n",sol_total_ms/kIterations,kIterations,sol_min_ms);
+  fprintf(stdout,"Speedup: %.6fx\n",ref_min_ms/sol_min_ms);
+  for (auto ptr:hD) cudaFree(ptr);
 #endif
 
   cudaEventDestroy(ev_start);
@@ -972,9 +804,9 @@ int main(int argc, char const **args) {
     configs.push_back({"custom", options.m, options.k, options.groups});
   } else {
     configs = {
-      {"small",    128,  512, 4},
-      {"medium",   512,  512, 16},
-      {"large",   2048,  512, 4},
+      {"moe_decode",    128,  2048, 16},
+      {"moe_prefill",   1024,  2048, 16},
+      {"moe_large",   2048,  4096, 8},
     };
   }
 
@@ -994,7 +826,7 @@ int main(int argc, char const **args) {
     size_options.n = fixed_n;
     size_options.k = cfg.k;
     size_options.groups = cfg.groups;
-    size_options.mode = 1;  // ScaleOnly
+    size_options.mode = 0;  // ConvertOnly: half activations, int8 weights
     size_options.alpha = 1.0f;
     size_options.beta = 0.0f;
     size_options.iterations = 20;
@@ -1002,10 +834,10 @@ int main(int argc, char const **args) {
     // Build problem sizes (all same M,N,K)
     size_options.problem_sizes_host.clear();
     for (int i = 0; i < cfg.groups; ++i) {
-      size_options.problem_sizes_host.push_back({cfg.m, fixed_n, cfg.k});
+      size_options.problem_sizes_host.push_back({i%7==6?0:std::max(16, ((cfg.m * (i % 5 + 1) / 3) / 16) * 16), fixed_n, cfg.k});
     }
 
-    run<GemmScaleOnly>(size_options, false);
+    if (run<GemmConvertOnly>(size_options, false) != 0) return 1;
     std::cout << "Passed" << std::endl;
   }
 

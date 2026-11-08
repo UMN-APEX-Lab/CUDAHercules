@@ -1,133 +1,160 @@
 #!/usr/bin/env python3
-"""Test all FA3 references, each in a subprocess to survive CUDA crashes."""
-import csv
+"""Validate generated FA3 wrappers against a bounded, independent fp32 oracle.
+
+Each task runs in its own process so illegal accesses cannot poison later tasks.
+JSON reports include accuracy margins, negative controls, and H200 timings.
+"""
+import argparse
+import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FA3_DIR = os.path.join(PROJECT_ROOT, "tasks", "class2", "hopper")
-CSV_PATH = os.path.join(PROJECT_ROOT, "results", "fa3_test_results.csv")
+ROOT = Path(__file__).resolve().parents[1]
 
-# Single-task test script run as subprocess
-TEST_SCRIPT = '''
-import os, sys, traceback
-sys.path.insert(0, os.path.join("{root}", "src"))
-import torch
-from cuda_hercules.eval import load_task_def, _build_call_args, check_correctness
-from cuda_hercules.compiler import compile_cuda_module
 
-task_path = "{task_path}"
-task_name = "{task_name}"
-root = "{root}"
-
-try:
-    task_def = load_task_def(task_path)
-    sig = task_def["FUNCTION_SIGNATURE"]
-    ref_cu = os.path.join(task_path, "reference.cu")
-    extra_includes = []
-    for inc in task_def["REFERENCE_EXTRA_INCLUDES"]:
-        inc_path = os.path.join(task_path, inc)
-        if not os.path.isdir(inc_path):
-            inc_path = os.path.join(root, inc)
-        if os.path.isdir(inc_path):
-            extra_includes.append(inc_path)
-    build_dir = os.path.join(root, ".cache", "ref_builds", task_name)
-    os.makedirs(build_dir, exist_ok=True)
-    ref_fn = compile_cuda_module(
-        cuda_source=ref_cu, function_signature=sig,
-        extra_include_dirs=extra_includes,
-        extra_cuda_cflags=task_def.get("REFERENCE_EXTRA_CUDA_FLAGS", []),
-        build_dir=build_dir, verbose=False)
-    print("COMPILE:OK")
-except Exception as e:
-    print(f"COMPILE:FAIL:{e}")
-    sys.exit(0)
-
-try:
-    torch.manual_seed(42); torch.cuda.manual_seed(42)
-    inputs = task_def["get_inputs"]()
-    outputs = task_def["get_outputs"](inputs)
-    args = _build_call_args(task_def, inputs, outputs)
-    ref_fn(*args)
-    torch.cuda.synchronize()
-    print("RUN:OK")
-except Exception as e:
-    print(f"RUN:FAIL:{e}")
-    sys.exit(0)
-
-try:
-    ref_outputs = task_def["reference_fn"](inputs)
-    ok, per = check_correctness(ref_outputs, outputs, task_def["TOLERANCES"])
-    print(f"CORRECT:{'PASS' if ok else 'FAIL'}")
-except Exception as e:
-    print(f"CORRECT:ERROR:{e}")
-'''
+def worker(name, seeds, tune_splits=False):
+    sys.path.insert(0, str(ROOT/'src'))
+    import torch
+    from cuda_hercules.eval import load_task_def, _build_call_args, check_correctness
+    from cuda_hercules.compiler import compile_cuda_module
+    from cuda_hercules.timing import time_cuda_function
+    from cuda_hercules.utils import task_source_hash
+    path = ROOT/'tasks/class2/hopper'/name
+    task = load_task_def(str(path))
+    build = ROOT/'.cache/ref_builds'/name
+    build.mkdir(parents=True, exist_ok=True)
+    fn = compile_cuda_module(cuda_source=str(path/'reference.cu'),
+        function_signature=task['FUNCTION_SIGNATURE'],
+        extra_include_dirs=[str(ROOT/p) for p in task['REFERENCE_EXTRA_INCLUDES']],
+        extra_cuda_cflags=task['REFERENCE_EXTRA_CUDA_FLAGS'],
+        build_dir=str(build), verbose=False)
+    # Compilation may overlap; correctness and timing own the GPU exclusively.
+    import fcntl
+    gpu_lock = open(ROOT/'.cache/hopper_gpu.lock', 'w')
+    fcntl.flock(gpu_lock, fcntl.LOCK_EX)
+    report = dict(task=name, gpu=torch.cuda.get_device_name(), trials=[],
+                  source_hash=task_source_hash(str(path)),scalar_args=dict(task['SCALAR_ARGS']))
+    for seed in seeds:
+        torch.manual_seed(seed)
+        inputs = task['get_inputs']()
+        outputs = task['get_outputs'](inputs)
+        args = _build_call_args(task, inputs, outputs)
+        fn(*args)
+        torch.cuda.synchronize()
+        expected = task['reference_fn'](inputs)
+        ok, details = check_correctness(expected, outputs, task['TOLERANCES'], task['CHECKED_OUTPUTS'])
+        margins = {}
+        out = dict(outputs)
+        for key, value in expected:
+            tol = task['TOLERANCES'].get('per_output',{}).get(key, task['TOLERANCES'])
+            error = (value.float()-out[key].float()).abs()
+            margins[key] = dict(max_abs=error.max().item(),
+                max_tolerance_fraction=(error/(tol['atol']+tol['rtol']*value.float().abs())).max().item(),
+                normalized_rms=details[key].get('normalized_rms'))
+        controls = {}
+        for label, change in [('empty', lambda t: torch.full_like(t,float('nan'))),
+                              ('zero', torch.zeros_like),
+                              ('nan', lambda t: torch.full_like(t,float('nan')))]:
+            bad=[(k,change(v)) for k,v in expected]
+            controls[label] = not check_correctness(expected,bad,task['TOLERANCES'])[0]
+        # Perturb one required output while retaining all the others.
+        key = 'dV' if name.startswith('fa3_bwd') else 'lse'
+        bad=[(k, v*0.9 if k==key and key=='dV' else (v+0.3 if k==key else v)) for k,v in expected]
+        controls['dv_10pct' if key=='dV' else 'lse_bias'] = not check_correctness(expected,bad,task['TOLERANCES'])[0]
+        if seed == seeds[0]:
+            # Simulate lower-precision operands, including fractional mantissas.
+            quantized=[(k, t.to(torch.float8_e4m3fn).to(t.dtype) if k in ['Q','K','V'] else t) for k,t in inputs]
+            fp8=task['reference_fn'](quantized)
+            controls['fp8_operands']=not check_correctness(expected,fp8,task['TOLERANCES'])[0]
+            globals_=task['reference_fn'].__globals__
+            if globals_['CAUSAL']:
+                globals_['CAUSAL']=False
+                try:
+                    unmasked=task['reference_fn'](inputs)
+                finally:
+                    globals_['CAUSAL']=True
+                controls['ignored_causal_mask']=not check_correctness(expected,unmasked,task['TOLERANCES'])[0]
+        report['trials'].append(dict(seed=seed,correct=ok,margin=margins,negative_controls=controls))
+        if not ok or not all(controls.values()):
+            report['passed']=False
+            return report
+    stats=time_cuda_function(fn,args,num_trials=10)
+    report.update(passed=True,ref_min_ms=stats.min_ms,ref_mean_ms=stats.mean_ms,
+                  peak_memory_bytes=torch.cuda.max_memory_allocated())
+    if tune_splits and 'fwd_split' in name:
+        tuning={}
+        for splits in [1,2,4,8,16,32]:
+            task['SCALAR_ARGS']['num_splits']=splits
+            outputs=task['get_outputs'](inputs)
+            candidate=_build_call_args(task,inputs,outputs)
+            fn(*candidate);torch.cuda.synchronize()
+            ok,_=check_correctness(expected,outputs,task['TOLERANCES'],task['CHECKED_OUTPUTS'])
+            if ok:
+                tuning[splits]=time_cuda_function(fn,candidate,num_trials=10).min_ms
+        report['split_tuning_ms']=tuning
+        report['best_num_splits']=min(tuning,key=tuning.get)
+    return report
 
 
 def main():
-    os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
-    tasks = sorted(d for d in os.listdir(FA3_DIR) if os.path.isdir(os.path.join(FA3_DIR, d)))
-    print(f"Testing {len(tasks)} FA3 tasks...")
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--filter',default='fa3_')
+    parser.add_argument('--seeds',default='42,43,44')
+    parser.add_argument('--output',default='results/hopper_fa3_validation.json')
+    parser.add_argument('--worker')
+    parser.add_argument('--jobs',type=int,default=4)
+    parser.add_argument('--tune-splits',action='store_true')
+    parser.add_argument('--resume',action='store_true')
+    args=parser.parse_args()
+    if args.worker:
+        try:
+            report=worker(args.worker,[int(x) for x in args.seeds.split(',')],args.tune_splits)
+        except Exception:
+            import traceback
+            report=dict(task=args.worker,passed=False,error=traceback.format_exc())
+        print('RESULT_JSON:'+json.dumps(report),flush=True)
+        return
+    reports=[]
+    output=ROOT/args.output
+    output.parent.mkdir(parents=True,exist_ok=True)
+    def validate(task):
+        print(task.name,flush=True)
+        log=output.parent/(task.name+'.log')
+        try:
+            cmd=[sys.executable,__file__,'--worker',task.name,'--seeds',args.seeds]
+            if args.tune_splits:cmd.append('--tune-splits')
+            proc=subprocess.run(cmd,
+                                cwd=ROOT,capture_output=True,text=True,timeout=600,
+                                env={**os.environ,'MAX_JOBS':'2'})
+            log.write_text(proc.stdout+proc.stderr)
+            lines=[x for x in proc.stdout.splitlines() if x.startswith('RESULT_JSON:')]
+            report=json.loads(lines[-1].split(':',1)[1]) if lines else dict(task=task.name,passed=False,error=f'exit {proc.returncode}; see {log}')
+        except subprocess.TimeoutExpired:
+            report=dict(task=task.name,passed=False,error='600s timeout')
+        print(task.name+(' PASS' if report['passed'] else ' FAIL: '+report.get('error','numeric mismatch')[-1000:]),flush=True)
+        return report
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    tasks=[t for t in sorted((ROOT/'tasks/class2/hopper').glob('fa3_*')) if args.filter in t.name]
+    if args.resume and output.exists():
+        from cuda_hercules.utils import task_source_hash
+        previous={r['task']:r for r in json.loads(output.read_text())}
+        pending=[]
+        for task in tasks:
+            cached=previous.get(task.name,{})
+            seeds=[t['seed'] for t in cached.get('trials',[])]
+            if cached.get('passed') and cached.get('source_hash')==task_source_hash(str(task)) and seeds==[int(x) for x in args.seeds.split(',')] and (not args.tune_splits or cached.get('best_num_splits')):
+                reports.append(cached)
+            else:pending.append(task)
+        tasks=pending
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures=[pool.submit(validate,t) for t in tasks]
+        for future in as_completed(futures):
+            reports.append(future.result())
+            reports.sort(key=lambda r:r['task'])
+            output.write_text(json.dumps(reports,indent=2)+'\n')
+    print(f'{sum(r["passed"] for r in reports)}/{len(reports)} passed; {output}')
+    if not reports or not all(r['passed'] for r in reports): raise SystemExit(1)
 
-    with open(CSV_PATH, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["task", "compile", "run", "correct", "error"])
-        f.flush()
-
-        for i, task_name in enumerate(tasks, 1):
-            task_path = os.path.join(FA3_DIR, task_name)
-            print(f"[{i}/{len(tasks)}] {task_name} ... ", end="", flush=True)
-
-            script = TEST_SCRIPT.replace("{root}", PROJECT_ROOT).replace("{task_path}", task_path).replace("{task_name}", task_name)
-            try:
-                result = subprocess.run(
-                    [sys.executable, "-c", script],
-                    capture_output=True, text=True, timeout=300
-                )
-                output = result.stdout + result.stderr
-            except subprocess.TimeoutExpired:
-                output = "COMPILE:FAIL:timeout"
-            except Exception as e:
-                output = f"COMPILE:FAIL:{e}"
-
-            compiled = "COMPILE:OK" in output
-            ran = "RUN:OK" in output
-            correct = ""
-            error = ""
-
-            if "CORRECT:PASS" in output:
-                correct = "PASS"
-            elif "CORRECT:FAIL" in output:
-                correct = "FAIL"
-
-            if "COMPILE:FAIL:" in output:
-                error = output.split("COMPILE:FAIL:")[-1].strip()[:200]
-            elif "RUN:FAIL:" in output:
-                error = output.split("RUN:FAIL:")[-1].strip()[:200]
-            elif "CORRECT:ERROR:" in output:
-                error = output.split("CORRECT:ERROR:")[-1].strip()[:200]
-            elif not compiled and result.returncode != 0:
-                # Process crashed (e.g., CHECK_CUDA exit)
-                lines = output.strip().split("\n")
-                error = lines[-1][:200] if lines else f"exit code {result.returncode}"
-
-            status = correct if correct else ("ran" if ran else ("compiled" if compiled else "COMPILE_FAIL"))
-            print(f"{status}" + (f"  [{error[:80]}]" if error else ""))
-            w.writerow([task_name, compiled, ran, correct, error])
-            f.flush()
-
-    print(f"\nResults saved to: {CSV_PATH}")
-
-    # Summary
-    with open(CSV_PATH) as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-    comp = sum(1 for r in rows if r["compile"] == "True")
-    run = sum(1 for r in rows if r["run"] == "True")
-    correct = sum(1 for r in rows if r["correct"] == "PASS")
-    print(f"Compiled: {comp}/{len(rows)}, Ran: {run}/{len(rows)}, Correct: {correct}/{len(rows)}")
-
-
-if __name__ == "__main__":
-    main()
+if __name__=='__main__': main()

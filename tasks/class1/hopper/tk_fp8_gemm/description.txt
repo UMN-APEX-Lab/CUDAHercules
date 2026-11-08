@@ -1,37 +1,15 @@
-# Task: tk_fp8_gemm
+Implement a CUDA kernel for Hopper SM90 (H200).
 
-## Target Hardware
-NVIDIA Hopper GPU (SM90).
+FP8 E4M3 GEMM with fp32 accumulation and BF16 output. A row-major [M,K], B row-major [N,K], C BF16 row-major [M,N].
+C=bf16(A@B^T). Only the output is BF16; input pointers remain E4M3. All output elements must be written.
 
+Required public API:
+void Fp8Gemm(__nv_fp8_e4m3 *A, __nv_fp8_e4m3 *B, __nv_bfloat16 *C, int M, int N, int K);
 
-FP8 (E4M3) General Matrix Multiply on H100, matching ThunderKittens performance.
+Default cases (label, M, N, K):
+run_benchmark<matmul_template<8>>("custom",atoi(argv[1]),atoi(argv[2]),atoi(argv[3]));
+run_benchmark<matmul_template<8>>("fp8_decode", 128, 8192, 8192);
+run_benchmark<matmul_template<8>>("fp8_prefill", 8192, 28672, 8192);
 
-## Function Signature
-
-Implement in solution.h:
-
-```cuda
-#pragma once
-#include <cuda_runtime.h>
-#include <cuda_fp8.h>
-
-void Fp8Gemm(__nv_fp8_e4m3 *A, __nv_fp8_e4m3 *B, __nv_fp8_e4m3 *C, int M, int N, int K);
-```
-
-## Operation
-
-C = A * B^T
-
-Where A is M×K (row-major), B is N×K (to be transposed, i.e. column-major), C is M×N (row-major). All FP8 E4M3.
-
-**IMPORTANT**: B is stored in column-major layout [N,K]. The GEMM computes C = A * B^T.
-
-## Build & Test
-
-```bash
-# Generate test data (no external data needed - self-contained)
-make test
-./test
-```
-
-Requires H100 GPU (SM90a). ThunderKittens headers on include path.
+The harness generates fractional random inputs, poisons output-only buffers, and rejects nonfinite results.
+Reference and solution use the same cold-L2 timing policy and per-case minimum; every reported case contributes to the geometric-mean speedup.

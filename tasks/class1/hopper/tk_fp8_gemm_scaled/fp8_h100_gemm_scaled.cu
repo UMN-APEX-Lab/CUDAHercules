@@ -1,3 +1,6 @@
+#include <map>
+#include <tuple>
+#include "hopper_validation.cuh"
 #include <iostream>
 #include <iomanip>
 #include <fstream>
@@ -108,12 +111,15 @@ struct matmul_template {
             warp::zero(args.state.accum);
         }
         __device__ static void compute(consumer_compute_args<layout> args) {
+            rt_fl<16, layout::c_tile::cols> partial;
+            warp::zero(partial);
             warpgroup::mma_ABt(
-                args.state.accum,
+                partial,
                 args.input.a[warpgroup::groupid()],
                 args.input.b
             );
             warpgroup::mma_async_wait();
+            warp::add(args.state.accum,args.state.accum,partial);
             if(laneid() == 0) arrive(args.inputs_finished);
         }
         __device__ static void finish(consumer_finish_args<layout> args) {
@@ -146,17 +152,24 @@ void inner_run(
     using b_layout = typename mmt::layout::b_layout;
     using c_layout = typename mmt::layout::c_layout;
     using globals  = typename mmt::layout::globals;
+    using scale_a_layout = typename mmt::layout::scale_a_layout;
+    using scale_b_layout = typename mmt::layout::scale_b_layout;
+    auto key=std::make_tuple(d_A,d_B,d_C,d_scale_a,d_scale_b,M,N,K);
+    static std::map<decltype(key),globals> descriptors;
+    auto it=descriptors.find(key);
+    if(it==descriptors.end()) {
     a_layout Ag{d_A, nullptr, nullptr, M, K};
     b_layout Bg{d_B, nullptr, nullptr, N, K};
     c_layout Cg{d_C, nullptr, nullptr, M, N};
 
     // scales
-    using scale_a_layout = typename mmt::layout::scale_a_layout;
-    using scale_b_layout = typename mmt::layout::scale_b_layout;
     scale_a_layout scale_a{d_scale_a, nullptr, nullptr, nullptr, M};
     scale_b_layout scale_b{d_scale_b, nullptr, nullptr, nullptr, N};
 
     globals G{Ag, Bg, Cg, scale_a, scale_b};
+      it=descriptors.emplace(key,G).first;
+    }
+    globals const& G=it->second;
     prototype::lcf::kernel<mmt><<<grid, block, MAX_SHARED_MEMORY-1024>>>(G);
 }
 
@@ -200,13 +213,6 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
     CUDACHECK(cudaMalloc(&d_B_float, K*N*sizeof(float)));
     CUDACHECK(cudaMalloc(&d_C_ref, M*N*sizeof(float)));
 
-    // Copy float matrices to device and compute reference GEMM on GPU
-    CUDACHECK(cudaMemcpy(d_A_float, h_A, M*K*sizeof(float), cudaMemcpyHostToDevice));
-    CUDACHECK(cudaMemcpy(d_B_float, h_B, K*N*sizeof(float), cudaMemcpyHostToDevice));
-    reference_gemm<float, float, true>(d_C_ref, d_A_float, d_B_float, M, N, K);
-    CUDACHECK(cudaDeviceSynchronize());
-    std::cout << "Computed reference GEMM" << std::endl;
-
     // Obtain FP8 inputs with per-row/per-column scaling
     const float FP8_E4M3_MAX = 448.0f;
     c_dtype *h_scale_a = new c_dtype[M];
@@ -218,7 +224,7 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
     for(size_t row = 0; row < M; row++) {
         float max_val = 0.0f;
         for(size_t col = 0; col < K; col++) {
-            float abs_val = std::abs(h_A[row * K + col]);
+            float abs_val = kh_abs(h_A[row * K + col]);
             max_val = std::max(max_val, abs_val);
         }
         h_scale_a[row] = c_dtype(max_val / FP8_E4M3_MAX);
@@ -235,7 +241,7 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
     for(size_t col = 0; col < N; col++) {
         float max_val = 0.0f;
         for(size_t row = 0; row < K; row++) {
-            float abs_val = std::abs(h_B[row + col*K]);
+            float abs_val = kh_abs(h_B[row + col*K]);
             max_val = std::max(max_val, abs_val);
         }
         h_scale_b[col] = c_dtype(max_val / FP8_E4M3_MAX);
@@ -253,6 +259,12 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
     CUDACHECK(cudaMemcpy(d_scale_a, h_scale_a, M*sizeof(c_dtype), cudaMemcpyHostToDevice));
     CUDACHECK(cudaMemcpy(d_scale_b, h_scale_b, N*sizeof(c_dtype), cudaMemcpyHostToDevice));
 
+    // Decode the actual FP8 operands and scales for the independent oracle.
+    for(size_t i=0;i<M*K;++i) h_A[i]=float(h_A_fp8_scaled[i])*float(h_scale_a[i/K]);
+    for(size_t i=0;i<N*K;++i) h_B[i]=float(h_B_fp8_scaled[i])*float(h_scale_b[i/K]);
+    CUDACHECK(cudaMemcpy(d_A_float,h_A,M*K*sizeof(float),cudaMemcpyHostToDevice));
+    CUDACHECK(cudaMemcpy(d_B_float,h_B,N*K*sizeof(float),cudaMemcpyHostToDevice));
+    reference_gemm<float,float,true>(d_C_ref,d_A_float,d_B_float,M,N,K);
     // Set kernel attributes
     unsigned long mem_size = MAX_SHARED_MEMORY - 1024;
     CUDACHECK(cudaFuncSetAttribute(prototype::lcf::kernel<mmt>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size));
@@ -277,6 +289,7 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
         cudaEvent_t start, stop;
         CUDACHECK(cudaEventCreate(&start));
         CUDACHECK(cudaEventCreate(&stop));
+        kh_cold_l2();
         CUDACHECK(cudaEventRecord(start));
         inner_run<mmt>(d_A, d_B, d_C, d_scale_a, d_scale_b, M, N, K, grid, block);
         CUDACHECK(cudaEventRecord(stop));
@@ -290,6 +303,7 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
     }
     float tk_avg_ms = tk_total_ms / num_iters;
 
+    kh_check_device(d_C,d_C_ref,M*N,0.01,0.002,0.001);
     // Verify TK correctness - compare d_C (float) vs d_C_ref (float)
     float *h_C_out = new float[M * N];
     float *h_C_ref = new float[M * N];
@@ -298,7 +312,7 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
 
     int error_count = 0;
     for (size_t i = 0; i < M * N; ++i) {
-        float error = std::abs(float(h_C_out[i]) - h_C_ref[i]);
+        float error = kh_abs(float(h_C_out[i]) - h_C_ref[i]);
         if (error > 0.7f) error_count++;
     }
     std::cout << "TK error count (tol=0.7): " << error_count << " / " << M*N << std::endl;
@@ -316,6 +330,7 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
     // Allocate solution output buffer
     float *d_C_solution;
     CUDACHECK(cudaMalloc(&d_C_solution, M*N*sizeof(float)));
+    kh_poison(d_C_solution, M*N*sizeof(float));
 
     // Run solution
     Fp8GemmScaled(reinterpret_cast<__nv_fp8_e4m3*>(d_A),
@@ -332,10 +347,11 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
       std::vector<float> h_sol(M * N), h_ref(M * N);
       cudaMemcpy(h_sol.data(), d_C_solution, M * N * sizeof(float), cudaMemcpyDeviceToHost);
       cudaMemcpy(h_ref.data(), d_C_ref, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+      kh_compare_outputs(h_sol,h_ref,0.003,0.001,0.0003);
       float max_diff = 0;
       for (size_t i = 0; i < M * N; ++i)
-        max_diff = fmaxf(max_diff, fabsf(h_sol[i] - h_ref[i]));
-      if (max_diff > 1.0f) {
+        max_diff = fmaxf(max_diff, kh_abs(h_sol[i] - h_ref[i]));
+      if (max_diff > 0.02f) {
         fprintf(stderr, "Solution incorrect vs reference: max_diff=%.6f\n", max_diff);
         std::cout << "Incorrect" << std::endl;
         exit(-1);
@@ -360,6 +376,7 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
         cudaEvent_t start, stop;
         CUDACHECK(cudaEventCreate(&start));
         CUDACHECK(cudaEventCreate(&stop));
+        kh_cold_l2();
         CUDACHECK(cudaEventRecord(start));
         Fp8GemmScaled(reinterpret_cast<__nv_fp8_e4m3*>(d_A),
                        reinterpret_cast<__nv_fp8_e4m3*>(d_B),
@@ -405,8 +422,9 @@ void run_benchmark(const char* label, size_t M, size_t N, size_t K) {
     cudaFree(d_scale_b);
 }
 
-int main() {
-    run_benchmark<matmul_template<8>>("fp8_gemm_scaled_4096", 4096, 4096, 4096);
-    run_benchmark<matmul_template<8>>("fp8_gemm_scaled_8192", 8192, 8192, 8192);
+int main(int argc,char** argv) {
+    if(argc==4) {run_benchmark<matmul_template<8>>("custom",atoi(argv[1]),atoi(argv[2]),atoi(argv[3]));return 0;}
+    run_benchmark<matmul_template<8>>("fp8_scaled_decode", 128, 8192, 8192);
+    run_benchmark<matmul_template<8>>("fp8_scaled_prefill", 8192, 28672, 8192);
     return 0;
 }

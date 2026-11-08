@@ -1,3 +1,4 @@
+#include "hopper_validation.cuh"
 /***************************************************************************************************
  * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -252,7 +253,7 @@ struct FwdRunner {
   // B H Q K D
   using ProblemShapeType = cute::tuple<int, int, int, int, int>;
 
-  
+
   using StrideQ = cute::tuple<int, _1, cute::tuple<int, int>>;  // Q D (B H)
   using StrideK = cute::tuple<int, _1, cute::tuple<int, int>>;  // K D (B H)
   using StrideV = std::conditional_t<sizeof(Element) == 1,
@@ -331,14 +332,14 @@ struct FwdRunner {
     reference_abs_diff(block_O, block_ref_O, max_diff, mean_diff);
     bool passed_O = (max_diff < kMaxDiffThresh) && (mean_diff < kMeanDiffThresh);
     if (! passed_O) {
-      std::cerr << "failed O: max diff " << max_diff 
+      std::cerr << "failed O: max diff " << max_diff
                 << " mean " << mean_diff << std::endl;
     }
 
     reference_abs_diff(block_LSE, block_ref_LSE, max_diff, mean_diff);
     bool passed_LSE = (max_diff < kMaxDiffThresh) && (mean_diff < kMeanDiffThresh);
     if ( ! passed_LSE) {
-      std::cerr << "failed LSE: max diff " << max_diff 
+      std::cerr << "failed LSE: max diff " << max_diff
                 << " mean " << mean_diff << std::endl;
     }
 
@@ -451,7 +452,7 @@ struct FwdRunner {
       auto shape_QO = cute::make_shape(B, H, Q, D_aligned);
       cutlass::DeviceAllocation<Element> block_sol_O;
       block_sol_O.reset(size(shape_QO));
-      cudaMemset(block_sol_O.get(), 0, block_sol_O.size() * sizeof(Element));
+      cudaMemset(block_sol_O.get(), 0xff, block_sol_O.size() * sizeof(Element));
 
       cudaError_t sol_err = HopperFmha(
         B, H, Q, K, D_aligned,
@@ -470,7 +471,7 @@ struct FwdRunner {
       // Compare solution output to CUTLASS reference
       double max_diff = 0, mean_diff = 0;
       reference_abs_diff(block_sol_O, block_O, max_diff, mean_diff);
-      if (max_diff > 0.05 || mean_diff > 0.01) {
+      if (!std::isfinite(max_diff) || !std::isfinite(mean_diff) || max_diff > 0.004 || mean_diff > 0.0004) {
         std::cerr << "Solution incorrect vs CUTLASS reference. max_diff=" << max_diff
                   << " mean_diff=" << mean_diff << std::endl;
         std::cout << "Incorrect" << std::endl;
@@ -498,6 +499,7 @@ struct FwdRunner {
     // Profile reference
     float ref_total_ms = 0, ref_min_ms = 1e30f;
     for (int iter = 0; iter < kIterations; ++iter) {
+      kh_cold_l2();
       cudaEventRecord(start);
       op.run();
       cudaEventRecord(stop);
@@ -541,6 +543,7 @@ struct FwdRunner {
       // Profile solution
       float sol_total_ms = 0, sol_min_ms = 1e30f;
       for (int iter = 0; iter < kIterations; ++iter) {
+        kh_cold_l2();
         cudaEventRecord(start);
         HopperFmha(B, H, Q, K, D_aligned,
           reinterpret_cast<__half const*>(block_Q.get()),
@@ -587,7 +590,7 @@ struct BwdRunner {
   using ProblemShapeType = cute::tuple<int, int, int, int, int>;
 
   using Operation = cutlass::fmha::device::FmhaBwd<Element, ElementAccumulator, TileShape, ActiveFusion, KernelOptions...>;
-  
+
   // Just like forward
   using StrideQ = cute::tuple<int, int, int, _1>; // B H Q D
   using StrideK = cute::tuple<int, int, int, _1>; // B H K D
@@ -691,21 +694,21 @@ struct BwdRunner {
     reference_abs_diff(block_dQ, block_ref_dQ, max_diff, mean_diff);
     bool passed_dQ = (max_diff < 1e-2) && (mean_diff < 1e-3);
     if (! passed_dQ) {
-      std::cerr << "failed dQ: max diff " << max_diff 
+      std::cerr << "failed dQ: max diff " << max_diff
                 << " mean " << mean_diff << std::endl;
     }
 
     reference_abs_diff(block_dK, block_ref_dK, max_diff, mean_diff);
     bool passed_dK = (max_diff < 1e-2) && (mean_diff < 1e-3);
     if (! passed_dK) {
-      std::cerr << "failed dK: max diff " << max_diff 
+      std::cerr << "failed dK: max diff " << max_diff
                 << " mean " << mean_diff << std::endl;
     }
 
     reference_abs_diff(block_dV, block_ref_dV, max_diff, mean_diff);
     bool passed_dV = (max_diff < 1e-2) && (mean_diff < 1e-3);
     if (! passed_dV) {
-      std::cerr << "failed dV: max diff " << max_diff 
+      std::cerr << "failed dV: max diff " << max_diff
                 << " mean " << mean_diff << std::endl;
     }
 
@@ -821,7 +824,7 @@ struct BwdRunner {
     cudaMemset(block_dQ.get(), 0, block_dQ.size() * sizeof(Element));
     cudaMemset(block_dK.get(), 0, block_dK.size() * sizeof(Element));
     cudaMemset(block_dV.get(), 0, block_dV.size() * sizeof(Element));
-    
+
     status = op.run();
     if (status != cutlass::Status::kSuccess) {
       std::cerr << "Failed to launch the CUTLASS kernel. Last CUDA error is: "
@@ -1139,9 +1142,9 @@ int main(int argc, char const **args) {
     configs.push_back({"custom", options.b, options.h, options.q, options.k, options.d});
   } else {
     configs = {
-      {"small",   4,  8, 256, 256, 64},
-      {"medium", 16, 16, 512, 512, 64},
-      {"large",   4, 16, 2048, 2048, 64},
+      {"vision_prefill",1,16,8192,8192,128},
+      {"cross_attention",1,32,4096,8192,128},
+      {"long_prefill",1,16,16384,16384,128},
     };
   }
 

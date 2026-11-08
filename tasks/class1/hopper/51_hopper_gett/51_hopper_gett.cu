@@ -1,3 +1,4 @@
+#include "hopper_validation.cuh"
 /***************************************************************************************************
  * Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
@@ -55,8 +56,8 @@ __global__ void NaiveGettRef_kernel(
     float acc = 0.0f;
     for (int k = 0; k < K; ++k) {
       // A col-major: A[i + k * lda]
-      // B col-major: B[k + j * ldb]
-      acc += __half2float(A[i + k * lda]) * __half2float(B[k + j * ldb]);
+      // B col-major: B[(k%128) + 128*(j+N*(k/128))]
+      acc += __half2float(A[i + k * lda]) * __half2float(B[(k%128) + 128*(j+N*(k/128))]);
     }
     // C col-major: C[i + j * ldc]
     // D col-major: D[i + j * ldd]
@@ -68,7 +69,7 @@ __global__ void NaiveGettRef_kernel(
 __global__ void InitHalf51_kernel(__half *matrix, int size, int seed) {
   int idx = threadIdx.x + blockIdx.x * blockDim.x;
   if (idx < size) {
-    float value = float(((idx + seed) * 16807 % 16) - 8) * 0.01f;
+    float value = kh_random(idx,seed);
     matrix[idx] = __float2half(value);
   }
 }
@@ -114,21 +115,21 @@ static auto MakeGettProblem51(int M, int N, int K) {
   auto problem_shape = make_shape(
     make_shape(M, 1, 1, 1),    // M modes
     make_shape(N, 1, 1, 1),    // N modes
-    make_shape(K, 1, 1),       // K modes
+    make_shape(128, K/128, 1),       // K modes
     make_shape(1, 1, 1, 1)     // L modes (no batching)
   );
 
   // A: column-major [M, K]
   StrideA51 stride_A = make_stride(
     make_stride(cute::Int<1>{}, int64_t(0), int64_t(0), int64_t(0)),
-    make_stride(int64_t(M), int64_t(0), int64_t(0)),
+    make_stride(int64_t(M), int64_t(128)*M, int64_t(0)),
     make_stride(int64_t(0), int64_t(0), int64_t(0), int64_t(0))
   );
 
   // B: column-major [K, N]
   StrideB51 stride_B = make_stride(
-    make_stride(int64_t(K), int64_t(0), int64_t(0), int64_t(0)),
-    make_stride(cute::Int<1>{}, int64_t(0), int64_t(0)),
+    make_stride(int64_t(128), int64_t(0), int64_t(0), int64_t(0)),
+    make_stride(cute::Int<1>{}, int64_t(128)*N, int64_t(0)),
     make_stride(int64_t(0), int64_t(0), int64_t(0), int64_t(0))
   );
 
@@ -161,8 +162,7 @@ static cudaError_t CutlassGett51(
     ElementEpi51(alpha), ElementEpi51(beta));
 
   if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
-  auto err = cudaDeviceSynchronize();
-  if (err != cudaSuccess) return err;
+
   return cudaSuccess;
 }
 #endif
@@ -186,28 +186,14 @@ cudaError_t TestCorrectness(int M, int N, int K, float alpha, float beta) {
   cudaMalloc(&D_cutlass, total_CD * sizeof(float));
   cudaMemset(D_cutlass, 0, total_CD * sizeof(float));
 
-  // Run naive reference
-  {
-    dim3 bl(16, 16), gr((M + 15) / 16, (N + 15) / 16);
-    NaiveGettRef_kernel<<<gr, bl>>>(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, D_ref, ldd);
-  }
-  cudaDeviceSynchronize();
-
-  bool cutlass_ok = false;
-#if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
-  if (CutlassGett51(M, N, K, alpha,
-      (cutlass::half_t const*)A, (cutlass::half_t const*)B,
-      beta, (cutlass::half_t const*)C, D_cutlass) == cudaSuccess) {
-    cutlass_ok = true;
-  } else {
-    cudaGetLastError(); // clear error
-  }
-#endif
-
+  bool cutlass_ok = true;
+  if(CutlassGett51(M,N,K,alpha,(cutlass::half_t*)A,(cutlass::half_t*)B,beta,(cutlass::half_t*)C,D_cutlass)!=cudaSuccess) return cudaErrorUnknown;
+  kh_sample_gemm<__half,__half,__half,float,true,true>(M,N,K,alpha,A,B,beta,C,D_cutlass);
 #ifdef KH_TEST_SOLUTION
   float *D_sol;
   cudaMalloc(&D_sol, total_CD * sizeof(float));
-  cudaMemset(D_sol, 0, total_CD * sizeof(float));
+    kh_poison(D_sol, total_CD * sizeof(float));
+  cudaMemset(D_sol, 0xff, total_CD * sizeof(float));
 
   cudaError_t sr = HopperGett(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, D_sol, ldd);
   if (sr != cudaSuccess) {
@@ -221,8 +207,9 @@ cudaError_t TestCorrectness(int M, int N, int K, float alpha, float beta) {
   std::vector<float> hs(total_CD), hr(total_CD);
   cudaMemcpy(hs.data(), D_sol, total_CD * sizeof(float), cudaMemcpyDeviceToHost);
   cudaMemcpy(hr.data(), D_check, total_CD * sizeof(float), cudaMemcpyDeviceToHost);
+  kh_compare_outputs(hs,hr,0.01,0.0005,0.0001);
   float md = 0;
-  for (int64_t i = 0; i < total_CD; ++i) md = fmaxf(md, fabsf(hs[i] - hr[i]));
+  for (int64_t i = 0; i < total_CD; ++i) md = fmaxf(md, kh_abs(hs[i] - hr[i]));
   if (md > 1.0f) {
     std::cerr << "Solution incorrect. Max diff: " << md << std::endl;
     cudaFree(D_sol); cudaFree(D_ref); cudaFree(D_cutlass); cudaFree(C); cudaFree(B); cudaFree(A);
@@ -264,6 +251,7 @@ void Profile(int M, int N, int K, float alpha, float beta, int iterations) {
     cudaDeviceSynchronize();
     float rt = 0;
     for (int i = 0; i < iterations; ++i) {
+      kh_cold_l2();
       cudaEventRecord(t0);
       CutlassGett51(M, N, K, alpha,
         (cutlass::half_t const*)A, (cutlass::half_t const*)B,
@@ -300,7 +288,7 @@ void Profile(int M, int N, int K, float alpha, float beta, int iterations) {
     cudaMemcpy(h_ref.data(), D_ref_saved, total_CD * sizeof(float), cudaMemcpyDeviceToHost);
     cudaFree(D_ref_saved);
     float md = 0;
-    for (int64_t i = 0; i < total_CD; ++i) md = fmaxf(md, fabsf(h_sol[i] - h_ref[i]));
+    for (int64_t i = 0; i < total_CD; ++i) md = fmaxf(md, kh_abs(h_sol[i] - h_ref[i]));
     if (md > 1.0f) {
       fprintf(stderr, "Solution incorrect in Profile: max_diff=%.6f\n", md);
       std::cout << "Incorrect" << std::endl;
@@ -316,6 +304,7 @@ void Profile(int M, int N, int K, float alpha, float beta, int iterations) {
 
   float st = 0, sm = 1e30f;
   for (int i = 0; i < iterations; ++i) {
+    kh_cold_l2();
     cudaEventRecord(t0);
     HopperGett(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, D, ldd);
     cudaEventRecord(t1);
@@ -359,9 +348,9 @@ int main(int argc, char const* argv[]) {
     configs.push_back({"custom", M, N, K});
   } else {
     configs = {
-      {"small",   1024, 1024, 1024},
-      {"medium",  4096, 4096, 4096},
-      {"large",   8192, 8192, 8192},
+      {"decode",128,8192,8192},
+      {"prefill",8192,8192,8192},
+      {"mlp",8192,28672,8192},
     };
   }
 

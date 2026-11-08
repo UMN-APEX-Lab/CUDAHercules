@@ -8,8 +8,8 @@ LIBS     = -lcuda -lcudadevrt -lcudart_static -lrt -lpthread -ldl
 ref: linear_attention.cu
 	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_HOPPER $< -o $@
 
-test: linear_attention.cu solution.h
-	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_HOPPER -DKH_TEST_SOLUTION $< -o $@
+test: solution_wrapper.cu solution_api.h linear_attention.cu solution.h
+	$(NVCC) $(NVCC_FLAGS) $(ARCH) $(TK_INC) $(LIBS) -DKITTENS_HOPPER -DKH_TEST_SOLUTION linear_attention.cu solution_wrapper.cu -o $@
 
 clean:
 	rm -f ref test

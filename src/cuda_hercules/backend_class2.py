@@ -13,7 +13,7 @@ import os
 from .backend_base import Backend
 from .task_schema import TaskConfig
 from .result import PerfMetrics
-from .utils import get_project_root
+from .utils import get_project_root, task_source_hash
 
 # Module-level cache for reference benchmarks
 _ref_benchmarks = None
@@ -68,7 +68,10 @@ class Class2DefpyBackend(Backend):
         benchmarks = _load_ref_benchmarks()
         cached_ref_time = 0.0
         if config.task_id in benchmarks:
-            cached_ref_time = benchmarks[config.task_id].get("ref_mean_ms", 0.0)
+            field = "ref_min_ms" if config.task_id.startswith("class2/hopper/") else "ref_mean_ms"
+            entry = benchmarks[config.task_id]
+            if "/hopper/" not in config.task_id or entry.get("source_hash") == task_source_hash(self._workdir):
+                cached_ref_time = entry.get(field, 0.0)
 
         tol = config.correctness.tolerances
         measure_perf = bool(getattr(config, "_measure_perf", True))

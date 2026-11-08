@@ -9,7 +9,8 @@ hardware:
   min_sm: 90
   tested_sms:
   - 90
-  required_features: []
+  required_features:
+  - sm_90a
 runner:
   backend: class1_make
   workdir: tasks/class1/hopper/55_hopper_mixed_dtype_gemm
@@ -43,6 +44,12 @@ source:
   license: BSD-3-Clause
 anti_cheat:
   blocked_patterns:
+  - '#include\s*[<"][^">]*(?:reference|harness|common\.cuh|hopper_validation|hopper_gemm_oracle|solution_api|\.\.)'
+  - \b(?:__nv_fp8\w*|float_e[45]m[23]_t)\b
+  - cvt\.[^;\n]*\.(?:e4m3|e5m2)
+  - \b(?:__nv_fp4\w*|float_e2m1_t)\b
+  - cvt\.[^;\n]*\.e2m1
+  - \b(?:Cutlass(?:Gemm|Gett)\w*|RunCutlassReference|reference_gemm\w*|kh_\w+|launch_tk_rotary|inner_run|run_ref_kernel|based_init|la_init|hedgehog_init|la_kernel|based_linear_attention|hedgehog_linear_attention_smd)\b
   required_patterns:
   - __global__\s+void
   - <<<.*>>>

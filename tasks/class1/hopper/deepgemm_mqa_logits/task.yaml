@@ -4,20 +4,21 @@ name: deepgemm_mqa_logits
 task_class: 1
 domain: ml
 tags:
-  - attention
-  - mqa
-  - fp8
+- attention
+- mqa
+- fp8
 hardware:
   min_sm: 90
   tested_sms:
-    - 90
-  required_features: []
+  - 90
+  required_features:
+  - sm_90a
 runner:
   backend: class1_make
   workdir: tasks/class1/hopper/deepgemm_mqa_logits
   timeout_sec: 300
   env:
-    KH_BENCHMARK: "20"
+    KH_BENCHMARK: '20'
   solution_file: solution.h
 build:
   cmd: make test
@@ -35,18 +36,22 @@ correctness:
 performance:
   enabled: true
   parser:
-    kernel_time_ms_regex: 'Kernel time:\s*([0-9.]+)\s*ms'
-    ref_time_ms_regex: 'Ref time:\s*([0-9.]+)\s*ms'
+    kernel_time_ms_regex: Kernel time:\s*([0-9.]+)\s*ms
+    ref_time_ms_regex: Ref time:\s*([0-9.]+)\s*ms
   metric: speedup_ref_over_sol
 source:
   repo: deepseek-ai/DeepGEMM
   files: []
-  commit: ""
+  commit: ''
   license: MIT
 anti_cheat:
   blocked_patterns:
-    - '#include\s*[<"]deep_gemm'
-    - 'deep_gemm::'
+  - '#include\s*[<"]deep_gemm'
+  - 'deep_gemm::'
+  - '#include\s*[<"][^">]*(?:reference|harness|common\.cuh|hopper_validation|hopper_gemm_oracle|solution_api|\.\.)'
+  - \b(?:__nv_fp4\w*|float_e2m1_t)\b
+  - cvt\.[^;\n]*\.e2m1
+  - \b(?:Cutlass(?:Gemm|Gett)\w*|RunCutlassReference|reference_gemm\w*|kh_\w+|launch_tk_rotary|inner_run|run_ref_kernel|based_init|la_init|hedgehog_init|la_kernel|based_linear_attention|hedgehog_linear_attention_smd)\b
   required_patterns:
-    - '__global__\s+void'
-    - '<<<.*>>>'
+  - __global__\s+void
+  - <<<.*>>>

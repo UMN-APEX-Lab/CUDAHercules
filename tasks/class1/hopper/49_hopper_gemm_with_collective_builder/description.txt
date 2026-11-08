@@ -1,51 +1,19 @@
-# Task: 49_hopper_gemm_with_collective_builder
+Implement a CUDA kernel for Hopper SM90 (H200).
 
-## Target Hardware
-NVIDIA Hopper GPU (SM90).
+FP16 GEMM, fp32 accumulation, fp16 output. A row-major [M,K], B column-major [K,N], D column-major [M,N].
+D = alpha*A@B + beta*D. beta=0 means D is output-only.
 
-
-Half-precision GEMM using CUTLASS 3.0 CollectiveBuilder on Hopper.
-
-## Function Signature
-
-Implement the following function in `solution.h`:
-
-```cuda
-#pragma once
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-
+Required public API:
 cudaError_t HopperCollectiveGemm(
     int M, int N, int K, float alpha,
     __half const *A, int lda,
     __half const *B, int ldb,
-    float beta,
-    __half *D, int ldd);
-```
+    float beta, __half *D, int ldd);
 
-## Operation
+Default cases ():
+{"decode",128,8192,8192}
+{"prefill",8192,8192,8192}
+{"mlp",8192,28672,8192}
 
-D = alpha * A * B + beta * D
-
-Where:
-- A is M x K (row-major, half)
-- B is K x N (column-major, half)
-- D is M x N (column-major, half)
-
-## Memory Layout
-
-- A: Row-major. Element (i,k) at `A[i * lda + k]`. lda >= K.
-- B: Column-major. Element (k,j) at `B[k + j * ldb]`. ldb >= K.
-- D: Column-major. Element (i,j) at `D[i + j * ldd]`. ldd >= M.
-
-## Build & Test
-
-```bash
-make test
-./test
-./test 1024 1024 1024
-```
-
-Correctness verified at small (1024), medium (4096), large (8192) sizes.
-
-CUTLASS headers are available on the include path.
+The harness generates fractional random inputs, poisons output-only buffers, and rejects nonfinite results.
+Reference and solution use the same cold-L2 timing policy and per-case minimum; every reported case contributes to the geometric-mean speedup.
