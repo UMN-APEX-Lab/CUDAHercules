@@ -31,9 +31,11 @@ Where:
 
 All matrices are `double` (FP64).
 
-The computation must be carried out in FP64: lower-precision paths (FP32, TF32, FP16, BF16,
-FP8, INT8 arithmetic or tensor cores, or rounding the inputs to a lower precision) are not
-allowed, even if they happen to pass the tolerance.
+The result must be FP64-accurate: it is checked against an FP64 reference with the tolerance
+below, which plain FP32 (or lower-precision) computation cannot meet. How FP64 accuracy is
+reached is up to you: native FP64 arithmetic, or emulating FP64 with lower-precision units
+(e.g. double-float arithmetic, or Ozaki-style splitting on tensor cores), are both allowed as
+long as the result meets the tolerance.
 
 ## Memory Layout
 

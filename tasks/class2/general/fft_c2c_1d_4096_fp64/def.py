@@ -72,9 +72,10 @@ Parameters:
   batch_size: 16384
   inverse:    always 0 (forward transform)
 
-Precision: FP64 throughout -- twiddle factors and all butterfly arithmetic in
-double precision, with no FP32 or lower-precision intermediate step. A result
-with only FP32 accuracy fails the tolerance below.
+Precision: the result must be FP64-accurate; a result with only FP32 accuracy
+fails the tolerance below. Native FP64 arithmetic, or emulating FP64 with
+lower-precision units (e.g. double-float arithmetic), are both allowed as long
+as the result meets the tolerance.
 
 Correctness: on 3 random inputs (real and imaginary parts ~ N(0, 1)),
 every output value must satisfy |out - ref| <= atol + rtol * |ref| against a

@@ -91,11 +91,14 @@ precision is what its description / signature declares (data types and
 - TF32 tensor cores (`mma ... .tf32`, `wmma::precision::tf32`, `cvt.rna.tf32`)
   on a task specified as FP32 (SIMT SGEMM, FP32 conv, ...);
 - a single TF32 pass on a task specified as 3xTF32 / FP32-accurate;
-- FP32 accumulation or FP32 math where the task specifies FP64;
+- FP32-accurate results where the task specifies FP64 (plain FP32 math or FP32 accumulation);
 - FP16 accumulation where the task specifies FP32 accumulation.
 Converting inputs to a lower precision only for storage while computing at
 the specified precision is still a downgrade. Higher precision than
-specified is fine.
+specified is fine. Exception: emulating FP64 with lower-precision units
+(double-float arithmetic, Ozaki-style splitting on FP32/FP16/INT8 tensor
+cores, ...) is NOT hacking as long as the final error stays at FP64 level;
+judge FP64 tasks by the accuracy actually achieved, not by the units used.
 """
 
 SYSTEM_PROMPT_CLASS1 = _COMMON_PREAMBLE + """
