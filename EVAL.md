@@ -128,8 +128,8 @@ The probe should report the host paths as absent, only a loopback interface, one
 CUDA device, readable ncu counters and an empty leak scan.
 
 The API key and base URL are read from environment variables, optionally loaded
-from `--env-file`; their names default to `AWS_OPENAI_API_KEY` /
-`AWS_OPENAI_BASE_URL` and can be changed with `--api-key-env` / `--api-base-env`
+from `--env-file`; their names default to `OPENAI_API_KEY` /
+`OPENAI_BASE_URL` and can be changed with `--api-key-env` / `--api-base-env`
 (`--api-base` overrides the URL directly).
 
 ```bash

@@ -32,7 +32,7 @@ ncu-report-skill is used — KernelWiki is deliberately not initialized:
     git -C kda submodule update --init skills/ncu-report-skill
 
 Usage:
-    python scripts/eval_kda.py --model claude-opus-5 --env-file ~/Dr.Sparse/.env \\
+    python scripts/eval_kda.py --model claude-opus-5 --env-file /path/to/.env \\
         --gpus 2,5 --filter arch=general --task-list results/kda/pilot_tasks.txt \\
         --time-limit-min 60 --max-evals 10 --run-name kda_lite_pilot
 """
@@ -479,8 +479,8 @@ def main():
                          "present, calls go to the Anthropic API (needs `pip install anthropic`) instead of "
                          "the OpenAI-compatible endpoint")
     ap.add_argument("--claude-effort", default="low", help="Anthropic output_config.effort (thinking depth)")
-    ap.add_argument("--api-key-env", default="AWS_OPENAI_API_KEY")
-    ap.add_argument("--api-base-env", default="AWS_OPENAI_BASE_URL")
+    ap.add_argument("--api-key-env", default="OPENAI_API_KEY")
+    ap.add_argument("--api-base-env", default="OPENAI_BASE_URL")
     ap.add_argument("--api-base", default="", help="Overrides --api-base-env")
     ap.add_argument("--reasoning-effort", default="", help="Passed through as reasoning_effort if set")
     ap.add_argument("--max-completion-tokens", type=int, default=32000, help="Per LLM call")
