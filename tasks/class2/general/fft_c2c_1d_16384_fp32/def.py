@@ -71,8 +71,11 @@ Parameters:
   batch_size: 8192
   inverse:    always 0 (forward transform)
 
-Precision: FP32 (or higher) arithmetic for twiddle factors and butterflies;
-FP16 / BF16 / TF32 or other reduced-precision arithmetic is not allowed.
+Precision: the result must be FP32-accurate; single-pass lower-precision
+(FP16 / BF16 / TF32) computation cannot meet the tolerance below. Native FP32
+arithmetic, or emulating FP32 with lower-precision units (e.g. split-precision
+tensor-core arithmetic), are both allowed as long as the result meets the
+tolerance.
 
 Correctness: on 3 random inputs (real and imaginary parts ~ N(0, 1)),
 every output value must satisfy |out - ref| <= atol + rtol * |ref| against a

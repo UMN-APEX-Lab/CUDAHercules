@@ -5,6 +5,8 @@ Source: flash-attention/csrc/layer_norm/ln_bwd_kernels.cuh
 Operation: Compute dx (bf16), dgamma, dbeta (fp32) given upstream gradient dz (bf16),
 saved x (bf16), mu, rs (fp32) and gamma (fp32).
 """
+import math
+
 import torch
 
 ROWS = 32768
@@ -33,13 +35,49 @@ TOLERANCES = {"atol": 0.001, "rtol": 0.024}  # mirrored in task.yaml correctness
 HAS_CUDA_REFERENCE = True
 REFERENCE_EXTRA_INCLUDES = ["reference_sources/layer_norm"]
 
+# Realistic activation rows (see "Inputs" in DESCRIPTION). Row classes sit at fixed row
+# indices, so every input set has the same mix:
+#   i % 8 == 3      mean-offset rows c_i + s_i * N(0, 1), |c_i| / s_i = 10^U(1, log10(50)),
+#                   random sign: a mean that is large relative to the spread (outlier tokens);
+#                   E[x^2] - mu^2 cancels badly on them and BF16 quantizes their spread.
+#   i % 512 == 100  constant rows: every element is c_i ~ N(0, 1) (variance 0, rs = 1/sqrt(eps)).
+#   i % 512 == 356  near-constant rows c_i + t_i * N(0, 1), c_i ~ N(0, 1), t_i = 10^U(-5, -3)
+#                   (variance << eps once rounded to BF16).
+#   other rows      zero-mean rows s_i * N(0, 1).
+# s_i = 10^U(-2, 1) per row: rows with a small variance make eps matter.
+OFFSET_RATIO_MAX = 50.0
+
+
+def _row_scale_and_classes():
+    i = torch.arange(ROWS, device='cuda')
+    s = torch.pow(10.0, torch.empty(ROWS, 1, device='cuda').uniform_(-2.0, 1.0))
+    return s, i[i % 8 == 3], i[i % 512 == 100], i[i % 512 == 356]
+
+
+def _add_mean_offset(a, s, off):
+    ratio = torch.pow(10.0, torch.empty(off.numel(), 1, device='cuda').uniform_(
+        1.0, math.log10(OFFSET_RATIO_MAX)))
+    sign = torch.randint(0, 2, (off.numel(), 1), device='cuda').float() * 2.0 - 1.0
+    a[off] += sign * ratio * s[off]
+
+
+def _activation():
+    """BF16 activation x [ROWS, COLS] with the row classes above."""
+    s, off, const, near = _row_scale_and_classes()
+    a = torch.randn(ROWS, COLS, device='cuda', dtype=torch.float32) * s
+    _add_mean_offset(a, s, off)
+    a[const] = torch.randn(const.numel(), 1, device='cuda').expand(-1, COLS)
+    t = torch.pow(10.0, torch.empty(near.numel(), 1, device='cuda').uniform_(-5.0, -3.0))
+    a[near] = (torch.randn(near.numel(), 1, device='cuda')
+               + t * torch.randn(near.numel(), COLS, device='cuda'))
+    return a.to(torch.bfloat16)
+
 
 def get_inputs():
-    # Per-row scale 10^U(-2, 1) on x: rs spans ~0.1 .. 95, so dx (proportional to rs)
+    # rs spans ~0.1 .. 316 (1/sqrt(eps) on the constant rows), so dx (proportional to rs)
     # covers a wide range and a missing ds/db term or BF16 arithmetic shows up on the
-    # high-rs rows.
-    row_scale = torch.pow(10.0, torch.empty(ROWS, 1, device='cuda').uniform_(-2.0, 1.0))
-    x = (torch.randn(ROWS, COLS, device='cuda', dtype=torch.float32) * row_scale).to(torch.bfloat16)
+    # high-rs rows. mu and rs are what the forward pass saves: the FP32 statistics of x.
+    x = _activation()
     xf = x.float()
     mu = xf.mean(dim=-1)
     rs = torch.rsqrt(xf.var(dim=-1, unbiased=False) + 1e-5)
@@ -100,9 +138,18 @@ Dimensions: rows=%d, cols=%d. All tensors are contiguous and row-major:
   dz, x, dx            bfloat16 (__nv_bfloat16), passed as void pointers
   mu, rs, gamma        float32
   dgamma, dbeta        float32
-Inputs: x[i, :] = bf16(s_i * N(0, 1)) with a per-row scale s_i = 10^U(-2, 1); mu and rs
-are the FP32 statistics of float(x) (so rs[i] ranges over ~0.1 .. 95); gamma is
-i.i.d. N(0, 1); dz = bf16(N(0, 1)).
+Inputs: x is the forward activation.
+Every row i has a scale s_i = 10^U(-2, 1). One row in every 8 is a mean-offset row,
+x[i, :] = bf16(c_i + s_i * N(0, 1)) with |c_i| / s_i = 10^U(1, log10(50)) and a random
+sign (a mean that is large relative to the spread, as on outlier tokens; BF16 rounding
+quantizes the spread of these rows). One row in every 512 is constant,
+x[i, :] = bf16(c_i) with c_i ~ N(0, 1) (variance 0, so rs = 1/sqrt(eps)), and one row in
+every 512 is near-constant, x[i, :] = bf16(c_i + t_i * N(0, 1)) with c_i ~ N(0, 1) and
+t_i = 10^U(-5, -3) (variance << eps). All other rows are zero-mean,
+x[i, :] = bf16(s_i * N(0, 1)). The row classes sit at the same row indices in every
+input set.
+mu and rs are the FP32 statistics of float(x) (so rs[i] ranges over ~0.1 .. 316); gamma
+is i.i.d. N(0, 1); dz = bf16(N(0, 1)).
 Outputs: dx [rows, cols] (bf16), dgamma [cols] (fp32), dbeta [cols] (fp32).
 
 Precision: BF16 is only the storage format of the activations and gradients. All

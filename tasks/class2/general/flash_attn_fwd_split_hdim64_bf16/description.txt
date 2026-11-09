@@ -23,6 +23,19 @@ Inputs (bf16, contiguous, [B, H, S, D] layout):
   num_splits = 4: passed by the caller; O and lse must equal attention over the
     full key sequence however the work is partitioned.
 
+Input distribution (each of the 3 input sets is a fresh random draw; it mimics the
+attention logits of a trained LLM). V is i.i.d. N(0, 1), rounded to bf16. Q and K are
+constructed so that the logits S[i][j] = scale * dot(Q[i], K[j]) have this structure:
+  - ordinary logits are ~ N(0, (3.6 * r_i)^2) with a per-query norm factor
+    r_i = exp(0.3 * clip(N(0, 1), -3, 3)) (overall logit std ~4);
+  - key 0 is an attention sink: its logit is +16 higher, for every query;
+  - the first min(40, Sq/2) query rows have logits shifted by -120 against the first
+    40 keys (very negative logits).
+  Construction: Q[i] = r_i*a*z_i + m*u (+ n*w for the first min(40, Sq/2) rows),
+  K[j] = a*y_j (+ m*u for j = 0) (- n*w for j < 40), with z_i, y_j ~ N(0, I) projected
+  orthogonal to two fixed orthonormal vectors u, w, and a, m, n set to give the logit
+  statistics above; Q and K are then rounded to bf16.
+
 Outputs:
   O:   [16, 8, 8, 64] bf16
   lse: [16, 8, 8] fp32
@@ -30,9 +43,15 @@ Outputs:
 Precision: dot products, softmax statistics and the P*V sums must be accumulated
 in FP32 (or higher); O is rounded to bf16 once, at the end.
 
-Correctness: on 3 random input sets (Q, K, V ~ N(0, 1)), O and lse are each
-compared element-wise with a reference: |out - ref| <= atol + rtol * |ref|,
-atol = 0.001, rtol = 0.01.
+Correctness: O and lse are compared with a reference implementation over
+3 random input sets; each output must pass both checks
+  element-wise:   |out - ref| <= atol + rtol * |ref|
+  normalized RMS: sqrt(mean((out - ref)^2)) / sqrt(mean(ref^2)) <= max_rms
+with
+  O:   atol = 0.004, rtol = 0.01, max_rms = 0.004
+  lse: atol = 0.0004, rtol = 0, max_rms = 3e-06
+NaN/Inf fail, and every output element must be written (output buffers are
+pre-filled with NaN).
 
 
 ## Function Signature

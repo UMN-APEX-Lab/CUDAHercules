@@ -159,7 +159,7 @@ extern "C" void launch_flash_attn_bwd(
 
     FLASH_NAMESPACE::run_mha_bwd_<cutlass::bfloat16_t, 32, false>(params, stream);
 
-    cudaStreamSynchronize(stream);
-    /* cudaFree(dq_accum); removed — buffer cached across invocations */
-    /* cudaFree(dsoftmax_sum); removed — buffer cached across invocations */
+    // No host-side sync: dq_accum / dsoftmax_sum are cached across calls (no per-call
+    // cudaMalloc/cudaFree), and the memset, the backward kernels and the dq_accum -> dQ
+    // conversion are all ordered on `stream`.
 }

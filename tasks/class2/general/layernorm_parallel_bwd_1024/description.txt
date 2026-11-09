@@ -28,8 +28,19 @@ Dimensions: rows=131072, cols=1024. All tensors are contiguous and row-major:
   dz, x, dx0, dresidual    bfloat16 (__nv_bfloat16), passed as void pointers
   mu, rs, gamma            float32
   dgamma, dbeta            float32
-Inputs: x0[i, :] and residual[i, :] are bf16(s_i * N(0, 1)) with a per-row scale
-s_i = 10^U(-2, 1) (so rs[i] ranges over ~0.07 .. 70); gamma is i.i.d. N(0, 1);
+Inputs: x0 is the block output and residual the residual stream; every row i has a scale
+s_i = 10^U(-2, 1). One row in every 8 is a mean-offset row: x0[i, :] = bf16(s_i * N(0, 1))
+and residual[i, :] = bf16(c_i + s_i * N(0, 1)) with |c_i| / s_i = 10^U(1, log10(50)) and
+a random sign (a mean that is large relative to the spread, as on outlier tokens; BF16
+rounding quantizes the spread of these rows). One row in every 512 is constant:
+x0[i, :] = 0 and residual[i, :] = bf16(c_i) with c_i ~ N(0, 1) (variance 0, so
+rs = 1/sqrt(eps)). One row in every 512 is near-constant: x0[i, :] = 0 and
+residual[i, :] = bf16(c_i + t_i * N(0, 1)) with c_i ~ N(0, 1) and t_i = 10^U(-5, -3)
+(variance << eps).
+All other rows have x0[i, :] and residual[i, :] = bf16(s_i * N(0, 1)). The row classes sit
+at the same row indices in every input set.
+mu and rs are the FP32 statistics of the FP32 sum x0 + residual and x is that sum
+rounded to bf16 (so rs[i] ranges over ~0.07 .. 316); gamma is i.i.d. N(0, 1);
 dz = bf16(N(0, 1)).
 Outputs: dx0 [rows, cols] (bf16), dresidual [rows, cols] (bf16), dgamma [cols] (fp32),
 dbeta [cols] (fp32).

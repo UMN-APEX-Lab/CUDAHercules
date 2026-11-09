@@ -16,6 +16,44 @@ HEAD_DIM = 256
 
 SCALE = 1.0 / math.sqrt(HEAD_DIM)
 
+# Test-input distribution: Q and K are built so that the attention logits
+# S = scale * Q K^T look like those of a trained LLM (see DESCRIPTION):
+#   ordinary logits ~ N(0, (LOGIT_STD * r_i)^2), r_i = exp(QNORM_LOGSTD * clip(N(0,1), -3, 3))
+#   key 0 is an attention sink: +SINK_LOGIT for every query
+#   the first NEG_Q query rows x the first NEG_K keys: -NEG_LOGIT (very negative logits)
+LOGIT_STD = 3.6
+QNORM_LOGSTD = 0.3
+SINK_LOGIT = 16.0
+NEG_LOGIT = 120.0
+NEG_K = 40
+
+
+def _structured_qk(B, H, Sq, Sk, D, dtype):
+    dev = 'cuda'
+    d = torch.arange(D, device=dev)
+    u = torch.where(d % 2 == 0, 1.0, -1.0) / math.sqrt(D)         # sink direction
+    w = torch.where((d // 2) % 2 == 0, 1.0, -1.0) / math.sqrt(D)  # negative-block direction (u . w = 0)
+
+    def rand_perp(*shape):
+        # N(0, I) projected orthogonal to u and w, rescaled so the logit std is exactly LOGIT_STD.
+        z = torch.randn(*shape, D, device=dev)
+        z -= (z @ u)[..., None] * u
+        z -= (z @ w)[..., None] * w
+        return z.mul_((D / (D - 2)) ** 0.25 * math.sqrt(LOGIT_STD))
+
+    scale = 1.0 / math.sqrt(D)
+    m = math.sqrt(SINK_LOGIT / scale)
+    n = math.sqrt(NEG_LOGIT / scale)
+    neg_q = min(NEG_K, Sq // 2)
+    r = torch.exp(QNORM_LOGSTD * torch.randn(B, H, Sq, 1, device=dev).clamp_(-3.0, 3.0))
+    q = rand_perp(B, H, Sq).mul_(r).add_(m * u)
+    q[:, :, :neg_q] += n * w
+    q = q.to(dtype)
+    k = rand_perp(B, H, Sk)
+    k[:, :, 0] += m * u
+    k[:, :, :NEG_K] -= n * w
+    return q, k.to(dtype)
+
 FUNCTION_SIGNATURE = """\
 void launch_flash_attn_fwd(
     const void* Q,     // [B, H, Sq, D] bf16
@@ -42,7 +80,11 @@ SCALAR_ARGS = {
     "scale": SCALE,
 }
 
-TOLERANCES = {"atol": 0.02, "rtol": 0.02}  # mirrored in task.yaml correctness.tolerances
+# Calibrated against FP64 truth on the LLM-like test inputs: atol/rtol are mirrored in
+# task.yaml correctness.tolerances; per_output and max_normalized_rms live only here
+# (eval.check_correctness reads them from def.py).
+TOLERANCES = {"atol": 0.02, "rtol": 0.02, "max_normalized_rms": 0.004,
+              "per_output": {"lse": {"atol": 0.0004, "rtol": 0, "max_normalized_rms": 3e-06}}}
 
 HAS_CUDA_REFERENCE = True
 REFERENCE_EXTRA_INCLUDES = [
@@ -53,10 +95,7 @@ REFERENCE_EXTRA_CUDA_FLAGS = ["-gencode", "arch=compute_80,code=compute_80"]
 
 
 def get_inputs():
-    Q = torch.randn(BATCH_SIZE, NUM_HEADS, SEQ_LEN_Q, HEAD_DIM,
-                     device='cuda', dtype=torch.bfloat16)
-    K = torch.randn(BATCH_SIZE, NUM_HEADS, SEQ_LEN_K, HEAD_DIM,
-                     device='cuda', dtype=torch.bfloat16)
+    Q, K = _structured_qk(BATCH_SIZE, NUM_HEADS, SEQ_LEN_Q, SEQ_LEN_K, HEAD_DIM, torch.bfloat16)
     V = torch.randn(BATCH_SIZE, NUM_HEADS, SEQ_LEN_K, HEAD_DIM,
                      device='cuda', dtype=torch.bfloat16)
     return [("Q", Q), ("K", K), ("V", V)]
@@ -110,7 +149,18 @@ Inputs (bf16, contiguous row-major [B, H, S, D] layout, D fastest):
   Q: [B, H, Sq, D] = [%d, %d, %d, %d]
   K: [B, H, Sk, D] = [%d, %d, %d, %d]
   V: [B, H, Sk, D] = [%d, %d, %d, %d]
-  All input elements are i.i.d. standard normal, rounded to bf16.
+Input distribution (each of the 3 input sets is a fresh random draw; it mimics the
+attention logits of a trained LLM). V is i.i.d. N(0, 1), rounded to bf16. Q and K are
+constructed so that the logits S[i][j] = scale * dot(Q[i], K[j]) have this structure:
+  - ordinary logits are ~ N(0, (3.6 * r_i)^2) with a per-query norm factor
+    r_i = exp(0.3 * clip(N(0, 1), -3, 3)) (overall logit std ~4);
+  - key 0 is an attention sink: its logit is +16 higher, for every query;
+  - the first min(40, Sq/2) query rows have logits shifted by -120 against the first
+    40 keys (very negative logits; with the causal mask, these query rows see only such keys).
+  Construction: Q[i] = r_i*a*z_i + m*u (+ n*w for the first min(40, Sq/2) rows),
+  K[j] = a*y_j (+ m*u for j = 0) (- n*w for j < 40), with z_i, y_j ~ N(0, I) projected
+  orthogonal to two fixed orthonormal vectors u, w, and a, m, n set to give the logit
+  statistics above; Q and K are then rounded to bf16.
 
 Outputs:
   O:   [B, H, Sq, D] bf16 — attention output
@@ -122,9 +172,13 @@ Precision: matrix products must use bf16 (or higher-precision) operands with FP3
 accumulation, and the softmax statistics / lse must be computed in FP32. Quantizing
 Q, K, V or P to FP8, INT8 or any lower precision is not allowed.
 
-Correctness: O and lse are compared element-wise with a reference
-implementation over 3 random input sets:
-  |out - ref| <= atol + rtol * |ref|,  atol = 0.02, rtol = 0.02
+Correctness: O and lse are compared with a reference implementation over
+3 random input sets; each output must pass both checks
+  element-wise:   |out - ref| <= atol + rtol * |ref|
+  normalized RMS: sqrt(mean((out - ref)^2)) / sqrt(mean(ref^2)) <= max_rms
+with
+  O:   atol = 0.02, rtol = 0.02, max_rms = 0.004
+  lse: atol = 0.0004, rtol = 0, max_rms = 3e-06
 NaN/Inf fail, and every output element must be written (output buffers are
 pre-filled with NaN).
 """ % (BATCH_SIZE, NUM_HEADS, SEQ_LEN_Q, HEAD_DIM,

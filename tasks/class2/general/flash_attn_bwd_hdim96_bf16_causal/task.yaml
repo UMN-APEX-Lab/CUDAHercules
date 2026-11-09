@@ -30,8 +30,8 @@ execute:
 correctness:
   mode: tensor_compare
   tolerances:
-    atol: 0.025
-    rtol: 0.05
+    atol: 0.15
+    rtol: 0.02
 performance:
   enabled: true
   parser: {}

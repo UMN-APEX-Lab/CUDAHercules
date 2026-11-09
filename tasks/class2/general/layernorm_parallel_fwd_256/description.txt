@@ -23,9 +23,19 @@ Dimensions: rows=262144, cols=256, eps=1e-05. All tensors are contiguous and row
   x0, residual, z, x    bfloat16 (__nv_bfloat16), passed as void pointers
   gamma, beta           float32
   mu, rs                float32
-Inputs: x0[i, :] and residual[i, :] are bf16(s_i * N(0, 1)) with a per-row scale
-s_i = 10^U(-2, 1) (so var[i] ranges over ~2e-4 .. 2e2 and eps matters for the small
-rows); gamma and beta are i.i.d. N(0, 1).
+Inputs: x0 is the block output and residual the residual stream; every row i has a scale
+s_i = 10^U(-2, 1). One row in every 8 is a mean-offset row: x0[i, :] = bf16(s_i * N(0, 1))
+and residual[i, :] = bf16(c_i + s_i * N(0, 1)) with |c_i| / s_i = 10^U(1, log10(50)) and
+a random sign (a mean that is large relative to the spread, as on outlier tokens; BF16
+rounding quantizes the spread of these rows). One row in every 512 is constant:
+x0[i, :] = 0 and residual[i, :] = bf16(c_i) with c_i ~ N(0, 1) (variance 0, so
+rs = 1/sqrt(eps)). One row in every 512 is near-constant: x0[i, :] = 0 and
+residual[i, :] = bf16(c_i + t_i * N(0, 1)) with c_i ~ N(0, 1) and t_i = 10^U(-5, -3)
+(variance << eps).
+All other rows have x0[i, :] and residual[i, :] = bf16(s_i * N(0, 1)). The row classes sit
+at the same row indices in every input set.
+So var[i] ranges from ~0 to ~2e2 and eps matters for the small rows. gamma and beta are
+i.i.d. N(0, 1).
 Outputs: z [rows, cols] (bf16), x [rows, cols] (bf16), mu [rows] (fp32), rs [rows] (fp32).
 
 Precision: BF16 is only the storage format of the activations. All arithmetic
@@ -36,12 +46,14 @@ tensor-core MMAs, or holding intermediates in a lower precision are not allowed,
 even if the result happens to pass the tolerance check.
 
 Correctness: z, x, mu and rs are compared element-wise (in FP32) with a reference
-implementation over 3 random input sets:
-  |out - ref| <= atol + rtol * |ref|,  atol = 4e-05, rtol = 0.024
-rtol allows about 3 BF16 ulps of rounding difference; atol is small, so z values that
-nearly cancel to zero (where (xf - mu) * rs * gamma ~ -beta) must be accurate to FP32
-level. NaN/Inf fail, and every output element must be written (output buffers are pre-
-filled with NaN).
+implementation over 3 random input sets, |out - ref| <= atol + rtol * |ref| with
+  z and x: atol = 0.00025, rtol = 0.024
+  mu: atol = 1.5e-06, rtol = 2e-05
+  rs: atol = 0, rtol = 2e-05
+mu and rs are FP32 outputs and must be FP32-accurate. For z and x, rtol allows about 3 BF16 ulps of rounding difference; atol is small compared with |z| ~ 1,
+so z values that nearly cancel to zero (where (xf - mu) * rs * gamma ~ -beta) must be
+accurate to well below BF16 resolution. NaN/Inf fail, and every output element must be
+written (output buffers are pre-filled with NaN).
 
 
 ## Function Signature

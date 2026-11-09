@@ -4,6 +4,8 @@ Task: LayerNorm Forward — hidden_size=256, BF16 activations, FP32 compute
 Source: flash-attention/csrc/layer_norm/ln_fwd_kernels.cuh
 Operation: z = bf16((x - mu) / sqrt(var + eps) * gamma + beta)
 """
+import math
+
 import torch
 
 ROWS = 262144
@@ -27,17 +29,53 @@ void launch_layernorm_forward(
 
 SCALAR_ARGS = {"rows": ROWS, "cols": COLS, "eps": EPS}
 
-TOLERANCES = {"atol": 4e-05, "rtol": 0.024}  # mirrored in task.yaml correctness.tolerances
+TOLERANCES = {"atol": 0.00025, "rtol": 0.024,
+              "per_output": {"mu": {"atol": 1e-06, "rtol": 2e-05},
+                             "rs": {"atol": 0.0, "rtol": 1.5e-05}}}  # mirrored in task.yaml correctness.tolerances
 
 HAS_CUDA_REFERENCE = True
 REFERENCE_EXTRA_INCLUDES = ["reference_sources/layer_norm"]
 
+# Realistic activation rows (see "Inputs" in DESCRIPTION). Row classes sit at fixed row
+# indices, so every input set has the same mix:
+#   i % 8 == 3      mean-offset rows c_i + s_i * N(0, 1), |c_i| / s_i = 10^U(1, log10(50)),
+#                   random sign: a mean that is large relative to the spread (outlier tokens);
+#                   E[x^2] - mu^2 cancels badly on them and BF16 quantizes their spread.
+#   i % 512 == 100  constant rows: every element is c_i ~ N(0, 1) (variance 0, rs = 1/sqrt(eps)).
+#   i % 512 == 356  near-constant rows c_i + t_i * N(0, 1), c_i ~ N(0, 1), t_i = 10^U(-5, -3)
+#                   (variance << eps once rounded to BF16).
+#   other rows      zero-mean rows s_i * N(0, 1).
+# s_i = 10^U(-2, 1) per row: rows with a small variance make eps matter.
+OFFSET_RATIO_MAX = 50.0
+
+
+def _row_scale_and_classes():
+    i = torch.arange(ROWS, device='cuda')
+    s = torch.pow(10.0, torch.empty(ROWS, 1, device='cuda').uniform_(-2.0, 1.0))
+    return s, i[i % 8 == 3], i[i % 512 == 100], i[i % 512 == 356]
+
+
+def _add_mean_offset(a, s, off):
+    ratio = torch.pow(10.0, torch.empty(off.numel(), 1, device='cuda').uniform_(
+        1.0, math.log10(OFFSET_RATIO_MAX)))
+    sign = torch.randint(0, 2, (off.numel(), 1), device='cuda').float() * 2.0 - 1.0
+    a[off] += sign * ratio * s[off]
+
+
+def _activation():
+    """BF16 activation x [ROWS, COLS] with the row classes above."""
+    s, off, const, near = _row_scale_and_classes()
+    a = torch.randn(ROWS, COLS, device='cuda', dtype=torch.float32) * s
+    _add_mean_offset(a, s, off)
+    a[const] = torch.randn(const.numel(), 1, device='cuda').expand(-1, COLS)
+    t = torch.pow(10.0, torch.empty(near.numel(), 1, device='cuda').uniform_(-5.0, -3.0))
+    a[near] = (torch.randn(near.numel(), 1, device='cuda')
+               + t * torch.randn(near.numel(), COLS, device='cuda'))
+    return a.to(torch.bfloat16)
+
 
 def get_inputs():
-    # Per-row scale 10^U(-2, 1): rows with a small variance make eps matter (a kernel
-    # that drops eps, or uses the unbiased variance, fails on them).
-    row_scale = torch.pow(10.0, torch.empty(ROWS, 1, device='cuda').uniform_(-2.0, 1.0))
-    x = (torch.randn(ROWS, COLS, device='cuda', dtype=torch.float32) * row_scale).to(torch.bfloat16)
+    x = _activation()
     gamma = torch.randn(COLS, device='cuda', dtype=torch.float32)
     beta = torch.randn(COLS, device='cuda', dtype=torch.float32)
     return [("x", x), ("gamma", gamma), ("beta", beta)]
@@ -83,8 +121,16 @@ Dimensions: rows=%d, cols=%d, eps=%g. All tensors are contiguous and row-major:
   x, z          bfloat16 (__nv_bfloat16), passed as void pointers
   gamma, beta   float32
   mu, rs        float32
-Inputs: x[i, :] = bf16(s_i * N(0, 1)) with a per-row scale s_i = 10^U(-2, 1) (so var[i]
-ranges over ~1e-4 .. 1e2 and eps matters for the small rows); gamma and beta are
+Inputs: Every row i has a scale s_i = 10^U(-2, 1). One row in every 8 is a mean-offset row,
+x[i, :] = bf16(c_i + s_i * N(0, 1)) with |c_i| / s_i = 10^U(1, log10(50)) and a random
+sign (a mean that is large relative to the spread, as on outlier tokens; BF16 rounding
+quantizes the spread of these rows). One row in every 512 is constant,
+x[i, :] = bf16(c_i) with c_i ~ N(0, 1) (variance 0, so rs = 1/sqrt(eps)), and one row in
+every 512 is near-constant, x[i, :] = bf16(c_i + t_i * N(0, 1)) with c_i ~ N(0, 1) and
+t_i = 10^U(-5, -3) (variance << eps). All other rows are zero-mean,
+x[i, :] = bf16(s_i * N(0, 1)). The row classes sit at the same row indices in every
+input set.
+So var[i] ranges from 0 to ~1e2 and eps matters for the small rows. gamma and beta are
 i.i.d. N(0, 1).
 Outputs: z [rows, cols] (bf16), mu [rows] (fp32), rs [rows] (fp32).
 
@@ -96,10 +142,12 @@ tensor-core MMAs, or holding intermediates in a lower precision are not allowed,
 even if the result happens to pass the tolerance check.
 
 Correctness: z, mu and rs are compared element-wise (in FP32) with a reference
-implementation over 3 random input sets:
-  |out - ref| <= atol + rtol * |ref|,  atol = 4e-05, rtol = 0.024
-rtol allows about 3 BF16 ulps of rounding difference; atol is small, so z values that
-nearly cancel to zero (where (xf - mu) * rs * gamma ~ -beta) must be accurate to FP32
-level. NaN/Inf fail, and every output element must be written (output buffers are pre-
-filled with NaN).
+implementation over 3 random input sets, |out - ref| <= atol + rtol * |ref| with
+  z: atol = 0.00025, rtol = 0.024
+  mu: atol = 1e-06, rtol = 2e-05
+  rs: atol = 0, rtol = 1.5e-05
+mu and rs are FP32 outputs and must be FP32-accurate. For z, rtol allows about 3 BF16 ulps of rounding difference; atol is small compared with |z| ~ 1,
+so z values that nearly cancel to zero (where (xf - mu) * rs * gamma ~ -beta) must be
+accurate to well below BF16 resolution. NaN/Inf fail, and every output element must be
+written (output buffers are pre-filled with NaN).
 """ % (ROWS, COLS, EPS)
