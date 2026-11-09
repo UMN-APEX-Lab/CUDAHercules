@@ -31,9 +31,13 @@ Where:
 
 ## Data Types and Precision
 
-All matrices are `float` (FP32). The product must be computed at FP32 precision (FP32
-multiplies and FP32 accumulation); lower-precision arithmetic (TF32, BF16, FP16, FP8 or INT8,
-including tensor-core paths that use them) is not allowed even if it passes the tolerance.
+All matrices are `float` (FP32).
+
+The result must be FP32-accurate: it is checked against an FP64 reference with the tolerance
+below, which single-pass lower-precision computation cannot meet. How FP32 accuracy is reached is
+up to you: native FP32 arithmetic, or emulating FP32 with lower-precision units (e.g. 3xTF32 or
+multi-term BF16 splitting on tensor cores), are both allowed as long as the result meets the
+tolerance.
 
 ## Memory Layout
 
@@ -73,7 +77,7 @@ alpha = 1, beta = 0, lda = K, ldb = K, ldc = ldd = N.
 Inputs are random FP32 values in [-1, 1) that use the full 24-bit significand. Every element of
 D is compared with the exact (FP64-accumulated) result:
 - every element must be finite and satisfy |D - exact| <= 1.5e-6 * sqrt(K) * RMS(exact);
-- the relative Frobenius error ||D - exact|| / ||exact|| must be <= 1.2e-7 * sqrt(K).
+- the relative Frobenius error ||D - exact|| / ||exact|| must be <= 5.5e-8 * sqrt(K).
 D is filled with NaN before your function runs, so elements that are not written fail.
 
 Performance is timed for both the reference and your solution at each size; the task score is

@@ -41,22 +41,9 @@ source:
   commit: ''
   license: BSD-3-Clause
 anti_cheat:
-  # Precision floor: the task is FP32. TF32, FP16, BF16, FP8 and INT8 compute (incl. tensor-core
-  # paths) is below spec and is not allowed even if it passes tolerance; header includes alone
-  # are fine.
-  blocked_patterns:
-  - '\.tf32\b'
-  - '\bprecision::tf32\b'
-  - '\b__float_to_tf32\b'
-  - '\btfloat32_t\b'
-  - '\b__(half2?|nv_bfloat162?|nv_fp8\w*|nv_fp6\w*|nv_fp4\w*)\b'
-  - '__float2(half|bfloat16)|__(half|bfloat16)2float'
-  - '\bcutlass::(half_t|bfloat16_t|float_e4m3_t|float_e5m2_t|float_e2m1_t|float_e3m2_t|float_e2m3_t)\b'
-  - '\.(b?f16)(x2)?\b'
-  - '\.e[2-5]m[1-3](x2)?\b'
-  - '\.[su](4|8)\.[su](4|8)\b'
-  - '\b__dp4a\b'
-  - ',\s*half\s*,'
+  # FP32 accuracy is enforced by the tolerance; FP32 emulation with lower-precision
+  # units is allowed, so there is no precision-floor pattern here.
+  blocked_patterns: []
   required_patterns:
   - __global__\s+void
   - <<<.*>>>

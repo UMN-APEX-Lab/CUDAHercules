@@ -40,9 +40,13 @@ Where:
 ## Data Types and Precision
 
 All data is `float` (FP32). Each quaternion element occupies 4 consecutive floats in order
-(x, y, z, w). The products must be computed at FP32 precision (FP32 multiplies and FP32
-accumulation); lower-precision arithmetic (TF32, BF16, FP16, FP8 or INT8, including tensor-core
-paths that use them) is not allowed even if it passes the tolerance.
+(x, y, z, w).
+
+The result must be FP32-accurate: it is checked against an FP64 reference with the tolerance
+below, which single-pass lower-precision computation cannot meet. How FP32 accuracy is reached is
+up to you: native FP32 arithmetic, or emulating FP32 with lower-precision units (e.g. 3xTF32 or
+multi-term BF16 splitting on tensor cores), are both allowed as long as the result meets the
+tolerance.
 
 ## Memory Layout
 
@@ -82,7 +86,7 @@ arbitrary finite values that must not affect the result.
 Inputs are random FP32 values in [-1, 1) that use the full 24-bit significand. Every component
 of C is compared with the exact (FP64-accumulated) result:
 - every component must be finite and satisfy |C - exact| <= 1.5e-6 * sqrt(4K) * RMS(exact);
-- the relative Frobenius error ||C - exact|| / ||exact|| must be <= 1.2e-7 * sqrt(4K).
+- the relative Frobenius error ||C - exact|| / ||exact|| must be <= 5.5e-8 * sqrt(4K).
 Components that are not written fail the check.
 
 Performance is timed for both the reference and your solution at each size; the task score is

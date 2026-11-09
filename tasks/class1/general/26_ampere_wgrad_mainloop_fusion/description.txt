@@ -65,9 +65,18 @@ All 3x3 filters, pad = 1, stride 1 (training):
 
 ## Correctness
 
-Inputs are random values using the full FP16 mantissa: input, grad_output and bias uniform in
-[-1, 1), scale uniform in [0.25, 2). Every grad_weight element is compared with an FP64 result in
-which the transformed activation is rounded once to FP16, and must satisfy
+Two input sets are used, both with random values using the full FP16 mantissa:
+- set 1 (plain): input, grad_output and bias uniform in [-1, 1), scale uniform in [0.25, 2);
+- set 2 (folded BatchNorm, as in a trained CNN): the activations are raw conv outputs with
+  per-channel statistics, input[..][c] = mu_c + sd_c * u (u uniform in [-1, 1), sd_c in
+  [0.25, 2), |mu_c| <= sd_c), and scale/bias are the folded BatchNorm parameters
+  scale_c = gamma_c / sqrt(var_c + 1e-5), bias_c = beta_c - mu_c * scale_c (var_c = sd_c^2 / 3,
+  beta_c in [-0.5, 0.5)). gamma_c is negative for about 1 in 6 channels and exactly 0 for about
+  1 in 32 channels (pruned channels), so scale takes negative values and exact zeros, and bias
+  can be positive for a zero scale. grad_output uniform in [-1, 1).
+Both sets are checked once before timing, and the timed calls alternate between them (each with
+its inputs rewritten into the same buffers). Every grad_weight element is compared with an
+FP64 result in which the transformed activation is rounded once to FP16, and must satisfy
 
   |grad_weight - expected| <= 5e-6 * sum_{n,p,q} |dy * t| + 1.97e-3 * sqrt(sum_{n,p,q} (dy * t)^2)
 

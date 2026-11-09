@@ -75,11 +75,19 @@ alpha = 1/sqrt(K) at every size; shapes as run on a single 96 GB GPU:
 
 ## Correctness
 
-Inputs A, B, C are random FP16 values uniform in [-2, 2). Both outputs are compared on every element
-with an FP32 reference (FP32-accumulated GEMM; softmax of the FP32 logits):
+Two input sets are used, and they alternate between consecutive calls:
+- set 0: A, B, C random FP16 values uniform in [-2, 2);
+- set 1 (attention-like): logits alpha * A.B with a standard deviation of about 4, plus one "sink"
+  column per batch (like a BOS token) whose logit is about +16 for every row; C uniform in [-1, 1).
+
+Both outputs are compared on every element with an FP32 reference (FP32-accumulated GEMM; softmax s
+of the FP32 logits g):
 - D:       |D - ref| <= 1e-3 + 2e-3 * |ref|
-- Softmax: |S - ref| <= 1e-6 + 1.5e-2 * |ref|, and every Softmax row must sum to 1 within 1e-3
-Every element must be written and finite. The outputs are checked again after the timed runs.
+- Softmax: |S - s| <= 1e-6 + |s| * (3e-3 + 2.5 * (h(g) + H)), and every Softmax row must sum to 1
+  within 5e-4 + H, where h(v) is half an FP16 ulp at |v| and H = sum_j s_j * h(g_j) over the row
+  (this allows for a softmax computed from the FP16-rounded D)
+Every element must be written and finite. The solution is verified before timing, after every timed
+call (inputs restored and outputs re-poisoned before each call) and again after the timed runs.
 
 ## Build & Test
 

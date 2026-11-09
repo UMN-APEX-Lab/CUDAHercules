@@ -88,6 +88,11 @@ checked:
   (FP64-accumulated) result;
 - all other rows must be left bit-for-bit unchanged.
 
+The timed calls alternate between two input sets that differ both in the data and in the routing
+(gather_A, gather_C and scatter_D change; the pointers stay the same). Before every call the
+inputs are restored and D is re-filled with the sentinel; the output of every timed call is
+checked as above.
+
 Performance is timed for both the reference and your solution at each size; the task score is
 the geometric mean of the per-size speedups.
 

@@ -44,19 +44,9 @@ source:
   commit: ''
   license: BSD-3-Clause
 anti_cheat:
+  # FP32 accuracy is enforced by the tolerance; FP32 emulation with lower-precision
+  # units is allowed, so there is no precision-floor pattern here.
   blocked_patterns:
-  # Precision floor: FP32 SIMT arithmetic. TF32 tensor cores (including 3xTF32 split schemes),
-  # FP16/BF16/FP8/INT8 compute are below the spec and not allowed even if they pass the tolerance
-  # (header includes alone are fine).
-  - '\b__(half2?|nv_bfloat162?|nv_fp8\w*|nv_fp6\w*|nv_fp4\w*)\b'
-  - '__float2(half|bfloat16)|__(half|bfloat16)2float'
-  - '\b(half_t|bfloat16_t|tfloat32_t|float_e[2-5]m[1-3]_t|float_ue[48]m[03]_t|u?int4b_t)\b'
-  - '\.(b?f16)(x2)?\b'
-  - '\.e[2-5]m[1-3](x[24])?\b'
-  - '\.[su](4|8)\.[su](4|8)\b'
-  - '\b__dp[24]a\b'
-  - ',\s*half\s*,'
-  - '\.tf32\b|precision::tf32|__float_to_tf32|tfloat32|TF32TF32|F16F16'
   # Reference / golden kernels compiled into the harness
   - '\bkh_(ref|golden)_|\bGemmBatched\b|\bGemmArray\b'
   required_patterns:

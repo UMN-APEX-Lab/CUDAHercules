@@ -79,12 +79,20 @@ models that run on a single 96 GB GPU:
 
 ## Correctness
 
-Inputs are random FP16 values (Q and K uniform in [-3, 3), giving attention logits with a standard
-deviation of about 3; V uniform in [-1, 1)). Every element of O is compared with an FP32 reference
-(Q.K^T, softmax and P.V all in FP32):
+Two sets of random FP16 inputs are used, and they alternate between consecutive calls:
+- set 0: Q and K uniform in [-3, 3) (attention logits with a standard deviation of about 3), V
+  uniform in [-1, 1);
+- set 1 (attention-like): logits with a standard deviation of about 4; key 0 of every sequence and
+  head is an attention sink (like a BOS token) with a logit of about +18 for every query; 1/8 of the
+  query rows have all their logits shifted by -120 to -150 (every logit of those rows is very
+  negative), the other rows by -20 to 20 (a per-row shift leaves the softmax unchanged); V uniform
+  in [-1, 1).
+
+Every element of O is compared with an FP32 reference (Q.K^T, softmax and P.V all in FP32):
 - per element: |O - ref| <= 1e-3 + 5e-3 * |ref|
 - whole output: rms(O - ref) <= 7e-4 * rms(ref)
-Every element of O must be written and finite. The output is checked again after the timed runs.
+Every element of O must be written and finite. The solution is verified before timing, after every
+timed call (inputs restored and output re-poisoned before each call) and again after the timed runs.
 
 ## Build & Test
 

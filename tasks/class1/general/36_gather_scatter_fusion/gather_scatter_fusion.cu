@@ -74,6 +74,191 @@
 #include <sstream>
 #include <vector>
 
+#include <cstdio>   // std::fprintf (KH_TRIAL_TIMES)
+#include <cstdlib>  // std::getenv / std::atoi (KH_WARMUP / KH_ITERS overrides)
+
+/// Optional environment overrides for the timing loops (reference and solution):
+///   KH_WARMUP = warmup launches before timing, KH_ITERS = number of timed trials.
+/// Unset (or empty) -> the built-in defaults are used unchanged.
+static int kh_env_int(const char *name, int dflt) {
+  const char *v = std::getenv(name);
+  return (v != nullptr && *v != '\0') ? std::atoi(v) : dflt;
+}
+
+/// KH_TRIAL_TIMES=1: additionally log every timed trial to stderr as
+/// "KH_TRIAL <label> <trial> <ms>" (stdout output is unchanged).
+static void kh_trial_log(const char *label, int trial, float ms) {
+  if (kh_env_int("KH_TRIAL_TIMES", 0)) std::fprintf(stderr, "KH_TRIAL %s %d %.6f\n", label, trial, ms);
+}
+
+// ===================================== KH_TIMING_BEGIN ======================================
+// Timing protocol of the Class 1 harnesses (this block is identical in every harness).
+//
+// kh_bench(label, warmup, iters, prep, call, check) measures one implementation; the reference
+// and the solution are measured the same way:
+//  * prep(s) runs before every warmup and timed call, outside the timed region. It copies input
+//    set s into the fixed input buffers (the call always sees the same pointers) and re-poisons
+//    the outputs. s alternates 0, 1, 0, 1, ... over all calls and the two sets hold different
+//    data, so a call can never reuse the result of an earlier call.
+//  * Before every timed call the L2 is flushed by READING a max(256 MB, 2 x L2) buffer (L2-cached
+//    loads, no stores), then cudaDeviceSynchronize(). This also writes back the dirty lines left by
+//    prep, and the L2 then holds only clean, unrelated lines, so the timed call pays no write-back
+//    of flush data (a write-based flush would leave up to a full L2 of dirty lines behind).
+//  * Every trial is timed with CUDA events on the legacy default stream and with the host clock,
+//    from just before the start event to after the cudaDeviceSynchronize() that follows the stop
+//    event. Trial time = max(event time, wall time - fixed overhead), so work the call leaves
+//    running on other streams (private non-blocking streams, graphs, host callbacks) when it
+//    returns is counted in full. The fixed overhead (clock reads, event records, synchronization
+//    wake-up) is calibrated once per process as the 90th percentile of (wall - event) over 64
+//    empty-kernel calls measured the same way, clamped to [2, 50] us.
+//  * check(s) runs after every timed call, outside the timed region: a device-side comparison of
+//    the outputs with the golden result of input set s. Any failure (or CUDA error) prints
+//    "Incorrect" and exits with status 1.
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <iostream>
+#include <vector>
+#include <cuda_runtime.h>
+
+__global__ void kh_empty_kernel() {}
+
+__global__ void kh_l2_flush_kernel(int4 const *p, size_t n, int *sink) {
+  int4 acc = make_int4(0, 0, 0, 0);
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x) {
+    int4 const v = __ldcg(p + i);
+    acc.x ^= v.x; acc.y ^= v.y; acc.z ^= v.z; acc.w ^= v.w;
+  }
+  if ((acc.x ^ acc.y ^ acc.z ^ acc.w) == 0x13579bdf) *sink = 1;  // keeps the loads alive
+}
+
+/// Aborts the run as incorrect.
+[[noreturn]] static void kh_fail(char const *what) {
+  std::fflush(stdout);
+  std::fprintf(stderr, "%s\n", what);
+  std::cout << "Incorrect" << std::endl;
+  std::exit(1);
+}
+
+[[maybe_unused]] static void kh_cuda_ok(cudaError_t e, char const *what) {
+  if (e != cudaSuccess) {
+    char msg[256];
+    std::snprintf(msg, sizeof(msg), "%s: CUDA error: %s", what, cudaGetErrorString(e));
+    kh_fail(msg);
+  }
+}
+
+/// Asynchronous device-to-device copy on the legacy default stream (input-set restore).
+[[maybe_unused]] static void kh_copy(void *dst, void const *src, size_t bytes) {
+  kh_cuda_ok(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice), "input restore");
+}
+
+static double kh_host_ms() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+struct KhTimer {
+  cudaEvent_t start = nullptr, stop = nullptr;
+  int4 *flush = nullptr;
+  size_t flush_n = 0;
+  int *sink = nullptr;
+  double overhead_ms = 0.0;
+};
+
+static void kh_l2_flush(KhTimer &t) {
+  kh_l2_flush_kernel<<<1024, 256>>>(t.flush, t.flush_n, t.sink);
+  kh_cuda_ok(cudaDeviceSynchronize(), "L2 flush");
+}
+
+/// One measured call: L2 flush, then event and host-clock timing up to device-wide completion.
+template <typename Call>
+static void kh_timed_call(KhTimer &t, Call &&call, char const *label, float *event_ms,
+                          double *wall_ms) {
+  kh_l2_flush(t);
+  double const t0 = kh_host_ms();
+  cudaEventRecord(t.start);
+  call();
+  cudaEventRecord(t.stop);
+  cudaError_t const e1 = cudaEventSynchronize(t.stop);
+  cudaError_t const e2 = cudaDeviceSynchronize();
+  double const t1 = kh_host_ms();
+  kh_cuda_ok(e1 != cudaSuccess ? e1 : e2, label);
+  kh_cuda_ok(cudaEventElapsedTime(event_ms, t.start, t.stop), label);
+  *wall_ms = t1 - t0;
+}
+
+static KhTimer &kh_timer() {
+  static KhTimer t;
+  static bool ready = false;
+  if (ready) return t;
+  int dev = 0, l2 = 0;
+  kh_cuda_ok(cudaGetDevice(&dev), "timer init");
+  kh_cuda_ok(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev), "timer init");
+  size_t const bytes = std::max<size_t>(size_t(256) << 20, 2 * size_t(l2));
+  kh_cuda_ok(cudaMalloc(&t.flush, bytes), "L2 flush buffer");
+  kh_cuda_ok(cudaMemset(t.flush, 0x5a, bytes), "L2 flush buffer");
+  kh_cuda_ok(cudaMalloc(&t.sink, sizeof(int)), "L2 flush buffer");
+  t.flush_n = bytes / sizeof(int4);
+  kh_cuda_ok(cudaEventCreate(&t.start), "timer init");
+  kh_cuda_ok(cudaEventCreate(&t.stop), "timer init");
+  std::vector<double> d;
+  for (int i = 0; i < 74; ++i) {
+    float ev = 0.f;
+    double wall = 0.0;
+    kh_timed_call(t, [] { kh_empty_kernel<<<1, 32>>>(); }, "timer calibration", &ev, &wall);
+    if (i >= 10) d.push_back(wall - double(ev));
+  }
+  std::sort(d.begin(), d.end());
+  t.overhead_ms = std::min(0.05, std::max(0.002, d[d.size() * 9 / 10]));
+  std::fprintf(stderr, "KH timing: L2 flush %zu MB, fixed overhead %.4f ms (p90 of %zu empty-kernel "
+               "trials, median %.4f ms)\n", bytes >> 20, t.overhead_ms, d.size(), d[d.size() / 2]);
+  ready = true;
+  return t;
+}
+
+struct KhTiming {
+  float avg_ms, min_ms;
+};
+
+/// check() for implementations whose output is not verified during timing (the reference).
+[[maybe_unused]] static bool kh_no_check(int) { return true; }
+
+template <typename Prep, typename Call, typename Check>
+static KhTiming kh_bench(char const *label, int warmup, int iters, Prep &&prep, Call &&call,
+                         Check &&check) {
+  KhTimer &t = kh_timer();
+  int set = 0;
+  for (int i = 0; i < warmup; ++i, set ^= 1) {
+    prep(set);
+    kh_cuda_ok(cudaDeviceSynchronize(), "input restore");
+    call();
+    kh_cuda_ok(cudaDeviceSynchronize(), label);
+  }
+  double total = 0.0;
+  float mn = 1e30f;
+  for (int it = 0; it < iters; ++it, set ^= 1) {
+    prep(set);
+    float ev = 0.f;
+    double wall = 0.0;
+    kh_timed_call(t, call, label, &ev, &wall);
+    float const ms = float(std::max<double>(ev, wall - t.overhead_ms));
+    kh_trial_log(label, it, ms);
+    if (!check(set)) {
+      char msg[256];
+      std::snprintf(msg, sizeof(msg), "%s: output of timed call %d (input set %d) does not match "
+                    "the golden result.", label, it, set);
+      kh_fail(msg);
+    }
+    total += ms;
+    mn = std::min(mn, ms);
+  }
+  return {iters > 0 ? float(total / iters) : 0.f, mn};
+}
+// ====================================== KH_TIMING_END =======================================
+
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_universal.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
@@ -442,10 +627,12 @@ static void kh_print(char const *who, KhResult const &r, double tol_max, double 
 /// experts; the expert under test receives M distinct tokens (in token order). Row i of the
 /// GEMM gathers token gather_A[i] and is scattered to its (token, k) slot
 /// scatter_D[i] = token * top_k + r in a [A_rows * top_k, N] output buffer; C is read at the
-/// same slot (gather_C == scatter_D). Returns the number of rows of C/D.
+/// same slot (gather_C == scatter_D). Returns the number of rows of C/D. `set` selects an
+/// independent routing (input set 0 = the correctness data, 1 = the alternate timing set).
 static int BuildMoeIndices(int M, int A_rows, int top_k, std::vector<int> &gather_A,
-                           std::vector<int> &gather_C, std::vector<int> &scatter_D) {
-  std::mt19937 rng(2024u + unsigned(M) * 31u + unsigned(A_rows));
+                           std::vector<int> &gather_C, std::vector<int> &scatter_D,
+                           unsigned set = 0) {
+  std::mt19937 rng(2024u + unsigned(M) * 31u + unsigned(A_rows) + set * 0x9E3779B9u);
   std::vector<int> tokens(A_rows);
   std::iota(tokens.begin(), tokens.end(), 0);
   for (int i = 0; i < M; ++i) {            // partial Fisher-Yates: M distinct tokens
@@ -463,7 +650,8 @@ static int BuildMoeIndices(int M, int A_rows, int top_k, std::vector<int> &gathe
   return A_rows * top_k;
 }
 
-/// Device buffers for one problem.
+/// Device buffers for one problem. Input set `set` (0 = correctness data, 1 = alternate timing
+/// set) selects the random data and the routing (gather / scatter indices).
 struct Problem {
   int M, N, K, A_rows, D_rows, lda, ldb, ldc, ldd;
   __half *dA = nullptr, *dB = nullptr;
@@ -472,8 +660,9 @@ struct Problem {
   size_t count_A, count_B, count_C, count_D;
   std::vector<int> gather_A, gather_C, scatter_D;
 
-  Problem(int M_, int N_, int K_, int A_rows_, int top_k) : M(M_), N(N_), K(K_), A_rows(A_rows_) {
-    D_rows = BuildMoeIndices(M, A_rows, top_k, gather_A, gather_C, scatter_D);
+  Problem(int M_, int N_, int K_, int A_rows_, int top_k, unsigned set = 0)
+      : M(M_), N(N_), K(K_), A_rows(A_rows_) {
+    D_rows = BuildMoeIndices(M, A_rows, top_k, gather_A, gather_C, scatter_D, set);
     lda = K; ldb = N; ldc = N; ldd = N;
     count_A = size_t(A_rows) * K; count_B = size_t(K) * N;
     count_C = size_t(D_rows) * N; count_D = size_t(D_rows) * N;
@@ -484,9 +673,9 @@ struct Problem {
     CUDA_CHECK(cudaMalloc(&dGC, M * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&dSD, M * sizeof(int)));
     // Random inputs with a full FP16 (A, B) / FP32 (C) significand.
-    kh_fill(dA, count_A, 1u);
-    kh_fill(dB, count_B, 2u);
-    kh_fill(dC, count_C, 3u);
+    kh_fill(dA, count_A, 1u + 10u * set);
+    kh_fill(dB, count_B, 2u + 10u * set);
+    kh_fill(dC, count_C, 3u + 10u * set);
     CUDA_CHECK(cudaMemcpy(dGA, gather_A.data(), M * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dGC, gather_C.data(), M * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dSD, scatter_D.data(), M * sizeof(int), cudaMemcpyHostToDevice));
@@ -500,6 +689,7 @@ struct Problem {
     // Same finite sentinel (0x7F7F7F7F ~ 3.4e38) in every D buffer: rows that must be written
     // and are not, and rows that must NOT be written but are, both fail the comparison.
     CUDA_CHECK(cudaMemset(d, 0x7F, count_D * sizeof(float)));
+    CUDA_CHECK(cudaDeviceSynchronize());  // complete before a call that may use other streams
     return d;
   }
 };
@@ -554,16 +744,19 @@ struct Golden {
   ~Golden() { cudaFree(G); cudaFree(Ds); cudaFree(is_target); cudaFree(bad); }
 
   /// Checks every element of D: the M scattered rows against the golden, and every other row
-  /// for the untouched sentinel.
-  bool Check(Problem const &p, float const *D, char const *who, double tol_max, double tol_fro) {
+  /// for the untouched sentinel. verbose = false prints only on failure.
+  bool Check(Problem const &p, float const *D, char const *who, double tol_max, double tol_fro,
+             bool verbose = true) {
     GatherRows_kernel<<<4096, 256>>>(D, p.dSD, p.M, p.N, Ds);
     KhResult r = kh_check(Ds, p.N, 1, G, p.M, p.N, tol_max, tol_fro);
     CUDA_CHECK(cudaMemset(bad, 0, sizeof(unsigned long long)));
     UntouchedRows_kernel<<<4096, 256>>>(D, is_target, p.D_rows, p.N, bad);
     unsigned long long nbad = 0;
     CUDA_CHECK(cudaMemcpy(&nbad, bad, sizeof(nbad), cudaMemcpyDeviceToHost));
-    kh_print(who, r, tol_max, tol_fro);
-    std::printf("  %s: elements written outside the scatter_D rows = %llu\n", who, nbad);
+    if (verbose || !r.pass || nbad) {
+      kh_print(who, r, tol_max, tol_fro);
+      std::printf("  %s: elements written outside the scatter_D rows = %llu\n", who, nbad);
+    }
     if (!r.pass || nbad) {
       std::cerr << who << " incorrect vs FP64 golden: max|err|/rms = " << r.max_err_rel
                 << ", rel_fro_err = " << r.fro_rel << ", non-finite = " << r.nonfinite
@@ -624,64 +817,56 @@ cudaError_t TestCorrectness(int M, int N, int K, int A_rows, int top_k, float al
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Profile reference (and solution if KH_TEST_SOLUTION) with CUDA events.
+/// Profile the reference (and the solution if KH_TEST_SOLUTION) with the KH timing protocol:
+/// two input sets (different data AND different routing indices) alternate between calls,
+/// restored into the same buffers outside the timed region; D is re-filled with the sentinel
+/// before and verified (solution) after every timed call.
 void Profile(int M, int N, int K, int A_rows, int top_k, float alpha, float beta, int iterations) {
-  Problem p(M, N, K, A_rows, top_k);
+  iterations = kh_env_int("KH_ITERS", iterations);  // KH_ITERS override (default unchanged)
+  int const warmup = kh_env_int("KH_WARMUP", 3);
+  Problem p(M, N, K, A_rows, top_k);   // buffers passed to the reference / solution
+  Problem p0(M, N, K, A_rows, top_k, 0), p1(M, N, K, A_rows, top_k, 1);
+  Problem const *ps[2] = {&p0, &p1};
   float *dD = p.AllocD();
+  auto restore = [&](int s) {
+    Problem const &q = *ps[s];
+    kh_copy(p.dA, q.dA, q.count_A * sizeof(__half));
+    kh_copy(p.dB, q.dB, q.count_B * sizeof(__half));
+    kh_copy(p.dC, q.dC, q.count_C * sizeof(float));
+    kh_copy(p.dGA, q.dGA, M * sizeof(int));
+    kh_copy(p.dGC, q.dGC, M * sizeof(int));
+    kh_copy(p.dSD, q.dSD, M * sizeof(int));
+  };
 
-  cudaEvent_t start, stop;
-  cudaEventCreate(&start);
-  cudaEventCreate(&stop);
-
-  // Warmup reference
-  for (int i = 0; i < 3; i++)
+  KhTiming ref = kh_bench("Ref time", warmup, iterations, restore, [&] {
     CutlassGatherScatterGemm(M, N, K, alpha, p.dA, p.lda, p.dGA, p.dB, p.ldb,
       beta, p.dC, p.ldc, dD, p.ldd, p.dSD);
-  cudaDeviceSynchronize();
-
-  // Profile reference
-  float ref_total_ms = 0, ref_min_ms = 1e30f;
-  for (int iter = 0; iter < iterations; ++iter) {
-    cudaEventRecord(start);
-    CutlassGatherScatterGemm(M, N, K, alpha, p.dA, p.lda, p.dGA, p.dB, p.ldb,
-      beta, p.dC, p.ldc, dD, p.ldd, p.dSD);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    float ms;
-    cudaEventElapsedTime(&ms, start, stop);
-    ref_total_ms += ms;
-    if (ms < ref_min_ms) ref_min_ms = ms;
-  }
+  }, kh_no_check);
   fprintf(stdout, "Ref time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
-          ref_total_ms / iterations, iterations, ref_min_ms);
+          ref.avg_ms, iterations, ref.min_ms);
 
 #ifdef KH_TEST_SOLUTION
-  // Warmup solution
-  for (int i = 0; i < 3; i++)
-    GatherScatterGemm(M, N, K, alpha, p.dA, p.lda, p.dGA, p.dB, p.ldb,
-      beta, p.dC, p.ldc, p.dGC, dD, p.ldd, p.dSD);
-  cudaDeviceSynchronize();
-
-  // Profile solution
-  float sol_total_ms = 0, sol_min_ms = 1e30f;
-  for (int iter = 0; iter < iterations; ++iter) {
-    cudaEventRecord(start);
-    GatherScatterGemm(M, N, K, alpha, p.dA, p.lda, p.dGA, p.dB, p.ldb,
-      beta, p.dC, p.ldc, p.dGC, dD, p.ldd, p.dSD);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    float ms;
-    cudaEventElapsedTime(&ms, start, stop);
-    sol_total_ms += ms;
-    if (ms < sol_min_ms) sol_min_ms = ms;
-  }
+  {
+  // FP64 goldens of both input sets (computed once, outside the timed region).
+  Golden g0(p0, alpha, beta), g1(p1, alpha, beta);
+  Golden *gs[2] = {&g0, &g1};
+  double const tol_max = TolMax(K), tol_fro = TolFro(K);
+  KhTiming sol = kh_bench("Kernel time", warmup, iterations,
+    [&](int s) {
+      restore(s);
+      kh_cuda_ok(cudaMemsetAsync(dD, 0x7F, p.count_D * sizeof(float)), "output sentinel");
+    },
+    [&] {
+      GatherScatterGemm(M, N, K, alpha, p.dA, p.lda, p.dGA, p.dB, p.ldb,
+        beta, p.dC, p.ldc, p.dGC, dD, p.ldd, p.dSD);
+    },
+    [&](int s) { return gs[s]->Check(*ps[s], dD, "solution (timed call)", tol_max, tol_fro, false); });
   fprintf(stdout, "Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
-          sol_total_ms / iterations, iterations, sol_min_ms);
-  fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
+          sol.avg_ms, iterations, sol.min_ms);
+  fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", ref.min_ms / sol.min_ms);
+  }
 #endif
 
-  cudaEventDestroy(start);
-  cudaEventDestroy(stop);
   cudaFree(dD);
 }
 

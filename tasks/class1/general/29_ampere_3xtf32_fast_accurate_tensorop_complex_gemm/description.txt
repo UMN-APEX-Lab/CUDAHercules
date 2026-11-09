@@ -36,9 +36,10 @@ Where:
 All matrices use `float` pairs for complex numbers. Each complex element occupies 2 consecutive
 floats: (real, imaginary).
 
-The result must have FP32-level accuracy: FP32 arithmetic, or an error-compensated tensor-core
-scheme with equivalent accuracy such as 3xTF32 (operands split into high and low TF32 parts).
-Single-pass TF32, FP16, BF16, FP8 or INT8 arithmetic is not allowed even if it passes the
+The result must be FP32-accurate: it is checked against an FP64 reference with the tolerance
+below, which single-pass lower-precision computation cannot meet. How FP32 accuracy is reached is
+up to you: native FP32 arithmetic, or emulating FP32 with lower-precision units (e.g. 3xTF32 or
+multi-term BF16 splitting on tensor cores), are both allowed as long as the result meets the
 tolerance.
 
 ## Memory Layout
@@ -80,7 +81,7 @@ using the full 24-bit significand. D is filled with NaN before your function run
 that are not written fail. Every real and imaginary component of D is compared with the exact
 (FP64-accumulated) result:
 - every component must be finite and satisfy |D - exact| <= 1.5e-6 * sqrt(2K) * RMS(exact);
-- the relative Frobenius error ||D - exact|| / ||exact|| must be <= 1.2e-7 * sqrt(2K).
+- the relative Frobenius error ||D - exact|| / ||exact|| must be <= 5.5e-8 * sqrt(2K).
 
 Performance is timed for both the reference and your solution at each size; the task score is
 the geometric mean of the per-size speedups.

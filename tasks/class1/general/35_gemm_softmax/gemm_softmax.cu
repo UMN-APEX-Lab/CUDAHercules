@@ -56,6 +56,191 @@
 #include <limits>
 #include <vector>
 
+#include <cstdio>   // std::fprintf (KH_TRIAL_TIMES)
+#include <cstdlib>  // std::getenv / std::atoi (KH_WARMUP / KH_ITERS overrides)
+
+/// Optional environment overrides for the timing loops (reference and solution):
+///   KH_WARMUP = warmup launches before timing, KH_ITERS = number of timed trials.
+/// Unset (or empty) -> the built-in defaults are used unchanged.
+static int kh_env_int(const char *name, int dflt) {
+  const char *v = std::getenv(name);
+  return (v != nullptr && *v != '\0') ? std::atoi(v) : dflt;
+}
+
+/// KH_TRIAL_TIMES=1: additionally log every timed trial to stderr as
+/// "KH_TRIAL <label> <trial> <ms>" (stdout output is unchanged).
+static void kh_trial_log(const char *label, int trial, float ms) {
+  if (kh_env_int("KH_TRIAL_TIMES", 0)) std::fprintf(stderr, "KH_TRIAL %s %d %.6f\n", label, trial, ms);
+}
+
+// ===================================== KH_TIMING_BEGIN ======================================
+// Timing protocol of the Class 1 harnesses (this block is identical in every harness).
+//
+// kh_bench(label, warmup, iters, prep, call, check) measures one implementation; the reference
+// and the solution are measured the same way:
+//  * prep(s) runs before every warmup and timed call, outside the timed region. It copies input
+//    set s into the fixed input buffers (the call always sees the same pointers) and re-poisons
+//    the outputs. s alternates 0, 1, 0, 1, ... over all calls and the two sets hold different
+//    data, so a call can never reuse the result of an earlier call.
+//  * Before every timed call the L2 is flushed by READING a max(256 MB, 2 x L2) buffer (L2-cached
+//    loads, no stores), then cudaDeviceSynchronize(). This also writes back the dirty lines left by
+//    prep, and the L2 then holds only clean, unrelated lines, so the timed call pays no write-back
+//    of flush data (a write-based flush would leave up to a full L2 of dirty lines behind).
+//  * Every trial is timed with CUDA events on the legacy default stream and with the host clock,
+//    from just before the start event to after the cudaDeviceSynchronize() that follows the stop
+//    event. Trial time = max(event time, wall time - fixed overhead), so work the call leaves
+//    running on other streams (private non-blocking streams, graphs, host callbacks) when it
+//    returns is counted in full. The fixed overhead (clock reads, event records, synchronization
+//    wake-up) is calibrated once per process as the 90th percentile of (wall - event) over 64
+//    empty-kernel calls measured the same way, clamped to [2, 50] us.
+//  * check(s) runs after every timed call, outside the timed region: a device-side comparison of
+//    the outputs with the golden result of input set s. Any failure (or CUDA error) prints
+//    "Incorrect" and exits with status 1.
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <iostream>
+#include <vector>
+#include <cuda_runtime.h>
+
+__global__ void kh_empty_kernel() {}
+
+__global__ void kh_l2_flush_kernel(int4 const *p, size_t n, int *sink) {
+  int4 acc = make_int4(0, 0, 0, 0);
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x) {
+    int4 const v = __ldcg(p + i);
+    acc.x ^= v.x; acc.y ^= v.y; acc.z ^= v.z; acc.w ^= v.w;
+  }
+  if ((acc.x ^ acc.y ^ acc.z ^ acc.w) == 0x13579bdf) *sink = 1;  // keeps the loads alive
+}
+
+/// Aborts the run as incorrect.
+[[noreturn]] static void kh_fail(char const *what) {
+  std::fflush(stdout);
+  std::fprintf(stderr, "%s\n", what);
+  std::cout << "Incorrect" << std::endl;
+  std::exit(1);
+}
+
+[[maybe_unused]] static void kh_cuda_ok(cudaError_t e, char const *what) {
+  if (e != cudaSuccess) {
+    char msg[256];
+    std::snprintf(msg, sizeof(msg), "%s: CUDA error: %s", what, cudaGetErrorString(e));
+    kh_fail(msg);
+  }
+}
+
+/// Asynchronous device-to-device copy on the legacy default stream (input-set restore).
+[[maybe_unused]] static void kh_copy(void *dst, void const *src, size_t bytes) {
+  kh_cuda_ok(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice), "input restore");
+}
+
+static double kh_host_ms() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+struct KhTimer {
+  cudaEvent_t start = nullptr, stop = nullptr;
+  int4 *flush = nullptr;
+  size_t flush_n = 0;
+  int *sink = nullptr;
+  double overhead_ms = 0.0;
+};
+
+static void kh_l2_flush(KhTimer &t) {
+  kh_l2_flush_kernel<<<1024, 256>>>(t.flush, t.flush_n, t.sink);
+  kh_cuda_ok(cudaDeviceSynchronize(), "L2 flush");
+}
+
+/// One measured call: L2 flush, then event and host-clock timing up to device-wide completion.
+template <typename Call>
+static void kh_timed_call(KhTimer &t, Call &&call, char const *label, float *event_ms,
+                          double *wall_ms) {
+  kh_l2_flush(t);
+  double const t0 = kh_host_ms();
+  cudaEventRecord(t.start);
+  call();
+  cudaEventRecord(t.stop);
+  cudaError_t const e1 = cudaEventSynchronize(t.stop);
+  cudaError_t const e2 = cudaDeviceSynchronize();
+  double const t1 = kh_host_ms();
+  kh_cuda_ok(e1 != cudaSuccess ? e1 : e2, label);
+  kh_cuda_ok(cudaEventElapsedTime(event_ms, t.start, t.stop), label);
+  *wall_ms = t1 - t0;
+}
+
+static KhTimer &kh_timer() {
+  static KhTimer t;
+  static bool ready = false;
+  if (ready) return t;
+  int dev = 0, l2 = 0;
+  kh_cuda_ok(cudaGetDevice(&dev), "timer init");
+  kh_cuda_ok(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev), "timer init");
+  size_t const bytes = std::max<size_t>(size_t(256) << 20, 2 * size_t(l2));
+  kh_cuda_ok(cudaMalloc(&t.flush, bytes), "L2 flush buffer");
+  kh_cuda_ok(cudaMemset(t.flush, 0x5a, bytes), "L2 flush buffer");
+  kh_cuda_ok(cudaMalloc(&t.sink, sizeof(int)), "L2 flush buffer");
+  t.flush_n = bytes / sizeof(int4);
+  kh_cuda_ok(cudaEventCreate(&t.start), "timer init");
+  kh_cuda_ok(cudaEventCreate(&t.stop), "timer init");
+  std::vector<double> d;
+  for (int i = 0; i < 74; ++i) {
+    float ev = 0.f;
+    double wall = 0.0;
+    kh_timed_call(t, [] { kh_empty_kernel<<<1, 32>>>(); }, "timer calibration", &ev, &wall);
+    if (i >= 10) d.push_back(wall - double(ev));
+  }
+  std::sort(d.begin(), d.end());
+  t.overhead_ms = std::min(0.05, std::max(0.002, d[d.size() * 9 / 10]));
+  std::fprintf(stderr, "KH timing: L2 flush %zu MB, fixed overhead %.4f ms (p90 of %zu empty-kernel "
+               "trials, median %.4f ms)\n", bytes >> 20, t.overhead_ms, d.size(), d[d.size() / 2]);
+  ready = true;
+  return t;
+}
+
+struct KhTiming {
+  float avg_ms, min_ms;
+};
+
+/// check() for implementations whose output is not verified during timing (the reference).
+[[maybe_unused]] static bool kh_no_check(int) { return true; }
+
+template <typename Prep, typename Call, typename Check>
+static KhTiming kh_bench(char const *label, int warmup, int iters, Prep &&prep, Call &&call,
+                         Check &&check) {
+  KhTimer &t = kh_timer();
+  int set = 0;
+  for (int i = 0; i < warmup; ++i, set ^= 1) {
+    prep(set);
+    kh_cuda_ok(cudaDeviceSynchronize(), "input restore");
+    call();
+    kh_cuda_ok(cudaDeviceSynchronize(), label);
+  }
+  double total = 0.0;
+  float mn = 1e30f;
+  for (int it = 0; it < iters; ++it, set ^= 1) {
+    prep(set);
+    float ev = 0.f;
+    double wall = 0.0;
+    kh_timed_call(t, call, label, &ev, &wall);
+    float const ms = float(std::max<double>(ev, wall - t.overhead_ms));
+    kh_trial_log(label, it, ms);
+    if (!check(set)) {
+      char msg[256];
+      std::snprintf(msg, sizeof(msg), "%s: output of timed call %d (input set %d) does not match "
+                    "the golden result.", label, it, set);
+      kh_fail(msg);
+    }
+    total += ms;
+    mn = std::min(mn, ms);
+  }
+  return {iters > 0 ? float(total / iters) : 0.f, mn};
+}
+// ====================================== KH_TIMING_END =======================================
+
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_types.h"
 
@@ -157,24 +342,46 @@ cutlass::Status kh_ref_run(kh_ref_problem const &p) {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // Device-side verification against the FP32 golden result
 
-// Tolerances. D: |x - g| <= kAtolD + kRtolD * |g|. Softmax: |x - s| <= kAtolS + kRtolS * |s|, with
-// s = softmax of the FP32 golden logits; every Softmax row must sum to 1 within kRowSumTol.
-// Non-finite values always fail. The reference (FP32 accumulation, FP16 outputs, softmax of the
-// FP16-rounded D) reaches at most 0.23 of the D tolerance, 0.27 of the Softmax tolerance and a row-sum
-// error of 2.7e-4; FP16 accumulation exceeds the D tolerance by 3-21x, BF16 operands by 13-16x.
+// Tolerances. D: |x - g| <= kAtolD + kRtolD * |g|. Softmax: |x - s| <= kAtolS + |s| * (kRtolS +
+// kUlpS * (h(g) + H)) and |row sum - 1| <= kRowSumTol + H, with s = softmax of the FP32 golden
+// logits g, h(v) = half an FP16 ulp at |v| and H = sum_j s_j h(g_j) over the row: a softmax computed
+// from the FP16-rounded D deviates by up to h(g) + H per element, which grows with the logit
+// magnitude, and is allowed kUlpS times over; normalizing such a softmax with the FP32 logits shifts
+// the row sum by up to H. Non-finite values always fail.
+// Reference (FP32 accumulation, FP16 outputs, softmax of the FP16-rounded D), max error / tolerance
+// over all sizes: D 0.22 (input set 0) / 0.24 (input set 1), Softmax 0.29 / 0.37, row sum <= 0.2;
+// FP16 accumulation exceeds the D tolerance by 3-21x, BF16 operands by 13-16x.
 static constexpr float kAtolD = 1e-3f;
 static constexpr float kRtolD = 2e-3f;
 static constexpr float kAtolS = 1e-6f;
-static constexpr float kRtolS = 1.5e-2f;
-static constexpr float kRowSumTol = 1e-3f;
+static constexpr float kRtolS = 3e-3f;
+static constexpr float kUlpS = 2.5f;
+static constexpr float kRowSumTol = 5e-4f;
 
 struct RowCheck {
   float max_ratio_d;      // max |err| / tol over the row (D)
   float max_ratio_s;      // max |err| / tol over the row (Softmax)
   double row_sum;         // sum of the candidate's Softmax row
+  float sum_ratio;        // |row_sum - 1| / its tolerance (inf if non-finite)
   int fails;              // elements out of tolerance (D or Softmax)
   int first_col;          // first failing column (or -1)
 };
+
+/// Golden softmax statistics of one row (computed once per input set).
+struct RowGold {
+  float mx;               // row maximum of the golden logits
+  double sum_exp;         // sum_j exp(g_j - mx)
+  double h_mean;          // sum_j s_j * h(g_j)
+};
+
+/// Half an FP16 ulp at |x| (half the subnormal spacing below the smallest normal).
+__device__ __forceinline__ float kh_half_ulp16(float x) {
+  x = fabsf(x);
+  if (!(x >= 6.103515625e-05f)) return 2.98023224e-08f;
+  int e;
+  frexpf(x, &e);
+  return ldexpf(1.0f, e - 12);
+}
 
 __device__ __forceinline__ float block_reduce_max(float v, float *red) {
   for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
@@ -196,24 +403,38 @@ __device__ __forceinline__ double block_reduce_sum(double v, double *red) {
   return r;
 }
 
-/// One block per row: golden softmax of the FP32 golden row G, then element-wise checks of D and
-/// Softmax (FP16) and the row sum.
-__global__ void check_rows_kernel(int N, ElementOutput const *D, ElementOutput const *S,
-                                  float const *G, int64_t ld, RowCheck *out) {
+/// One block per row of the golden logits G (all batches, rows of length N).
+__global__ void golden_row_stats_kernel(int N, float const *G, RowGold *out) {
   __shared__ float redf[32];
   __shared__ double redd[32];
-  __shared__ int first_bad;
-  int const row = blockIdx.x;
-  D += int64_t(row) * ld;
-  S += int64_t(row) * ld;
-  G += int64_t(row) * ld;
-
+  int64_t const row = blockIdx.x;
+  G += row * N;
   float mx = -INFINITY;
   for (int j = threadIdx.x; j < N; j += blockDim.x) mx = fmaxf(mx, G[j]);
   mx = block_reduce_max(mx, redf);
-  double se = 0;
-  for (int j = threadIdx.x; j < N; j += blockDim.x) se += exp(double(G[j]) - double(mx));
+  double se = 0, sh = 0;
+  for (int j = threadIdx.x; j < N; j += blockDim.x) {
+    double const e = exp(double(G[j]) - double(mx));
+    se += e;
+    sh += e * double(kh_half_ulp16(G[j]));
+  }
   double const sum_exp = block_reduce_sum(se, redd);
+  double const sum_h = block_reduce_sum(sh, redd);
+  if (threadIdx.x == 0) out[row] = RowGold{mx, sum_exp, sum_h / sum_exp};
+}
+
+/// One block per row: element-wise checks of D and Softmax (FP16) against the golden row and its
+/// softmax, and the row sum.
+__global__ void check_rows_kernel(int N, ElementOutput const *D, ElementOutput const *S,
+                                  float const *G, RowGold const *gold_rows, RowCheck *out) {
+  __shared__ float redf[32];
+  __shared__ double redd[32];
+  __shared__ int first_bad;
+  int64_t const row = blockIdx.x;
+  D += row * N;
+  S += row * N;
+  G += row * N;
+  RowGold const rg = gold_rows[row];
 
   if (threadIdx.x == 0) first_bad = N;
   __syncthreads();
@@ -223,11 +444,11 @@ __global__ void check_rows_kernel(int N, ElementOutput const *D, ElementOutput c
   int fails = 0;
   for (int j = threadIdx.x; j < N; j += blockDim.x) {
     float const g = G[j];
-    float const gs = float(exp(double(g) - double(mx)) / sum_exp);
+    float const gs = float(exp(double(g) - double(rg.mx)) / rg.sum_exp);
     float const d = float(D[j]);
     float const s = float(S[j]);
     float const td = kAtolD + kRtolD * fabsf(g);
-    float const ts = kAtolS + kRtolS * fabsf(gs);
+    float const ts = kAtolS + fabsf(gs) * (kRtolS + kUlpS * (kh_half_ulp16(g) + float(rg.h_mean)));
     float const ed = fabsf(d - g), es = fabsf(s - gs);
     bool const bad = !isfinite(d) || !isfinite(s) || !(ed <= td) || !(es <= ts);
     if (bad) {
@@ -243,8 +464,100 @@ __global__ void check_rows_kernel(int N, ElementOutput const *D, ElementOutput c
   row_sum = block_reduce_sum(row_sum, redd);
   double const nf = block_reduce_sum(double(fails), redd);
   if (threadIdx.x == 0) {
-    out[row] = RowCheck{rd, rs, row_sum, int(nf), first_bad < N ? first_bad : -1};
+    float const sum_tol = kRowSumTol + float(rg.h_mean);
+    float const sum_ratio = isfinite(row_sum) ? float(fabs(row_sum - 1.0)) / sum_tol : INFINITY;
+    out[row] = RowCheck{rd, rs, row_sum, sum_ratio, int(nf), first_bad < N ? first_bad : -1};
   }
+}
+
+/// Reduction of all row checks: max ratios, max |row sum - 1|, total failures and the first row that
+/// fails (element failures or row sum).
+struct CheckSummary {
+  unsigned max_rd_bits, max_rs_bits, max_se_bits, max_sr_bits;
+  unsigned long long fails, first_bad_row;
+};
+
+__global__ void summarize_rows_kernel(RowCheck const *rc, int64_t rows, CheckSummary *out) {
+  float rd = 0, rs = 0, se_max = 0, sr = 0;
+  unsigned long long fails = 0, first = ~0ull;
+  for (int64_t r = blockIdx.x * int64_t(blockDim.x) + threadIdx.x; r < rows;
+       r += int64_t(gridDim.x) * blockDim.x) {
+    RowCheck const c = rc[r];
+    float const se = isfinite(c.row_sum) ? float(fabs(c.row_sum - 1.0)) : INFINITY;
+    rd = fmaxf(rd, c.max_ratio_d);
+    rs = fmaxf(rs, c.max_ratio_s);
+    se_max = fmaxf(se_max, se);
+    sr = fmaxf(sr, c.sum_ratio);
+    fails += (unsigned long long)c.fails;
+    if ((c.fails || !(c.sum_ratio <= 1.0f)) && (unsigned long long)r < first) first = (unsigned long long)r;
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    rd = fmaxf(rd, __shfl_xor_sync(0xffffffffu, rd, o));
+    rs = fmaxf(rs, __shfl_xor_sync(0xffffffffu, rs, o));
+    se_max = fmaxf(se_max, __shfl_xor_sync(0xffffffffu, se_max, o));
+    sr = fmaxf(sr, __shfl_xor_sync(0xffffffffu, sr, o));
+    fails += __shfl_xor_sync(0xffffffffu, fails, o);
+    unsigned long long const f = __shfl_xor_sync(0xffffffffu, first, o);
+    first = f < first ? f : first;
+  }
+  if ((threadIdx.x & 31) == 0) {
+    atomicMax(&out->max_rd_bits, __float_as_uint(rd));
+    atomicMax(&out->max_rs_bits, __float_as_uint(rs));
+    atomicMax(&out->max_se_bits, __float_as_uint(se_max));
+    atomicMax(&out->max_sr_bits, __float_as_uint(sr));
+    if (fails) atomicAdd(&out->fails, fails);
+    if (first != ~0ull) atomicMin(&out->first_bad_row, first);
+  }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Input sets. Set 0: A, B, C uniform in [-2, 2) (logits with a standard deviation of ~1.8).
+// Set 1 (attention-like): A = 3 r + u(b,k), with u = +-1 shared by all rows of a batch, B = 3.5 r
+// except one "sink" column n_s(b) (like a BOS token) equal to (16 / sqrt(K)) u(b,k), C uniform in
+// [-1, 1) (r uniform in [-1, 1)). The logits alpha * A.B (alpha = 1/sqrt(K)) then have a standard
+// deviation of ~4, and the sink column a logit of ~ +16 for every row.
+
+__host__ __device__ inline uint64_t kh_mix64(uint64_t x) {
+  x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 27; x *= 0x94D049BB133111EBull; x ^= x >> 33;
+  return x;
+}
+
+/// Uniform in [-1, 1) with 24 random bits.
+__device__ inline float kh_unif(uint64_t i, uint32_t seed) {
+  uint64_t const h = kh_mix64(i * 0x9E3779B97F4A7C15ull + (uint64_t(seed) + 1) * 0xD1B54A32D192ED03ull);
+  return float(int32_t(uint32_t(h >> 32)) >> 8) * (1.0f / 8388608.0f);
+}
+
+__device__ inline float kh_sign(uint64_t i, uint32_t seed) { return (kh_mix64(i + (uint64_t(seed) << 40)) & 1) ? 1.f : -1.f; }
+
+__host__ __device__ inline int kh_sink_col(int b, int N, uint32_t seed) {
+  return int(kh_mix64(uint64_t(b) * 0x9E3779B97F4A7C15ull + seed) % uint64_t(N));
+}
+
+/// A: row-major [M, K] per batch.
+__global__ void fill_set1_A_kernel(ElementInput *A, int M, int K, int64_t count, uint32_t seed) {
+  for (int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x; i < count; i += int64_t(gridDim.x) * blockDim.x) {
+    int64_t const b = i / (int64_t(M) * K);
+    int const k = int(i % K);
+    A[i] = ElementInput(3.0f * kh_unif(i, seed) + kh_sign(b * K + k, seed + 7));
+  }
+}
+
+/// B: column-major [K, N] per batch; the sink column shares u(b,k) with the rows of A.
+__global__ void fill_set1_B_kernel(ElementInput *B, int K, int N, int64_t count, uint32_t seed_u,
+                                   uint32_t seed, float sink) {
+  for (int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x; i < count; i += int64_t(gridDim.x) * blockDim.x) {
+    int64_t const b = i / (int64_t(K) * N);
+    int const n = int((i / K) % N), k = int(i % K);
+    float const v = (n == kh_sink_col(int(b), N, seed)) ? sink * kh_sign(b * K + k, seed_u + 7)
+                                                        : 3.5f * kh_unif(i, seed);
+    B[i] = ElementInput(v);
+  }
+}
+
+__global__ void fill_uniform_kernel(ElementInput *p, int64_t count, uint32_t seed, float scale) {
+  for (int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x; i < count; i += int64_t(gridDim.x) * blockDim.x)
+    p[i] = ElementInput(scale * kh_unif(i, seed));
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -299,11 +612,15 @@ struct Testbed {
 
   int64_t mn, count_A, count_B, count_C;
 
+  // Buffers passed to the reference / solution, and the two input sets restored into them.
   cutlass::DeviceAllocation<ElementInput> block_A, block_B, block_C;
+  cutlass::DeviceAllocation<ElementInput> set_A[2], set_B[2], set_C[2];
   cutlass::DeviceAllocation<ElementOutput> ref_D, ref_Softmax;
   cutlass::DeviceAllocation<float> block_Norm, block_Sum;
-  cutlass::DeviceAllocation<float> gold_D;       // one batch, FP32
+  cutlass::DeviceAllocation<float> gold_D[2];        // FP32 golden logits of each input set (all batches)
+  cutlass::DeviceAllocation<RowGold> gold_rows[2];   // golden softmax statistics per row
   cutlass::DeviceAllocation<RowCheck> row_checks;
+  cutlass::DeviceAllocation<CheckSummary> summary;
 #ifdef KH_TEST_SOLUTION
   cutlass::DeviceAllocation<ElementOutput> sol_D, sol_Softmax;
 #endif
@@ -325,19 +642,64 @@ struct Testbed {
     ref_Softmax.reset(count_C);
     block_Norm.reset(max_partials(N) * M * batch);
     block_Sum.reset(max_partials(N) * M * batch);
+    for (int s = 0; s < 2; ++s) {
+      set_A[s].reset(count_A);
+      set_B[s].reset(count_B);
+      set_C[s].reset(count_C);
+    }
 
-    // Uniform random values in [-2, 2) at full FP16 precision.
-    cutlass::reference::device::BlockFillRandomUniform(block_A.get(), count_A, seed, ElementInput(2), ElementInput(-2), -1);
-    cutlass::reference::device::BlockFillRandomUniform(block_B.get(), count_B, seed + 1, ElementInput(2), ElementInput(-2), -1);
-    cutlass::reference::device::BlockFillRandomUniform(block_C.get(), count_C, seed + 2, ElementInput(2), ElementInput(-2), -1);
+    // Set 0: uniform random values in [-2, 2) at full FP16 precision.
+    cutlass::reference::device::BlockFillRandomUniform(set_A[0].get(), count_A, seed, ElementInput(2), ElementInput(-2), -1);
+    cutlass::reference::device::BlockFillRandomUniform(set_B[0].get(), count_B, seed + 1, ElementInput(2), ElementInput(-2), -1);
+    cutlass::reference::device::BlockFillRandomUniform(set_C[0].get(), count_C, seed + 2, ElementInput(2), ElementInput(-2), -1);
+    // Set 1: attention-like logits (std ~4 plus a sink column, see above).
+    fill_set1_A_kernel<<<4096, 256>>>(set_A[1].get(), M, K, count_A, seed + 100);
+    fill_set1_B_kernel<<<4096, 256>>>(set_B[1].get(), K, N, count_B, seed + 100, seed + 101,
+                                      16.0f / std::sqrt(float(K)));
+    fill_uniform_kernel<<<4096, 256>>>(set_C[1].get(), count_C, seed + 102, 1.0f);
 
+    // Golden logits (FP32 accumulation) and row statistics of both sets, computed once.
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+    row_checks.reset(int64_t(M) * batch);
+    summary.reset(1);
+    for (int s = 0; s < 2; ++s) {
+      gold_D[s].reset(count_C);
+      gold_rows[s].reset(int64_t(M) * batch);
+      cutlass::reference::device::GemmComplex<
+          ElementInput, LayoutA, ElementInput, LayoutB, ElementInput, LayoutC, float, float, float>(
+        {M, N, K}, alpha,
+        cutlass::TensorRef<ElementInput, LayoutA>(set_A[s].get(), LayoutA(K)),
+        cutlass::ComplexTransform::kNone,
+        cutlass::TensorRef<ElementInput, LayoutB>(set_B[s].get(), LayoutB(K)),
+        cutlass::ComplexTransform::kNone,
+        beta,
+        cutlass::TensorRef<ElementInput, LayoutC>(set_C[s].get(), LayoutC(N)),
+        cutlass::TensorRef<float, LayoutC>(gold_D[s].get(), LayoutC(N)),
+        0.0f, batch, int64_t(M) * K, int64_t(K) * N, mn, mn);
+      golden_row_stats_kernel<<<unsigned(int64_t(M) * batch), 256>>>(N, gold_D[s].get(), gold_rows[s].get());
+    }
+
+    restore_inputs(0);
     // 0xFFFF is a NaN in FP16: any element left unwritten fails verification.
-    cudaMemset(ref_D.get(), 0xFF, count_C * sizeof(ElementOutput));
-    cudaMemset(ref_Softmax.get(), 0xFF, count_C * sizeof(ElementOutput));
+    poison(ref_D.get(), ref_Softmax.get());
 #ifdef KH_TEST_SOLUTION
     sol_D.reset(count_C);
     sol_Softmax.reset(count_C);
 #endif
+  }
+
+  /// Copies input set s into the buffers passed to the reference / solution.
+  void restore_inputs(int s) {
+    kh_copy(block_A.get(), set_A[s].get(), count_A * sizeof(ElementInput));
+    kh_copy(block_B.get(), set_B[s].get(), count_B * sizeof(ElementInput));
+    kh_copy(block_C.get(), set_C[s].get(), count_C * sizeof(ElementInput));
+  }
+
+  void poison(ElementOutput *D, ElementOutput *S) {
+    cudaMemsetAsync(D, 0xFF, count_C * sizeof(ElementOutput));
+    cudaMemsetAsync(S, 0xFF, count_C * sizeof(ElementOutput));
   }
 
   cutlass::Status run_reference_() {
@@ -360,112 +722,61 @@ struct Testbed {
   }
 #endif
 
-  /// Verifies the given outputs (all batches) against the golden result.
-  struct Outputs { char const *who; ElementOutput const *D; ElementOutput const *S; };
-
-  bool verify(std::vector<Outputs> const &outs) {
-    gold_D.reset(mn);
-    row_checks.reset(M);
-    std::vector<RowCheck> host(M);
-    std::vector<bool> ok(outs.size(), true);
-    std::vector<double> max_rd(outs.size(), 0), max_rs(outs.size(), 0), max_sum_err(outs.size(), 0);
-    std::vector<long long> nfail(outs.size(), 0);
-
-    using LayoutA = cutlass::layout::RowMajor;
-    using LayoutB = cutlass::layout::ColumnMajor;
-    using LayoutC = cutlass::layout::RowMajor;
-
-    for (int b = 0; b < batch; ++b) {
-      cutlass::reference::device::GemmComplex<
-          ElementInput, LayoutA, ElementInput, LayoutB, ElementInput, LayoutC, float, float, float>(
-        {M, N, K}, alpha,
-        cutlass::TensorRef<ElementInput, LayoutA>(block_A.get() + int64_t(M) * K * b, LayoutA(K)),
-        cutlass::ComplexTransform::kNone,
-        cutlass::TensorRef<ElementInput, LayoutB>(block_B.get() + int64_t(K) * N * b, LayoutB(K)),
-        cutlass::ComplexTransform::kNone,
-        beta,
-        cutlass::TensorRef<ElementInput, LayoutC>(block_C.get() + mn * b, LayoutC(N)),
-        cutlass::TensorRef<float, LayoutC>(gold_D.get(), LayoutC(N)),
-        0.0f);
-
-      for (size_t o = 0; o < outs.size(); ++o) {
-        check_rows_kernel<<<M, 256>>>(N, outs[o].D + mn * b, outs[o].S + mn * b, gold_D.get(), N, row_checks.get());
-        cudaError_t err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-          std::cerr << "Verification kernel failed: " << cudaGetErrorString(err) << std::endl;
-          return false;
-        }
-        cutlass::device_memory::copy_to_host(host.data(), row_checks.get(), M);
-        for (int r = 0; r < M; ++r) {
-          RowCheck const &c = host[r];
-          max_rd[o] = std::max(max_rd[o], double(c.max_ratio_d));
-          max_rs[o] = std::max(max_rs[o], double(c.max_ratio_s));
-          double const se = std::isfinite(c.row_sum) ? std::fabs(c.row_sum - 1.0) : INFINITY;
-          max_sum_err[o] = std::max(max_sum_err[o], se);
-          if ((c.fails || !(se <= kRowSumTol)) && ok[o]) {
-            ok[o] = false;
-            if (c.fails) {
-              int const col = c.first_col;
-              float gd = 0, d = 0, s = 0;
-              cutlass::device_memory::copy_to_host(&gd, gold_D.get() + int64_t(r) * N + col, 1);
-              ElementOutput hd, hs;
-              cutlass::device_memory::copy_to_host(&hd, outs[o].D + mn * b + int64_t(r) * N + col, 1);
-              cutlass::device_memory::copy_to_host(&hs, outs[o].S + mn * b + int64_t(r) * N + col, 1);
-              d = float(hd);
-              s = float(hs);
-              fprintf(stderr, "%s: mismatch at batch %d, row %d, col %d: D = %g (golden %g), Softmax = %g\n",
-                      outs[o].who, b, r, col, d, gd, s);
-            } else {
-              fprintf(stderr, "%s: Softmax row %d of batch %d sums to %.6f\n", outs[o].who, r, b, c.row_sum);
-            }
-          }
-          nfail[o] += c.fails;
-        }
+  /// Verifies outputs D and S (all batches) against the golden result of input set `set` on the
+  /// device. Prints a summary line unless `quiet` (failures are always reported).
+  bool verify(char const *who, ElementOutput const *D, ElementOutput const *S, int set, bool quiet = false) {
+    int64_t const rows = int64_t(M) * batch;
+    CheckSummary init{0u, 0u, 0u, 0u, 0ull, ~0ull}, h;
+    cudaMemcpy(summary.get(), &init, sizeof(init), cudaMemcpyHostToDevice);
+    check_rows_kernel<<<unsigned(rows), 256>>>(N, D, S, gold_D[set].get(), gold_rows[set].get(), row_checks.get());
+    summarize_rows_kernel<<<1024, 256>>>(row_checks.get(), rows, summary.get());
+    cudaError_t err = cudaMemcpy(&h, summary.get(), sizeof(h), cudaMemcpyDeviceToHost);
+    if (err == cudaSuccess) err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      std::cerr << "Verification kernel failed: " << cudaGetErrorString(err) << std::endl;
+      return false;
+    }
+    float max_rd, max_rs, max_se, max_sr;
+    std::memcpy(&max_rd, &h.max_rd_bits, sizeof(float));
+    std::memcpy(&max_rs, &h.max_rs_bits, sizeof(float));
+    std::memcpy(&max_se, &h.max_se_bits, sizeof(float));
+    std::memcpy(&max_sr, &h.max_sr_bits, sizeof(float));
+    bool const ok = (h.first_bad_row == ~0ull);
+    if (!ok) {
+      int64_t const r = int64_t(h.first_bad_row);
+      int const b = int(r / M), row = int(r % M);
+      RowCheck c;
+      cutlass::device_memory::copy_to_host(&c, row_checks.get() + r, 1);
+      if (c.fails) {
+        int const col = c.first_col;
+        float gd = 0;
+        ElementOutput hd, hs;
+        cutlass::device_memory::copy_to_host(&gd, gold_D[set].get() + r * N + col, 1);
+        cutlass::device_memory::copy_to_host(&hd, D + r * N + col, 1);
+        cutlass::device_memory::copy_to_host(&hs, S + r * N + col, 1);
+        fprintf(stderr, "%s: mismatch (input set %d) at batch %d, row %d, col %d: D = %g (golden %g), Softmax = %g\n",
+                who, set, b, row, col, float(hd), gd, float(hs));
+      } else {
+        fprintf(stderr, "%s: Softmax row %d of batch %d sums to %.6f (input set %d, |sum - 1| / tolerance = %.3f)\n",
+                who, row, b, c.row_sum, set, c.sum_ratio);
       }
     }
-
-    bool all_ok = true;
-    for (size_t o = 0; o < outs.size(); ++o) {
-      printf("%s: max |err|/tol D = %.3f, Softmax = %.3f; max |row sum - 1| = %.3g (tol %.3g); "
-             "%lld of %lld elements out of tolerance\n",
-             outs[o].who, max_rd[o], max_rs[o], max_sum_err[o], double(kRowSumTol), nfail[o], (long long)count_C);
-      all_ok = all_ok && ok[o];
+    if (!quiet || !ok) {
+      printf("%s: max |err|/tol D = %.3f, Softmax = %.3f; max |row sum - 1| = %.3g (max ratio to its "
+             "tolerance %.3f); %lld of %lld elements out of tolerance\n",
+             who, max_rd, max_rs, max_se, max_sr, (long long)h.fails, (long long)count_C);
     }
-    return all_ok;
-  }
-
-  template <typename Fn>
-  float time_min_ms_(Fn &&fn, char const *label) {
-    for (int i = 0; i < 3; ++i) {
-      fn();
-    }
-    cudaDeviceSynchronize();
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    float total_ms = 0, min_ms = 1e30f;
-    for (int iter = 0; iter < iterations; ++iter) {
-      cudaEventRecord(start);
-      fn();
-      cudaEventRecord(stop);
-      cudaEventSynchronize(stop);
-      float ms = 0;
-      cudaEventElapsedTime(&ms, start, stop);
-      total_ms += ms;
-      min_ms = std::min(min_ms, ms);
-    }
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    fprintf(stdout, "%s: %.4f ms (avg over %d trials, min: %.4f ms)\n", label, total_ms / iterations, iterations, min_ms);
-    return min_ms;
+    return ok;
   }
 
 #ifdef KH_TEST_SOLUTION
-  /// Poisons the solution outputs (NaN), runs the solution once and verifies it.
-  bool run_and_verify_solution_(char const *who) {
-    cudaMemset(sol_D.get(), 0xFF, count_C * sizeof(ElementOutput));
-    cudaMemset(sol_Softmax.get(), 0xFF, count_C * sizeof(ElementOutput));
-    cudaError_t err = run_solution_();
+  /// Restores input set `set`, poisons the solution outputs (NaN), runs the solution once and
+  /// verifies it.
+  bool run_and_verify_solution_(char const *who, int set) {
+    restore_inputs(set);
+    poison(sol_D.get(), sol_Softmax.get());
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err == cudaSuccess) err = run_solution_();
     if (err == cudaSuccess) {
       err = cudaDeviceSynchronize();
     }
@@ -473,7 +784,7 @@ struct Testbed {
       std::cerr << who << ": execution failed: " << cudaGetErrorString(err) << std::endl;
       return false;
     }
-    return verify({{who, sol_D.get(), sol_Softmax.get()}});
+    return verify(who, sol_D.get(), sol_Softmax.get(), set);
   }
 #endif
 
@@ -488,33 +799,55 @@ struct Testbed {
       return false;
     }
 
-    if (verify_reference && !verify({{"Reference", ref_D.get(), ref_Softmax.get()}})) {
-      std::cerr << "Reference verification failed" << std::endl;
-      return false;
+    if (verify_reference) {
+      if (!verify("Reference", ref_D.get(), ref_Softmax.get(), 0)) {
+        std::cerr << "Reference verification failed" << std::endl;
+        return false;
+      }
+      // Reference on input set 1 (attention-like logits with a sink column), once, untimed.
+      restore_inputs(1);
+      poison(ref_D.get(), ref_Softmax.get());
+      status = run_reference_();
+      err = cudaDeviceSynchronize();
+      if (status != cutlass::Status::kSuccess || err != cudaSuccess ||
+          !verify("Reference (input set 1)", ref_D.get(), ref_Softmax.get(), 1)) {
+        std::cerr << "Reference verification failed (input set 1)" << std::endl;
+        return false;
+      }
+      restore_inputs(0);
     }
 
 #ifdef KH_TEST_SOLUTION
-    if (!run_and_verify_solution_("Solution")) {
+    if (!run_and_verify_solution_("Solution", 0)) {
       return false;
     }
 #endif
 
     std::cout << "Passed" << std::endl;
-    if (iterations <= 0) {
+    int const iters = kh_env_int("KH_ITERS", this->iterations);  // KH_ITERS override (default unchanged)
+    if (iters <= 0) {
       return true;
     }
+    int const warmup = kh_env_int("KH_WARMUP", 3);
 
-    float const ref_min_ms = time_min_ms_([&]() { run_reference_(); }, "Ref time");
+    // KH timing protocol: input sets 0 and 1 alternate (restored outside the timed region).
+    KhTiming const ref = kh_bench("Ref time", warmup, iters, [&](int s) { restore_inputs(s); },
+                                  [&] { run_reference_(); }, kh_no_check);
+    fprintf(stdout, "%s: %.4f ms (avg over %d trials, min: %.4f ms)\n", "Ref time", ref.avg_ms, iters, ref.min_ms);
 #ifdef KH_TEST_SOLUTION
-    float const sol_min_ms = time_min_ms_([&]() { run_solution_(); }, "Kernel time");
-    fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
+    KhTiming const sol = kh_bench("Kernel time", warmup, iters,
+      [&](int s) { restore_inputs(s); poison(sol_D.get(), sol_Softmax.get()); },
+      [&] { run_solution_(); },
+      [&](int s) { return verify("Solution (timed call)", sol_D.get(), sol_Softmax.get(), s, true); });
+    fprintf(stdout, "%s: %.4f ms (avg over %d trials, min: %.4f ms)\n", "Kernel time", sol.avg_ms, iters, sol.min_ms);
+    fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", ref.min_ms / sol.min_ms);
     // The outputs must still be produced by a fresh call after the timed runs.
-    if (!run_and_verify_solution_("Solution (re-run after timing)")) {
+    if (!run_and_verify_solution_("Solution (re-run after timing)", 0)) {
       return false;
     }
 #endif
     double const flops = 2.0 * M * N * double(K) * batch;
-    printf("Reference: %.1f TFLOP/s\n", flops / ref_min_ms / 1e9);
+    printf("Reference: %.1f TFLOP/s\n", flops / ref.min_ms / 1e9);
     return true;
   }
 };

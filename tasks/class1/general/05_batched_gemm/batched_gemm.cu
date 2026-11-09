@@ -61,6 +61,191 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdio>   // std::fprintf (KH_TRIAL_TIMES)
+#include <cstdlib>  // std::getenv / std::atoi (KH_WARMUP / KH_ITERS overrides)
+
+/// Optional environment overrides for the timing loops (reference and solution):
+///   KH_WARMUP = warmup launches before timing, KH_ITERS = number of timed trials.
+/// Unset (or empty) -> the built-in defaults are used unchanged.
+static int kh_env_int(const char *name, int dflt) {
+  const char *v = std::getenv(name);
+  return (v != nullptr && *v != '\0') ? std::atoi(v) : dflt;
+}
+
+/// KH_TRIAL_TIMES=1: additionally log every timed trial to stderr as
+/// "KH_TRIAL <label> <trial> <ms>" (stdout output is unchanged).
+static void kh_trial_log(const char *label, int trial, float ms) {
+  if (kh_env_int("KH_TRIAL_TIMES", 0)) std::fprintf(stderr, "KH_TRIAL %s %d %.6f\n", label, trial, ms);
+}
+
+// ===================================== KH_TIMING_BEGIN ======================================
+// Timing protocol of the Class 1 harnesses (this block is identical in every harness).
+//
+// kh_bench(label, warmup, iters, prep, call, check) measures one implementation; the reference
+// and the solution are measured the same way:
+//  * prep(s) runs before every warmup and timed call, outside the timed region. It copies input
+//    set s into the fixed input buffers (the call always sees the same pointers) and re-poisons
+//    the outputs. s alternates 0, 1, 0, 1, ... over all calls and the two sets hold different
+//    data, so a call can never reuse the result of an earlier call.
+//  * Before every timed call the L2 is flushed by READING a max(256 MB, 2 x L2) buffer (L2-cached
+//    loads, no stores), then cudaDeviceSynchronize(). This also writes back the dirty lines left by
+//    prep, and the L2 then holds only clean, unrelated lines, so the timed call pays no write-back
+//    of flush data (a write-based flush would leave up to a full L2 of dirty lines behind).
+//  * Every trial is timed with CUDA events on the legacy default stream and with the host clock,
+//    from just before the start event to after the cudaDeviceSynchronize() that follows the stop
+//    event. Trial time = max(event time, wall time - fixed overhead), so work the call leaves
+//    running on other streams (private non-blocking streams, graphs, host callbacks) when it
+//    returns is counted in full. The fixed overhead (clock reads, event records, synchronization
+//    wake-up) is calibrated once per process as the 90th percentile of (wall - event) over 64
+//    empty-kernel calls measured the same way, clamped to [2, 50] us.
+//  * check(s) runs after every timed call, outside the timed region: a device-side comparison of
+//    the outputs with the golden result of input set s. Any failure (or CUDA error) prints
+//    "Incorrect" and exits with status 1.
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <iostream>
+#include <vector>
+#include <cuda_runtime.h>
+
+__global__ void kh_empty_kernel() {}
+
+__global__ void kh_l2_flush_kernel(int4 const *p, size_t n, int *sink) {
+  int4 acc = make_int4(0, 0, 0, 0);
+  for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x) {
+    int4 const v = __ldcg(p + i);
+    acc.x ^= v.x; acc.y ^= v.y; acc.z ^= v.z; acc.w ^= v.w;
+  }
+  if ((acc.x ^ acc.y ^ acc.z ^ acc.w) == 0x13579bdf) *sink = 1;  // keeps the loads alive
+}
+
+/// Aborts the run as incorrect.
+[[noreturn]] static void kh_fail(char const *what) {
+  std::fflush(stdout);
+  std::fprintf(stderr, "%s\n", what);
+  std::cout << "Incorrect" << std::endl;
+  std::exit(1);
+}
+
+[[maybe_unused]] static void kh_cuda_ok(cudaError_t e, char const *what) {
+  if (e != cudaSuccess) {
+    char msg[256];
+    std::snprintf(msg, sizeof(msg), "%s: CUDA error: %s", what, cudaGetErrorString(e));
+    kh_fail(msg);
+  }
+}
+
+/// Asynchronous device-to-device copy on the legacy default stream (input-set restore).
+[[maybe_unused]] static void kh_copy(void *dst, void const *src, size_t bytes) {
+  kh_cuda_ok(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice), "input restore");
+}
+
+static double kh_host_ms() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+struct KhTimer {
+  cudaEvent_t start = nullptr, stop = nullptr;
+  int4 *flush = nullptr;
+  size_t flush_n = 0;
+  int *sink = nullptr;
+  double overhead_ms = 0.0;
+};
+
+static void kh_l2_flush(KhTimer &t) {
+  kh_l2_flush_kernel<<<1024, 256>>>(t.flush, t.flush_n, t.sink);
+  kh_cuda_ok(cudaDeviceSynchronize(), "L2 flush");
+}
+
+/// One measured call: L2 flush, then event and host-clock timing up to device-wide completion.
+template <typename Call>
+static void kh_timed_call(KhTimer &t, Call &&call, char const *label, float *event_ms,
+                          double *wall_ms) {
+  kh_l2_flush(t);
+  double const t0 = kh_host_ms();
+  cudaEventRecord(t.start);
+  call();
+  cudaEventRecord(t.stop);
+  cudaError_t const e1 = cudaEventSynchronize(t.stop);
+  cudaError_t const e2 = cudaDeviceSynchronize();
+  double const t1 = kh_host_ms();
+  kh_cuda_ok(e1 != cudaSuccess ? e1 : e2, label);
+  kh_cuda_ok(cudaEventElapsedTime(event_ms, t.start, t.stop), label);
+  *wall_ms = t1 - t0;
+}
+
+static KhTimer &kh_timer() {
+  static KhTimer t;
+  static bool ready = false;
+  if (ready) return t;
+  int dev = 0, l2 = 0;
+  kh_cuda_ok(cudaGetDevice(&dev), "timer init");
+  kh_cuda_ok(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev), "timer init");
+  size_t const bytes = std::max<size_t>(size_t(256) << 20, 2 * size_t(l2));
+  kh_cuda_ok(cudaMalloc(&t.flush, bytes), "L2 flush buffer");
+  kh_cuda_ok(cudaMemset(t.flush, 0x5a, bytes), "L2 flush buffer");
+  kh_cuda_ok(cudaMalloc(&t.sink, sizeof(int)), "L2 flush buffer");
+  t.flush_n = bytes / sizeof(int4);
+  kh_cuda_ok(cudaEventCreate(&t.start), "timer init");
+  kh_cuda_ok(cudaEventCreate(&t.stop), "timer init");
+  std::vector<double> d;
+  for (int i = 0; i < 74; ++i) {
+    float ev = 0.f;
+    double wall = 0.0;
+    kh_timed_call(t, [] { kh_empty_kernel<<<1, 32>>>(); }, "timer calibration", &ev, &wall);
+    if (i >= 10) d.push_back(wall - double(ev));
+  }
+  std::sort(d.begin(), d.end());
+  t.overhead_ms = std::min(0.05, std::max(0.002, d[d.size() * 9 / 10]));
+  std::fprintf(stderr, "KH timing: L2 flush %zu MB, fixed overhead %.4f ms (p90 of %zu empty-kernel "
+               "trials, median %.4f ms)\n", bytes >> 20, t.overhead_ms, d.size(), d[d.size() / 2]);
+  ready = true;
+  return t;
+}
+
+struct KhTiming {
+  float avg_ms, min_ms;
+};
+
+/// check() for implementations whose output is not verified during timing (the reference).
+[[maybe_unused]] static bool kh_no_check(int) { return true; }
+
+template <typename Prep, typename Call, typename Check>
+static KhTiming kh_bench(char const *label, int warmup, int iters, Prep &&prep, Call &&call,
+                         Check &&check) {
+  KhTimer &t = kh_timer();
+  int set = 0;
+  for (int i = 0; i < warmup; ++i, set ^= 1) {
+    prep(set);
+    kh_cuda_ok(cudaDeviceSynchronize(), "input restore");
+    call();
+    kh_cuda_ok(cudaDeviceSynchronize(), label);
+  }
+  double total = 0.0;
+  float mn = 1e30f;
+  for (int it = 0; it < iters; ++it, set ^= 1) {
+    prep(set);
+    float ev = 0.f;
+    double wall = 0.0;
+    kh_timed_call(t, call, label, &ev, &wall);
+    float const ms = float(std::max<double>(ev, wall - t.overhead_ms));
+    kh_trial_log(label, it, ms);
+    if (!check(set)) {
+      char msg[256];
+      std::snprintf(msg, sizeof(msg), "%s: output of timed call %d (input set %d) does not match "
+                    "the golden result.", label, it, set);
+      kh_fail(msg);
+    }
+    total += ms;
+    mn = std::min(mn, ms);
+  }
+  return {iters > 0 ? float(total / iters) : 0.f, mn};
+}
+// ====================================== KH_TIMING_END =======================================
+
 #include "cutlass/cutlass.h"
 #include "cutlass/layout/matrix.h"
 
@@ -180,11 +365,16 @@ cudaError_t FillRandomUniform(float *ptr, size_t count, uint32_t seed) {
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // Device-side element-wise check against the golden result.
 //
-// With inputs in [-1, 1), FP32 accumulation errors stay below kTolScale * (|alpha| * sqrt(K) + |beta|)
-// (sequential FP32 accumulation over K = 8192 reaches 0.31 of it); TF32/FP16 operands exceed it by
-// 16-19x, BF16 operands by > 100x. Non-finite values always fail.
+// With inputs in [-1, 1), sequential FP32 accumulation over K reaches an absolute error of about
+// 7e-8 * K * |alpha| (rounding errors accumulate along K). The bound is
+// kTolK * |alpha| * K + kTolBeta * |beta|: sequential FP32 accumulation stays >= 3.1x below it at
+// every benchmark size (K = 128 .. 8192). TF32/FP16 operands exceed it by >= 8x, BF16 operands by
+// > 100x; 3xBF16 (2-term split, error ~ 1e-5 * sqrt(K)) exceeds it at K = 128 (decode and
+// prefill scores). FP32-accurate emulations (3xTF32, 6xBF16, 9xBF16) pass at every size.
+// Non-finite values always fail.
 
-static constexpr double kTolScale = 3e-5;
+static constexpr double kTolK = 3.7e-7;
+static constexpr double kTolBeta = 3e-5;
 
 struct CheckStats {
   unsigned long long fails;
@@ -229,8 +419,8 @@ __global__ void check_kernel(float const *x, float const *gold, size_t count, fl
 
 bool check_output(char const *who, float const *d_x, float const *d_gold,
                   int m, int n, int k, long long int batch_stride_C, int batch_count,
-                  float alpha, float beta) {
-  double const tol = kTolScale * (std::fabs(double(alpha)) * std::sqrt(double(k)) + std::fabs(double(beta)));
+                  float alpha, float beta, bool quiet = false) {
+  double const tol = kTolK * std::fabs(double(alpha)) * double(k) + kTolBeta * std::fabs(double(beta));
   size_t const count = size_t(batch_stride_C) * batch_count;  // packed: ldc = m
 
   CheckStats init{0ull, ~0ull, 0u, 0.0, 0.0}, stats;
@@ -258,6 +448,7 @@ bool check_output(char const *who, float const *d_x, float const *d_gold,
             who, (long long)(i / batch_stride_C), (long long)(i % m), (long long)((i % batch_stride_C) / m),
             got, expected, tol);
   }
+  if (quiet && stats.fails == 0) return true;  // timed calls: details only on failure
   fprintf(stdout, "%s: max |err| = %.3g (tol %.3g, max |err|/tol = %.3f), rms(err)/rms(ref) = %.3g, "
           "%llu of %zu elements out of tolerance\n",
           who, max_err, tol, max_err / tol, rel_rms, stats.fails, count);
@@ -265,32 +456,6 @@ bool check_output(char const *who, float const *d_x, float const *d_gold,
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <typename Fn>
-float time_min_ms(Fn &&fn, int iterations, char const *label) {
-  for (int i = 0; i < 3; ++i) {
-    fn();
-  }
-  cudaDeviceSynchronize();
-  cudaEvent_t start, stop;
-  cudaEventCreate(&start);
-  cudaEventCreate(&stop);
-  float total_ms = 0, min_ms = 1e30f;
-  for (int iter = 0; iter < iterations; ++iter) {
-    cudaEventRecord(start);
-    fn();
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    float ms = 0;
-    cudaEventElapsedTime(&ms, start, stop);
-    total_ms += ms;
-    min_ms = std::min(min_ms, ms);
-  }
-  cudaEventDestroy(start);
-  cudaEventDestroy(stop);
-  fprintf(stdout, "%s: %.4f ms (avg over %d trials, min: %.4f ms)\n", label, total_ms / iterations, iterations, min_ms);
-  return min_ms;
-}
 
 /// Verifies the reference (unless skipped) and the solution (if KH_TEST_SOLUTION) against the
 /// golden result, then profiles both. Returns false on any failure.
@@ -399,18 +564,60 @@ bool RunSize(int m, int n, int k, int batch_count, float alpha, float beta, int 
 
   std::cout << "Passed" << std::endl;
 
+  iterations = kh_env_int("KH_ITERS", iterations);  // KH_ITERS override (default unchanged)
   if (iterations > 0) {
-    float const ref_min_ms = time_min_ms([&]() {
-      kh_ref_strided_batched_sgemm(m, n, k, alpha, d_A, lda, batch_stride_A, d_B, ldb, batch_stride_B,
-                                   d_C_ref, ldc, batch_stride_C, beta, batch_count);
-    }, iterations, "Ref time");
+    int const warmup = kh_env_int("KH_WARMUP", 3);
+    // KH timing protocol: two input sets (set 0 = the correctness data, set 1 = new seeds). The
+    // generator is deterministic, so prep(s) regenerates set s in place (same pointers) instead of
+    // copying it from a stored pristine copy; outputs are re-initialized before every call.
+    uint32_t const seed_A[2] = {1, 11}, seed_B[2] = {2, 12}, seed_Cs[2] = {seed_C, 13};
+    auto restore_AB = [&](int s) {
+      kh_cuda_ok(FillRandomUniform(d_A, count_A, seed_A[s]), "input restore");
+      kh_cuda_ok(FillRandomUniform(d_B, count_B, seed_B[s]), "input restore");
+    };
+    // C holds the random initial values of set s (an input when beta != 0; with beta == 0 they act
+    // as a finite poison, 0 * C = 0, so elements the call does not write fail the check).
+    auto init_C = [&](float *C, int s) {
+      kh_cuda_ok(FillRandomUniform(C, count_C, seed_Cs[s]), "output re-initialization");
+    };
+
+    KhTiming const ref_t = kh_bench("Ref time", warmup, iterations,
+      [&](int s) { restore_AB(s); if (beta != 0.0f) init_C(d_C_ref, s); },
+      [&] {
+        kh_ref_strided_batched_sgemm(m, n, k, alpha, d_A, lda, batch_stride_A, d_B, ldb, batch_stride_B,
+                                     d_C_ref, ldc, batch_stride_C, beta, batch_count);
+      }, kh_no_check);
+    fprintf(stdout, "Ref time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
+            ref_t.avg_ms, iterations, ref_t.min_ms);
+    float const ref_min_ms = ref_t.min_ms;
 #ifdef KH_TEST_SOLUTION
-    float const sol_min_ms = time_min_ms([&]() {
-      StridedBatchedSgemm(m, n, k, alpha, d_A, lda, batch_stride_A, d_B, ldb, batch_stride_B,
-                          d_C_sol, ldc, batch_stride_C, beta, batch_count);
-    }, iterations, "Kernel time");
-    fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_min_ms);
-    // The output must still be produced by a fresh call after the timed runs.
+    // Golden of set 1 (computed once, outside the timed region; reads the initial C of set 1).
+    float *d_golden1 = nullptr;
+    kh_cuda_ok(cudaMalloc(&d_golden1, sizeof_C), "golden (timing set 1)");
+    restore_AB(1);
+    kh_cuda_ok(FillRandomUniform(d_C_sol, count_C, seed_Cs[1]), "golden (timing set 1)");
+    kh_cuda_ok(kh_golden_strided_batched_gemm(
+      m, n, k, alpha, d_A, lda, batch_stride_A, d_B, ldb, batch_stride_B,
+      d_C_sol, ldc, batch_stride_C, beta, d_golden1, batch_count), "golden (timing set 1)");
+    kh_cuda_ok(cudaDeviceSynchronize(), "golden (timing set 1)");
+    float const *gold[2] = {d_golden, d_golden1};
+
+    KhTiming const sol_t = kh_bench("Kernel time", warmup, iterations,
+      [&](int s) { restore_AB(s); init_C(d_C_sol, s); },
+      [&] {
+        StridedBatchedSgemm(m, n, k, alpha, d_A, lda, batch_stride_A, d_B, ldb, batch_stride_B,
+                            d_C_sol, ldc, batch_stride_C, beta, batch_count);
+      },
+      [&](int s) {
+        return check_output("Solution (timed call)", d_C_sol, gold[s], m, n, k, batch_stride_C,
+                            batch_count, alpha, beta, /*quiet=*/true);
+      });
+    cudaFree(d_golden1);
+    fprintf(stdout, "Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
+            sol_t.avg_ms, iterations, sol_t.min_ms);
+    fprintf(stdout, "Speedup: %.4fx (ref_min / kernel_min)\n", ref_min_ms / sol_t.min_ms);
+    // The output must still be produced by a fresh call after the timed runs (set 0 inputs).
+    restore_AB(0);
     if (!run_and_verify_solution("Solution (re-run after timing)")) {
       free_all();
       return false;
@@ -418,7 +625,6 @@ bool RunSize(int m, int n, int k, int batch_count, float alpha, float beta, int 
 #endif
     printf("Reference: %.1f TFLOP/s\n", 2.0 * m * n * double(k) * batch_count / ref_min_ms / 1e9);
   }
-
   free_all();
   return true;
 }
