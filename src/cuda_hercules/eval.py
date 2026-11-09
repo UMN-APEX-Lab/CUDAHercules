@@ -29,8 +29,16 @@ def _timeout_handler(signum, frame):
     raise _KernelTimeout("CUDA kernel execution timed out")
 
 from .compiler import compile_cuda_module, get_reference_include_dirs
-from .timing import time_cuda_function, TimingStats
+from .timing import calibrate_sync_overhead, time_cuda_function, TimingStats
 from .utils import get_project_root
+
+
+class TimingVerificationError(Exception):
+    """A timed call's outputs did not match the reference for its input set."""
+
+    def __init__(self, message: str, per_output: Optional[dict] = None):
+        super().__init__(message)
+        self.per_output = per_output or {}
 
 
 @dataclass
@@ -329,6 +337,65 @@ def check_correctness(
     return all_correct, per_output
 
 
+def _poison_outputs(outputs: list, checked_outputs: Optional[list[str]]) -> None:
+    """Overwrite checked outputs so values a call does not write are detectable."""
+    for name, tensor in outputs:
+        if checked_outputs is not None and name not in checked_outputs:
+            continue  # scratch buffer: contents are implementation-defined
+        if tensor.is_floating_point() or tensor.is_complex():
+            tensor.fill_(float("nan"))
+        elif tensor.dtype != torch.bool:
+            tensor.fill_(torch.iinfo(tensor.dtype).max)
+
+
+def _timing_summary(stats: TimingStats) -> dict:
+    """Measurement diagnostics recorded in KernelExecResult.metadata['timing']."""
+    events = stats.event_times_ms
+    return {
+        "event_mean_ms": sum(events) / len(events) if events else 0.0,
+        "event_min_ms": min(events) if events else 0.0,
+        "escape_flagged_trials": stats.escape_flagged_trials,
+        "max_escape_ms": stats.max_escape_ms,
+        "retries": stats.retries,
+        "verified_calls": stats.verified_calls,
+    }
+
+
+def _make_timing_input_sets(task_def: dict, ref_fn, num_sets: int, first_seed: int,
+                            device) -> tuple[list, list]:
+    """Build the input sets the timing phase alternates between.
+
+    Every set is a complete, self-consistent get_inputs() draw (different
+    seed), so tasks whose inputs derive from each other (e.g. FA backward's
+    O / lse / dO) stay consistent. The reference's outputs for each set are
+    computed once here. Returns (live_inputs, sets): live_inputs are the
+    tensors handed to the timed function -- the same pointers on every call --
+    and sets[k] = (pristine_inputs_k, reference_outputs_k) is copied into
+    them before each call that uses set k.
+    """
+    checked = task_def["CHECKED_OUTPUTS"]
+    live_inputs = None
+    sets = []
+    for k in range(num_sets):
+        seed = first_seed + k
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        inputs = task_def["get_inputs"]()
+        if k == 0:
+            live_inputs = inputs
+            pristine = [(name, t.clone() if isinstance(t, torch.Tensor) else t)
+                        for name, t in inputs]
+        else:
+            pristine = inputs  # never handed to the timed function
+        ref_outputs = task_def["get_outputs"](pristine)
+        ref_fn(*_build_call_args(task_def, pristine, ref_outputs))
+        torch.cuda.synchronize(device=device)
+        kept = [(name, tensor) for name, tensor in ref_outputs
+                if checked is None or name in checked]
+        sets.append((pristine, kept))
+    return live_inputs, sets
+
+
 def eval_kernel(
     task_dir: str,
     solution_cu: str,
@@ -340,6 +407,7 @@ def eval_kernel(
     device: Optional[torch.device] = None,
     verbose: bool = True,
     cached_ref_time_ms: float = 0.0,
+    num_timing_input_sets: int = 2,
 ) -> KernelExecResult:
     """
     Evaluate a CUDA solution against a task's reference.
@@ -354,6 +422,10 @@ def eval_kernel(
         rtol: Relative tolerance override (uses task default if None).
         device: CUDA device.
         verbose: Print progress.
+        cached_ref_time_ms: Pre-measured reference time (skips reference timing).
+        num_timing_input_sets: Input sets (>= 2) that consecutive timed calls
+            alternate between. Every timed solution call is verified against
+            the reference outputs for its set.
 
     Returns:
         KernelExecResult with compilation, correctness, and performance data.
@@ -535,31 +607,117 @@ def eval_kernel(
     result.correctness = all_correct
 
     # --- Step 4: Measure performance ---
+    # Consecutive timed calls alternate between >= 2 input sets, delivered in
+    # the SAME tensors (copied in outside the timed region), with the checked
+    # outputs re-poisoned before and verified after every solution call. A
+    # solution that remembers its last arguments and skips the work, or
+    # replays a stashed output, therefore fails here instead of timing ~0.
     if measure_performance and result.correctness:
+        num_sets = max(2, int(num_timing_input_sets))
+        checked = task_def["CHECKED_OUTPUTS"]
         if verbose:
-            print(f"[Eval] Measuring performance ({num_perf_trials} trials)...")
+            print(f"[Eval] Measuring performance ({num_perf_trials} trials, "
+                  f"alternating {num_sets} verified input sets)...")
 
-        torch.manual_seed(42)
-        torch.cuda.manual_seed(42)
-        inputs = task_def["get_inputs"]()
+        try:
+            live_inputs, timing_sets = _make_timing_input_sets(
+                task_def, ref_cuda_fn, num_sets,
+                first_seed=42 + num_correct_trials, device=device,
+            )
+        except Exception as e:
+            if target_sm > 0 and _is_arch_runtime_error(str(e)):
+                result.runtime_error = (
+                    f"{UNSUPPORTED_ARCH_PREFIX} general reference launch failed on target "
+                    f"sm_{target_sm}: {e}"
+                )
+            else:
+                result.runtime_error = (
+                    f"Performance measurement setup (reference outputs) failed: "
+                    f"{traceback.format_exc()}"
+                )
+            return result
+
+        def load_input_set(call_index: int, outputs: list) -> None:
+            pristine, _ = timing_sets[call_index % num_sets]
+            for (_, dst), (_, src) in zip(live_inputs, pristine):
+                if isinstance(dst, torch.Tensor):
+                    dst.copy_(src)
+            _poison_outputs(outputs, checked)
+
+        sol_outputs = task_def["get_outputs"](live_inputs)
+        sol_args = _build_call_args(task_def, live_inputs, sol_outputs)
+
+        def verify_solution_call(call_index: int) -> None:
+            k = call_index % num_sets
+            ok, per_output = check_correctness(
+                timing_sets[k][1], sol_outputs, tolerances, checked_outputs=checked,
+            )
+            if not ok:
+                bad = [name for name, info in per_output.items() if not info.get("correct")]
+                raise TimingVerificationError(
+                    f"Timing-phase verification failed: outputs of performance call "
+                    f"{call_index + 1} (input set {k + 1} of {num_sets}; every call reuses the "
+                    f"same input/output buffers) do not match the reference for that input "
+                    f"set: {', '.join(bad)}. Each call must compute its outputs from its "
+                    f"current inputs; caching results across calls is not allowed.",
+                    per_output,
+                )
+
+        # Overhead of the device-wide completion measurement, calibrated once
+        # with an empty op and shared by the solution and reference timings.
+        calibration = calibrate_sync_overhead(device)
+        timing_meta = {"num_input_sets": num_sets, **calibration.as_dict()}
+        result.metadata["timing"] = timing_meta
+        if verbose:
+            print(f"[Eval] Device-sync overhead (empty op): median "
+                  f"{calibration.median_ms * 1000:.1f} us, allowance "
+                  f"{calibration.allowance_ms * 1000:.1f} us, escape margin "
+                  f"{calibration.margin_ms * 1000:.1f} us, post-sync allowance "
+                  f"{calibration.post_allowance_ms * 1000:.1f} us, gate "
+                  f"{'on' if calibration.gate else 'off'}")
 
         # Time solution (wrap with 10-min SIGALRM — all kernel trials combined)
-        sol_outputs = task_def["get_outputs"](inputs)
-        sol_args = _build_call_args(task_def, inputs, sol_outputs)
         old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
         signal.alarm(kernel_timeout_sec)
         try:
             result.solution_time = time_cuda_function(
-                sol_fn, sol_args, num_trials=num_perf_trials, verbose=verbose, device=device
+                sol_fn, sol_args, num_trials=num_perf_trials, verbose=verbose, device=device,
+                before_call=lambda i: load_input_set(i, sol_outputs),
+                after_call=verify_solution_call,
+                calibration=calibration,
             )
+        except TimingVerificationError as e:
+            result.correctness = False
+            result.per_output_correctness = e.per_output
+            result.runtime_error = str(e)
+            timing_meta["verification"] = "failed"
+            if verbose:
+                print(f"[Eval] {e}")
+            return result
         except _KernelTimeout:
             result.runtime_error = f"Performance measurement (solution) timed out ({kernel_timeout_sec}s)"
             if verbose:
                 print(f"[Eval] Solution perf timed out after {kernel_timeout_sec}s")
             return result
+        except Exception:
+            result.correctness = False
+            result.runtime_error = f"Performance measurement (solution) failed: {traceback.format_exc()}"
+            if verbose:
+                print("[Eval] Solution failed during performance measurement")
+            return result
         finally:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, old_handler)
+
+        timing_meta["verification"] = "passed"
+        timing_meta["solution"] = _timing_summary(result.solution_time)
+        if result.solution_time.escape_flagged_trials:
+            result.metadata["stream_escape_detected"] = True
+            if verbose:
+                print(f"[Eval] WARNING: the solution left work running outside its timed stream in "
+                      f"{result.solution_time.escape_flagged_trials}/{result.solution_time.num_trials} "
+                      f"trials (up to {result.solution_time.max_escape_ms:.4f} ms after the stop "
+                      f"event); charged device-wide completion time")
 
         # Reference timing: use cached value or measure live
         if cached_ref_time_ms > 0:
@@ -574,14 +732,20 @@ def eval_kernel(
             if verbose:
                 print(f"[Eval] Using cached ref time: {cached_ref_time_ms:.4f} ms")
         else:
-            ref_outputs_tensors = task_def["get_outputs"](inputs)
-            ref_args = _build_call_args(task_def, inputs, ref_outputs_tensors)
+            # Same measurement as the solution (same alternating input sets in
+            # the same buffers, same poisoning, flush, gate and device-wide
+            # check); the reference's outputs are not verified.
+            ref_outputs_tensors = task_def["get_outputs"](live_inputs)
+            ref_args = _build_call_args(task_def, live_inputs, ref_outputs_tensors)
             old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
             signal.alarm(kernel_timeout_sec)
             try:
                 result.reference_time = time_cuda_function(
-                    ref_cuda_fn, ref_args, num_trials=num_perf_trials, verbose=verbose, device=device
+                    ref_cuda_fn, ref_args, num_trials=num_perf_trials, verbose=verbose, device=device,
+                    before_call=lambda i: load_input_set(i, ref_outputs_tensors),
+                    calibration=calibration,
                 )
+                timing_meta["reference"] = _timing_summary(result.reference_time)
             except _KernelTimeout:
                 result.runtime_error = f"Performance measurement (reference) timed out ({kernel_timeout_sec}s)"
                 if verbose:
