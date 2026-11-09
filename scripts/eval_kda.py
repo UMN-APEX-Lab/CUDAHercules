@@ -62,8 +62,7 @@ NCU_SKILL = os.path.join(KDA_ROOT, "skills", "ncu-report-skill")
 SUPPORTED_BACKENDS = ("class1_make", "class2_defpy")
 
 
-def load_api_config(args) -> tuple[str, str]:
-    """(api_base, api_key) from the environment or --env-file. Never logged."""
+def _read_env_file(args) -> dict:
     file_env = {}
     if args.env_file and os.path.isfile(os.path.expanduser(args.env_file)):
         for line in open(os.path.expanduser(args.env_file)):
@@ -71,7 +70,18 @@ def load_api_config(args) -> tuple[str, str]:
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
                 file_env[k.strip()] = v.strip().strip('"').strip("'")
-    key = os.environ.get(args.api_key_env) or file_env.get(args.api_key_env, "")
+    return file_env
+
+
+def load_env_value(args, name: str) -> str:
+    """Value of `name` from the environment or --env-file. Never logged."""
+    return os.environ.get(name) or _read_env_file(args).get(name, "")
+
+
+def load_api_config(args) -> tuple[str, str]:
+    """(api_base, api_key) of the OpenAI-compatible endpoint from the environment or --env-file. Never logged."""
+    file_env = _read_env_file(args)
+    key = load_env_value(args, args.api_key_env)
     base = args.api_base or os.environ.get(args.api_base_env) or file_env.get(args.api_base_env, "")
     if not key or not base:
         raise RuntimeError(f"missing {args.api_key_env} / {args.api_base_env} (env or --env-file)")
@@ -275,7 +285,6 @@ def run_one(config, gpu: int, args, ea) -> dict:
         f.write(prompt)
     sbx.install_opt_kh(opt_kh)
 
-    api_base, api_key = load_api_config(args)
     time_limit_s = args.time_limit_min * 60
     result = {
         "task_id": config.task_id, "task_class": config.task_class, "domain": config.domain,
@@ -302,13 +311,28 @@ def run_one(config, gpu: int, args, ea) -> dict:
             workspace=ws, sock_dir=sock_dir, gpu_index=gpu, opt_kh=opt_kh,
             ro_binds=[(NCU_SKILL, "/opt/kda/skills/ncu-report-skill")],
             env={"KH_SOLUTION_FILE": config.runner.solution_file})
+        claude_key = load_env_value(args, args.claude_key_env) if args.claude_key_env else ""
+        if claude_key:
+            # official Anthropic API; one shared client per run so usage totals accumulate over tasks
+            from kda_eval.claude_client import shared_client
+            client = shared_client(args.run_dir, claude_key=claude_key, effort=args.claude_effort)
+            usage_before = client.snapshot()
+        else:
+            api_base, api_key = load_api_config(args)
+            client = OpenAI(base_url=api_base, api_key=api_key, timeout=900.0, max_retries=0)
+            usage_before = None
         loop = AgentLoop(
-            OpenAI(base_url=api_base, api_key=api_key, timeout=900, max_retries=0),
+            client,
             args.model, spec, task_out, judge_sock, deadline,
             max_completion_tokens=args.max_completion_tokens, context_limit=args.context_limit,
             max_llm_calls=args.max_llm_calls, max_total_tokens=args.max_total_tokens,
             reasoning_effort=args.reasoning_effort)
         result["session"] = loop.run(prompt)
+        if usage_before is not None:
+            after = client.snapshot()
+            result["session"]["claude_usage"] = {k: round(after[k] - usage_before[k], 4) for k in after}
+            print(f"[usage] {config.task_id}: this task ${result['session']['claude_usage']['usd']:.2f}, "
+                  f"run total ${after['usd']:.2f}", flush=True)
     except Exception as e:
         result["final_status"] = "ERROR"
         result["error"] = f"{type(e).__name__}: {e}"
@@ -450,6 +474,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True, help="Model alias on the API endpoint (e.g. claude-opus-5.5)")
     ap.add_argument("--env-file", default=os.path.join(KH_ROOT, ".env"), help="File holding the API key/base")
+    ap.add_argument("--claude-key-env", default="",
+                    help="Env var holding an official Anthropic API key (e.g. CLAUDE_API_KEY). If set and "
+                         "present, calls go to the Anthropic API (needs `pip install anthropic`) instead of "
+                         "the OpenAI-compatible endpoint")
+    ap.add_argument("--claude-effort", default="low", help="Anthropic output_config.effort (thinking depth)")
     ap.add_argument("--api-key-env", default="AWS_OPENAI_API_KEY")
     ap.add_argument("--api-base-env", default="AWS_OPENAI_BASE_URL")
     ap.add_argument("--api-base", default="", help="Overrides --api-base-env")

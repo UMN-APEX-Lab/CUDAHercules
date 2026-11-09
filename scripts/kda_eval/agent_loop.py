@@ -25,6 +25,17 @@ from openai import (APIConnectionError, APITimeoutError, BadRequestError,
 
 from . import sandbox as sbx
 
+# transient provider errors (OpenAI-compatible gateway, or the native Anthropic API when the optional
+# `anthropic` package is installed and --claude-key-env is used): back off and retry
+RETRYABLE = (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)
+BAD_REQUEST = (BadRequestError,)
+try:
+    import anthropic
+    RETRYABLE += (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.InternalServerError)
+    BAD_REQUEST += (anthropic.BadRequestError,)
+except ImportError:
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 KDA_HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kda_lite", "budget_guard.py")
 
@@ -177,13 +188,13 @@ class AgentLoop:
         for attempt in range(8):
             try:
                 return self.client.chat.completions.create(**kwargs)
-            except (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError) as e:
+            except RETRYABLE as e:
                 self.stats["api_retries"] += 1
                 self._log(type="api_error", error=f"{type(e).__name__}: {e}"[:1000], attempt=attempt)
                 if self._remaining() < 60:
                     raise
                 time.sleep(min(120, 5 * 2 ** attempt))
-            except BadRequestError as e:
+            except BAD_REQUEST as e:
                 msg = str(e).lower()
                 self._log(type="api_error", error=f"BadRequest: {e}"[:2000], attempt=attempt)
                 if any(s in msg for s in ("context", "too long", "too many tokens", "prompt is too long")):
