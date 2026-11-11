@@ -13,11 +13,34 @@ import re
 import hashlib
 import tempfile
 import subprocess
+import shutil
+import sys
 from pathlib import Path
 from typing import Optional
 
 import torch
 from torch.utils.cpp_extension import load
+
+
+def ensure_ninja_available() -> dict:
+    """Expose the interpreter's Ninja even without activating its virtualenv.
+
+    torch invokes the executable by name; importing the Python package alone
+    does not make its virtualenv bin directory visible to subprocesses.
+    """
+    candidates=[shutil.which('ninja'),str(Path(sys.executable).parent/'ninja'),
+                str(Path(sys.prefix)/'bin/ninja')]
+    for candidate in dict.fromkeys(p for p in candidates if p):
+        if not Path(candidate).is_file() or not os.access(candidate,os.X_OK):continue
+        try:
+            probe=subprocess.run([candidate,'--version'],capture_output=True,text=True,check=True,timeout=10)
+        except (OSError,subprocess.SubprocessError):continue
+        directory=str(Path(candidate).parent)
+        paths=os.environ.get('PATH','').split(os.pathsep)
+        if directory not in paths:os.environ['PATH']=os.pathsep.join([directory,*paths])
+        return dict(ninja=str(Path(candidate).absolute()),version=probe.stdout.strip())
+    raise RuntimeError('CUDA build infrastructure unavailable: Ninja executable not found. '
+                       'Install ninja in the evaluation interpreter environment before running KDA.')
 
 
 CUDA_ALLOC_CACHE_INTERPOSE = r"""\
@@ -316,6 +339,7 @@ def compile_cuda_module(
     Returns:
         A callable Python function that wraps the CUDA function.
     """
+    ensure_ninja_available()
     parsed_sig = parse_function_signature(function_signature)
     func_name = parsed_sig["name"]
 

@@ -124,13 +124,15 @@ class AgentLoop:
 
     # -- KDA budget hook ----------------------------------------------------
     def _hook(self, event: str) -> dict | None:
+        if self._remaining() <= 0:
+            return None
         env = dict(os.environ,
                    KDA_BUDGET_STATUS_CMD=f"{sys.executable} {os.path.join(HERE, 'submit.py')} --budget-json",
                    KH_JUDGE_SOCKET=self.judge_socket,
                    KDA_BUDGET_STATE=os.path.join(self.task_out, "kda_budget_state.json"))
         try:
             p = subprocess.run([sys.executable, KDA_HOOK, event], input="{}", capture_output=True,
-                               text=True, env=env, timeout=90)
+                               text=True, env=env, timeout=min(90,max(0.1,self._remaining())))
             return json.loads(p.stdout) if p.stdout.strip() else None
         except Exception:
             return None
@@ -140,8 +142,10 @@ class AgentLoop:
         return self.deadline - time.time()
 
     def _run_tool(self, name: str, args: dict) -> str:
+        if self._remaining() <= 0:
+            return "REJECTED: wall-clock budget exhausted."
         if name == "bash":
-            timeout = min(int(args.get("timeout_s") or 600), 1800, max(int(self._remaining()) + 60, 60))
+            timeout = min(int(args.get("timeout_s") or 600), 1800, max(self._remaining(),0.1))
             rc, out, err, timed_out = sbx.run_in_sandbox(
                 self.spec, ["/bin/bash", "-c", args["command"]], timeout_s=timeout)
             head = f"exit_code: {rc}" + (f" (killed after {timeout}s timeout)" if timed_out else "")
@@ -149,7 +153,8 @@ class AgentLoop:
         if name in ("read_file", "write_file", "edit_file"):
             req = dict(args, op=name.split("_")[0])
             rc, out, err, _ = sbx.run_in_sandbox(
-                self.spec, ["/usr/bin/python3", "/opt/kh/fstool.py"], stdin=json.dumps(req), timeout_s=120)
+                self.spec, ["/usr/bin/python3", "/opt/kh/fstool.py"], stdin=json.dumps(req),
+                timeout_s=min(120,max(0.1,self._remaining())))
             try:
                 resp = json.loads(out)
                 return _truncate(resp["output"] if resp["ok"] else "ERROR: " + resp["output"])
@@ -161,6 +166,13 @@ class AgentLoop:
     def _elide_old(self, messages: list) -> None:
         """Shrink old tool outputs and old write_file payloads. The KDA
         evidence records in /workspace keep what matters re-readable."""
+        if getattr(self.client,'preserve_native_history',False):
+            # Native signed thinking/tool blocks must be echoed unchanged.
+            # Opus 5's 1M context accommodates this run's 150k soft threshold.
+            if not getattr(self,'_native_context_note',False):
+                self._log(type='context_policy',policy='preserve_native_signed_history')
+                self._native_context_note=True
+            return
         cutoff = len(messages) - KEEP_RECENT_MESSAGES
         for m in messages[2:max(cutoff, 2)]:
             if m["role"] == "tool" and len(m["content"]) > 600:
@@ -180,6 +192,19 @@ class AgentLoop:
         self.stats["elisions"] += 1
 
     # -- API ----------------------------------------------------------------
+    def _completion_limit(self) -> int:
+        path=os.path.join(os.path.dirname(self.task_out),'runtime_settings.json')
+        try:
+            with open(path) as settings:value=json.load(settings)['max_completion_tokens']
+        except FileNotFoundError:
+            return self.max_completion_tokens
+        if not isinstance(value,int) or not 1<=value<=1048576:
+            raise ValueError('Invalid trusted max_completion_tokens setting')
+        if value!=self.max_completion_tokens:
+            self._log(type='runtime_settings',max_completion_tokens=value)
+            self.max_completion_tokens=value
+        return value
+
     def _complete(self, messages: list):
         kwargs = dict(model=self.model, messages=messages, tools=TOOLS, tool_choice="auto",
                       max_completion_tokens=self.max_completion_tokens)
@@ -187,13 +212,16 @@ class AgentLoop:
             kwargs["reasoning_effort"] = self.reasoning_effort
         for attempt in range(8):
             try:
-                return self.client.chat.completions.create(**kwargs)
+                if self._remaining() <= 0:
+                    raise TimeoutError("wall-clock budget exhausted")
+                kwargs['max_completion_tokens']=self._completion_limit()
+                return self.client.chat.completions.create(**kwargs,timeout=min(900,self._remaining()))
             except RETRYABLE as e:
                 self.stats["api_retries"] += 1
                 self._log(type="api_error", error=f"{type(e).__name__}: {e}"[:1000], attempt=attempt)
                 if self._remaining() < 60:
                     raise
-                time.sleep(min(120, 5 * 2 ** attempt))
+                time.sleep(min(120, 5 * 2 ** attempt, max(0,self._remaining())))
             except BAD_REQUEST as e:
                 msg = str(e).lower()
                 self._log(type="api_error", error=f"BadRequest: {e}"[:2000], attempt=attempt)
@@ -204,15 +232,46 @@ class AgentLoop:
         raise RuntimeError("API retries exhausted")
 
     # -- main loop ----------------------------------------------------------
-    def run(self, user_prompt: str) -> dict:
-        messages = [{"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt}]
+    def _checkpoint(self,messages: list) -> None:
+        state=dict(self.stats,wall_s=round(time.time()-self.t0,3))
+        for name,value in [('messages.json',messages),('session_state.json',state)]:
+            path=os.path.join(self.task_out,name)
+            with open(path+'.tmp','w') as output:json.dump(value,output,indent=1,default=str)
+            os.replace(path+'.tmp',path)
+
+    def run(self, user_prompt: str, *, initial_messages: list | None = None,
+            initial_stats: dict | None = None, elapsed_s: float = 0) -> dict:
+        self.t0-=elapsed_s
+        if initial_stats:
+            for key in self.stats:
+                if key in initial_stats:self.stats[key]=initial_stats[key]
+        messages = initial_messages if initial_messages is not None else [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}]
+        if initial_messages is not None:
+            # Never repeat an interrupted tool automatically (it may submit).
+            last_assistant=next((m for m in reversed(messages) if m['role']=='assistant'),{})
+            completed={m.get('tool_call_id') for m in messages if m['role']=='tool'}
+            for call in last_assistant.get('tool_calls') or []:
+                if call['id'] not in completed:
+                    messages.append(dict(role='tool',tool_call_id=call['id'],
+                        content='Interrupted by the pause. Inspect the workspace and budget before retrying.'))
+            messages.append(dict(role='user',content=user_prompt))
+            self._log(type='resumed',previous_elapsed_s=elapsed_s)
+        self._checkpoint(messages)
         end_reason = "model_stopped"
         try:
             while True:
                 if self._remaining() <= 0:
                     end_reason = "time_limit"
                     break
+                state_path=os.path.join(self.task_out,"judge_state.json")
+                if os.path.isfile(state_path):
+                    with open(state_path) as state_file:
+                        state=json.load(state_file)
+                    if state["evals_used"]>=state["evals_limit"]:
+                        end_reason="max_evaluations"
+                        break
                 if self.stats["llm_calls"] >= self.max_llm_calls:
                     end_reason = "max_llm_calls"
                     break
@@ -229,6 +288,9 @@ class AgentLoop:
                 self.stats["prompt_tokens"] += usage.get("prompt_tokens") or 0
                 self.stats["completion_tokens"] += usage.get("completion_tokens") or 0
                 self._log(type="response", finish_reason=choice.finish_reason, usage=usage,
+                          max_completion_tokens=self.max_completion_tokens,
+                          provider=getattr(self.client,'last_provider','aws'),
+                          reasoning_effort=self.reasoning_effort,
                           message=msg.model_dump(exclude_none=True))
 
                 assistant = {"role": "assistant", "content": msg.content or ""}
@@ -237,7 +299,10 @@ class AgentLoop:
                         {"id": tc.id, "type": "function",
                          "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
                         for tc in msg.tool_calls]
+                if getattr(msg,'anthropic_content',None) is not None:
+                    assistant['_anthropic_content']=msg.anthropic_content
                 messages.append(assistant)
+                self._checkpoint(messages)
 
                 if not msg.tool_calls:
                     hook = self._hook("stop")
@@ -264,6 +329,7 @@ class AgentLoop:
                     self._log(type="tool", name=name, args=tc["function"]["arguments"][:4000],
                               output=output[:8000], dt=round(time.time() - t_tool, 1))
                     messages.append({"role": "tool", "tool_call_id": tc["id"], "content": output})
+                    self._checkpoint(messages)
 
                 hook = self._hook("post-tool-use")
                 note = ((hook or {}).get("hookSpecificOutput") or {}).get("additionalContext")
@@ -277,7 +343,6 @@ class AgentLoop:
             end_reason = f"error: {type(e).__name__}: {e}"[:500]
             self._log(type="fatal", error=end_reason)
         finally:
-            with open(os.path.join(self.task_out, "messages.json"), "w") as f:
-                json.dump(messages, f, indent=1, default=str)
+            self._checkpoint(messages)
             self.transcript.close()
         return dict(self.stats, end_reason=end_reason, wall_s=round(time.time() - self.t0, 1))

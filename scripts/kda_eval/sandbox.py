@@ -29,6 +29,7 @@ import tempfile
 from dataclasses import dataclass, field
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
 KH_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 
 SANDBOX_HOME = "/home/agent"
@@ -86,7 +87,7 @@ def base_env() -> dict:
         "PATH": "/opt/kh/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "CUDA_HOME": "/usr/local/cuda",
         "CUTLASS_INCLUDE_DIRS": ":".join(f"/opt/cutlass/{d}" for d in CUTLASS_INCLUDE_SUBDIRS),
-        "PYTHONPATH": "/usr/local/cuda/nsight-compute-2025.3.1/extras/python",
+        "PYTHONPATH": "/opt/nvidia/nsight-compute/2025.3.1/extras/python",
         "TMPDIR": "/tmp",
         "KH_JUDGE_SOCKET": f"{SANDBOX_SOCK_DIR}/judge.sock",
     }
@@ -202,6 +203,13 @@ def build_uid_argv(spec: SandboxSpec, command: list[str], user: str) -> list[str
 def run_in_sandbox(spec: SandboxSpec, command: list[str], stdin: str = "",
                    timeout_s: float = 600) -> tuple[int, str, str, bool]:
     """Run one command in a fresh sandbox. Returns (rc, stdout, stderr, timed_out)."""
+    if os.environ.get("KH_SANDBOX_BACKEND", "bwrap") == "chroot":
+        from kda_eval import chroot_sandbox
+        if spec._minor < 0:
+            spec._minor = gpu_minor_number(spec.gpu_index)
+        env = base_env()
+        env.update(spec.env)
+        return chroot_sandbox.run(spec, command, stdin, timeout_s, env)
     user = _uid_mode()
     argv = build_uid_argv(spec, command, user) if user else build_bwrap_argv(spec, command)
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
@@ -217,6 +225,20 @@ def run_in_sandbox(spec: SandboxSpec, command: list[str], stdin: str = "",
         timed_out = True
     return (proc.returncode, out.decode("utf-8", "replace"),
             err.decode("utf-8", "replace"), timed_out)
+
+
+def prepare_sandbox(spec: SandboxSpec) -> None:
+    if os.environ.get("KH_SANDBOX_BACKEND", "bwrap") == "chroot":
+        from kda_eval import chroot_sandbox
+        if spec._minor < 0:
+            spec._minor = gpu_minor_number(spec.gpu_index)
+        chroot_sandbox.prepare(spec)
+
+
+def cleanup_sandbox(spec: SandboxSpec) -> None:
+    if os.environ.get("KH_SANDBOX_BACKEND", "bwrap") == "chroot":
+        from kda_eval import chroot_sandbox
+        chroot_sandbox.cleanup(spec)
 
 
 def install_opt_kh(dest: str) -> None:
@@ -278,7 +300,11 @@ def probe(gpu: int, scan: bool, ro_binds: list) -> int:
         spec = SandboxSpec(workspace=dirs["ws"], sock_dir=dirs["sock"], gpu_index=gpu,
                            opt_kh=dirs["opt_kh"], ro_binds=ro_binds)
         script = PROBE_SCRIPT + (_leak_scan_cmd() if scan else "")
-        return subprocess.run(build_bwrap_argv(spec, ["/bin/bash", "-c", script])).returncode
+        code, out, err, _ = run_in_sandbox(spec, ["/bin/bash", "-c", script])
+        print(out, end="")
+        print(err, end="", file=sys.stderr)
+        cleanup_sandbox(spec)
+        return code
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

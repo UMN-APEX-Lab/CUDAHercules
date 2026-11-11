@@ -38,9 +38,11 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import multiprocessing as mp
 import os
+from pathlib import Path
 import re
 import shutil
 import signal
@@ -88,6 +90,33 @@ def load_api_config(args) -> tuple[str, str]:
     return base.rstrip("/"), key
 
 
+def load_official_only_key(args) -> str:
+    """Retain the official-only CLI while preferring an explicit fallback route."""
+    if args.api_provider == 'anthropic_with_aws_fallback':
+        return ''
+    return load_env_value(args, args.claude_key_env) if args.claude_key_env else ''
+
+
+def make_api_client(args, task_id: str):
+    from openai import OpenAI
+
+    claude_key = load_official_only_key(args)
+    if claude_key:
+        from kda_eval.claude_client import shared_client
+        client = shared_client(args.run_dir, claude_key=claude_key, effort=args.claude_effort)
+        client.last_provider = 'anthropic'
+        return client
+    api_base, api_key = load_api_config(args)
+    client = OpenAI(base_url=api_base, api_key=api_key, timeout=900, max_retries=0)
+    if args.api_provider == 'anthropic_with_aws_fallback':
+        from kda_eval.providers import OfficialClaudeWithFallback
+        client = OfficialClaudeWithFallback(
+            client, args.env_file, args.provider_state_file, model=args.model,
+            effort=args.reasoning_effort or args.claude_effort, task_id=task_id,
+            key_env=args.claude_key_env or 'CLAUDE_API_KEY')
+    return client
+
+
 # ---------------------------------------------------------------------------
 # Workspace + prompt
 # ---------------------------------------------------------------------------
@@ -111,12 +140,23 @@ def _makefile_build_flags(config) -> tuple[str, str]:
 
 def _sandbox_notes(config, gpu_name: str, sm: int) -> str:
     sol = config.runner.solution_file
-    flags = "-O3 --use_fast_math --expt-relaxed-constexpr -std=c++17"
-    arch = f"native `sm_{sm}` code plus PTX"
+    standard = "c++20" if config.runner.backend == "class2_defpy" else "c++17"
+    makefile = os.path.join(KH_ROOT, config.runner.workdir, "Makefile")
+    if os.path.isfile(makefile):
+        match = re.search(r"-std=(c\+\+\d+)", open(makefile).read())
+        if match:
+            standard = match[1]
+    target_feature = next((f for f in config.hardware.required_features if f.startswith("sm_")), f"sm_{sm}")
+    arch = f"`{target_feature}`"
+    flags = f"-O3 --use_fast_math --expt-relaxed-constexpr -std={standard}"
     if config.runner.backend == "class2_defpy":
         flags += (" --expt-extended-lambda -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__"
                   " -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__")
         how = f"`{sol}` is compiled as a PyTorch extension behind an auto-generated pybind11 wrapper."
+        from cuda_hercules.eval import load_task_def,get_solution_cuda_flags
+        definition=load_task_def(os.path.join(KH_ROOT,config.runner.workdir))
+        shared=get_solution_cuda_flags(definition,sm if '/general/' in config.task_id else 0)
+        flags+=' '+ ' '.join(flag for flag in shared if flag.startswith('-D'))
     else:
         how = f"`{sol}` is included by the judge's private test harness."
         if config.runner.backend == "class1_make" and "/general/" not in config.task_id:
@@ -150,6 +190,9 @@ def _sandbox_notes(config, gpu_name: str, sm: int) -> str:
 - GPU: one {gpu_name} (sm_{sm}) for your own builds, tests and profiling.
   The judge times submissions on the same GPU.
 - No network access.
+{('- This container does not grant NVIDIA performance-counter access (ERR_NVGPUCTRPERM). '
+  'Do not spend budget retrying counter-based ncu profiling. CUDA-event timing and local CUDA tests work. '
+  'Nsight Systems is not installed.' if os.environ.get('KH_NCU_COUNTERS_AVAILABLE') == '0' else '')}
 """
 
 
@@ -224,6 +267,21 @@ def _wait_for(path: str, proc: subprocess.Popen, timeout: float, what: str) -> N
 def _stop(proc: subprocess.Popen | None) -> None:
     if proc is None or proc.poll() is not None:
         return
+    # Evaluators start their own sessions. Killing only the judge's group can
+    # otherwise leave a CUDA test/compilation running into the next task.
+    parents={};groups={}
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():continue
+        try:
+            fields=(entry/'stat').read_text().rsplit(')',1)[1].split()
+            parents[int(entry.name)]=int(fields[1]);groups[int(entry.name)]=int(fields[2])
+        except (OSError,ValueError,IndexError):continue
+    descendants={proc.pid}
+    while True:
+        expanded=descendants|{pid for pid,parent in parents.items() if parent in descendants}
+        if expanded==descendants:break
+        descendants=expanded
+    child_groups={groups[pid] for pid in descendants if pid in groups}-{os.getpgrp(),proc.pid}
     try:
         os.killpg(proc.pid, signal.SIGTERM)
         proc.wait(timeout=20)
@@ -232,6 +290,10 @@ def _stop(proc: subprocess.Popen | None) -> None:
             os.killpg(proc.pid, signal.SIGKILL)
         except Exception:
             pass
+    finally:
+        for group in child_groups:
+            try:os.killpg(group,signal.SIGKILL)
+            except ProcessLookupError:pass
 
 
 def _final_reeval(ea, config, task_out: str, eval_timeout: int) -> dict:
@@ -262,12 +324,19 @@ def _final_reeval(ea, config, task_out: str, eval_timeout: int) -> dict:
 
 
 def run_one(config, gpu: int, args, ea) -> dict:
-    from openai import OpenAI
     from kda_eval.agent_loop import AgentLoop
+    from cuda_hercules.utils import task_source_hash
+
+    fingerprint=task_source_hash(os.path.join(KH_ROOT,config.runner.workdir))
+    if fingerprint!=args.task_source_hashes[config.task_id]:
+        raise RuntimeError("Benchmark task sources changed after this run was started")
 
     run_dir = args.run_dir
     task_out = os.path.join(run_dir, config.task_id.replace("/", "_"))
+    resume=getattr(args,'resume_tasks',{}).get(config.task_id)
     if os.path.isdir(task_out):
+        if resume or os.path.isfile(os.path.join(task_out,'judge_state.json')):
+            raise RuntimeError('Incomplete session exists; refuse to delete or reset its budget')
         shutil.rmtree(task_out)  # incomplete earlier attempt (no result.json)
     ws = os.path.join(task_out, "workspace")
     opt_kh = os.path.join(task_out, "opt_kh")
@@ -281,6 +350,25 @@ def run_one(config, gpu: int, args, ea) -> dict:
     task_md = ea.build_task_prompt(config)
     make_workspace(config, ws, task_md)
     prompt = build_kda_prompt(config, task_md, args, gpu_name, sm)
+    initial_messages=None
+    resume_path=None
+    if resume:
+        from kda_eval.resume import restore_workspace
+        restore_workspace(resume['checkpoint_directory'],task_out,task_md)
+        initial_messages=json.load(open(os.path.join(task_out,'messages.json')))
+        elapsed=resume['judge_state']['elapsed_s']
+        reference_notice=('The benchmark reference has been upgraded. Earlier local timing guesses may be stale; '
+                          if resume['benchmark_changed'] else 'The benchmark reference is unchanged; ')
+        prompt=(f'Session resumed after an explicit pause. Your code, records and conversation are restored. '
+                f'Already used {elapsed/60:.2f}/60 minutes and '
+                f'{resume["judge_state"]["evals_used"]}/{args.max_evals} evaluations; '
+                f'only {(args.time_limit_min*60-elapsed)/60:.2f} minutes remain. '+reference_notice+
+                f'the per-response output token limit is {args.max_completion_tokens}. '+
+                'read the current TASK.md and use submit for formal feedback. '
+                'Do not restart exploration from scratch. Current instructions follow:\n\n'+prompt)
+        resume_path=os.path.join(task_out,'resume_state.json')
+        with open(resume_path,'w') as output:json.dump(resume['judge_state'],output,indent=2)
+        with open(os.path.join(task_out,'resume_provenance.json'),'w') as output:json.dump(resume,output,indent=2)
     with open(os.path.join(task_out, "prompt.md"), "w") as f:
         f.write(prompt)
     sbx.install_opt_kh(opt_kh)
@@ -289,45 +377,52 @@ def run_one(config, gpu: int, args, ea) -> dict:
     result = {
         "task_id": config.task_id, "task_class": config.task_class, "domain": config.domain,
         "model": args.model, "agent": "kda-lite-api", "gpu": gpu,
+        "api_routing":getattr(args,'api_provider','aws'),
+        "reasoning_effort":args.reasoning_effort,
+        "source_hash":fingerprint,
         "final_status": "FAIL", "best_speedup": 0.0, "best_solution_file": "",
         "budget": {"time_limit_min": args.time_limit_min, "max_evals": args.max_evals,
                    "max_total_tokens": args.max_total_tokens, "target_speedup": args.target_speedup},
     }
     judge = None
+    spec = None
     try:
+        spec = sbx.SandboxSpec(
+            workspace=ws, sock_dir=sock_dir, gpu_index=gpu, opt_kh=opt_kh,
+            ro_binds=[(NCU_SKILL, "/opt/kda/skills/ncu-report-skill")],
+            env={"KH_SOLUTION_FILE": config.runner.solution_file})
+        sbx.prepare_sandbox(spec)
+        rc,_,error,_=sbx.run_in_sandbox(spec,["/usr/bin/true"],timeout_s=30)
+        if rc:
+            raise RuntimeError(f"sandbox health check failed before model session: {error[-1500:]}")
         judge_env = dict(os.environ, TORCH_EXTENSIONS_DIR=os.path.join(task_out, ".torch_ext"))
         judge = subprocess.Popen(
             [sys.executable, os.path.join(HERE, "kda_eval", "judge.py"),
              "--task-id", config.task_id, "--socket", judge_sock,
              "--run-dir", task_out, "--max-evals", str(args.max_evals),
              "--time-limit", str(time_limit_s), "--eval-timeout", str(args.eval_timeout),
-             "--target-speedup", str(args.target_speedup)],
+             "--target-speedup", str(args.target_speedup)]+(['--resume-state',resume_path] if resume_path else []),
             stdout=open(os.path.join(task_out, "judge.log"), "w"), stderr=subprocess.STDOUT,
             env=judge_env, start_new_session=True)
         _wait_for(judge_sock, judge, 300, "judge")
-        deadline = time.time() + time_limit_s  # the judge's clock started slightly earlier
+        with open(os.path.join(task_out,"judge_state.json")) as state:
+            deadline = json.load(state)["deadline_epoch"]
 
-        spec = sbx.SandboxSpec(
-            workspace=ws, sock_dir=sock_dir, gpu_index=gpu, opt_kh=opt_kh,
-            ro_binds=[(NCU_SKILL, "/opt/kda/skills/ncu-report-skill")],
-            env={"KH_SOLUTION_FILE": config.runner.solution_file})
-        claude_key = load_env_value(args, args.claude_key_env) if args.claude_key_env else ""
-        if claude_key:
-            # official Anthropic API; one shared client per run so usage totals accumulate over tasks
-            from kda_eval.claude_client import shared_client
-            client = shared_client(args.run_dir, claude_key=claude_key, effort=args.claude_effort)
-            usage_before = client.snapshot()
-        else:
-            api_base, api_key = load_api_config(args)
-            client = OpenAI(base_url=api_base, api_key=api_key, timeout=900.0, max_retries=0)
-            usage_before = None
+        client = make_api_client(args, config.task_id)
+        usage_before = client.snapshot() if hasattr(client, 'snapshot') else None
+        result['api_routing'] = (args.api_provider if args.api_provider == 'anthropic_with_aws_fallback'
+                                 else getattr(client, 'last_provider', args.api_provider))
+        result['reasoning_effort'] = getattr(client, 'effort', args.reasoning_effort)
         loop = AgentLoop(
             client,
             args.model, spec, task_out, judge_sock, deadline,
             max_completion_tokens=args.max_completion_tokens, context_limit=args.context_limit,
             max_llm_calls=args.max_llm_calls, max_total_tokens=args.max_total_tokens,
-            reasoning_effort=args.reasoning_effort)
-        result["session"] = loop.run(prompt)
+            reasoning_effort=result['reasoning_effort'])
+        result["session"] = loop.run(prompt,initial_messages=initial_messages,
+            initial_stats=resume['stats'] if resume else None,
+            elapsed_s=resume['judge_state']['elapsed_s'] if resume else 0)
+        if resume:result['resumed_from']=resume['checkpoint_directory']
         if usage_before is not None:
             after = client.snapshot()
             result["session"]["claude_usage"] = {k: round(after[k] - usage_before[k], 4) for k in after}
@@ -338,6 +433,8 @@ def run_one(config, gpu: int, args, ea) -> dict:
         result["error"] = f"{type(e).__name__}: {e}"
     finally:
         _stop(judge)
+        if spec is not None:
+            sbx.cleanup_sandbox(spec)
         shutil.rmtree(sock_dir, ignore_errors=True)
 
     state_path = os.path.join(task_out, "judge_state.json")
@@ -393,12 +490,18 @@ def _worker(gpu: int, task_ids: "mp.Queue", args) -> None:
         except Exception as e:
             res = {"task_id": tid, "final_status": "ERROR", "best_speedup": 0.0,
                    "error": f"{type(e).__name__}: {e}"}
+            task_out=os.path.join(args.run_dir,tid.replace("/","_"))
+            os.makedirs(task_out,exist_ok=True)
+            with open(os.path.join(task_out,"result.json"),"w") as output:
+                json.dump(res,output,indent=2)
         sess = res.get("session", {})
         print(f"[gpu{gpu}] DONE  {tid}: {res['final_status']} {res.get('best_speedup', 0):.3f}x "
               f"evals={res.get('evals_used', '?')} llm_calls={sess.get('llm_calls', '?')} "
               f"tokens={sess.get('prompt_tokens', 0) + sess.get('completion_tokens', 0):,} "
               f"wall={(time.time() - t0) / 60:.1f}min end={sess.get('end_reason', '')} "
               f"{res.get('error', '')}", flush=True)
+        selected=[configs[task_id] for task_id in args.selected_task_ids]
+        summarize(args.run_dir,selected)
 
 
 def audit(run_dir: str, tasks: list) -> dict:
@@ -435,6 +538,8 @@ def audit(run_dir: str, tasks: list) -> dict:
 
 def summarize(run_dir: str, tasks: list) -> dict:
     flags = audit(run_dir, tasks)
+    infrastructure_path=Path(run_dir)/'infrastructure_errors.json'
+    infrastructure=json.loads(infrastructure_path.read_text()) if infrastructure_path.exists() else {}
     rows = []
     for t in tasks:
         tid = t.task_id
@@ -442,6 +547,11 @@ def summarize(run_dir: str, tasks: list) -> dict:
         r = (json.load(open(p)) if os.path.isfile(p)
              else {"task_id": tid, "final_status": "MISSING", "best_speedup": 0.0})
         r["hack"] = tid in flags
+        if tid in infrastructure and r['final_status']!='MISSING':
+            # Reporting annotation only: keep the original result and budgets.
+            r['recorded_final_status']=r['final_status']
+            r['final_status']='ERROR'
+            r['infrastructure_error']=infrastructure[tid]
         rows.append(r)
     n = len(rows)
     raw_pass = [r for r in rows if r["final_status"] == "PASS"]
@@ -450,6 +560,9 @@ def summarize(run_dir: str, tasks: list) -> dict:
     sess = [r.get("session") or {} for r in rows]
     summary = {
         "num_tasks": n,
+        "num_completed": sum(r["final_status"] != "MISSING" for r in rows),
+        "num_error": sum(r["final_status"] == "ERROR" for r in rows),
+        "num_infrastructure_error": sum(bool(r.get('infrastructure_error')) for r in rows),
         "num_pass": len(passed),
         "pass_rate": len(passed) / n if n else 0.0,
         # Arithmetic mean over all tasks, failures count as 0.
@@ -462,11 +575,16 @@ def summarize(run_dir: str, tasks: list) -> dict:
         "completion_tokens": sum(s.get("completion_tokens", 0) for s in sess),
         "tasks": [dict({k: r.get(k) for k in ("task_id", "final_status", "best_speedup", "evals_used",
                                               "in_loop_best_speedup", "hack")},
+                       **({"infrastructure_error":r['infrastructure_error'],
+                           "recorded_final_status":r['recorded_final_status']} if r.get('infrastructure_error') else {}),
                        **({"hack_reasons": flags[r["task_id"]]} if r["hack"] else {}))
                   for r in rows],
     }
-    with open(os.path.join(run_dir, "summary.json"), "w") as f:
+    summary_path=os.path.join(run_dir,"summary.json")
+    temp_summary=summary_path+f".{os.getpid()}.tmp"
+    with open(temp_summary, "w") as f:
         json.dump(summary, f, indent=2)
+    os.replace(temp_summary,summary_path)
     return summary
 
 
@@ -483,10 +601,17 @@ def main():
     ap.add_argument("--api-base-env", default="OPENAI_BASE_URL")
     ap.add_argument("--api-base", default="", help="Overrides --api-base-env")
     ap.add_argument("--reasoning-effort", default="", help="Passed through as reasoning_effort if set")
-    ap.add_argument("--max-completion-tokens", type=int, default=32000, help="Per LLM call")
+    ap.add_argument('--api-provider',choices=['aws','anthropic_with_aws_fallback'],default='aws')
+    ap.add_argument('--provider-state-file',default=os.path.join(KH_ROOT,'.cache/kda_official_usage.json'),
+                    help='Trusted usage/cost estimate and durable credit-exhaustion fallback latch')
+    ap.add_argument("--max-completion-tokens", type=int, default=65536, help="Per LLM call")
     ap.add_argument("--context-limit", type=int, default=150000,
                     help="Elide old tool outputs once a prompt exceeds this many tokens")
     ap.add_argument("--gpus", required=True, help="Comma-separated nvidia-smi indices, one task per GPU at a time")
+    ap.add_argument("--sandbox-backend", choices=["bwrap", "chroot"], default="bwrap",
+                    help="chroot+unprivileged UID+seccomp fallback when namespaces are unavailable")
+    ap.add_argument("--counter-profiling-unavailable", action="store_true",
+                    help="Record the observed counter permission restriction and notify the agent")
     ap.add_argument("--filter", action="append", default=[])
     ap.add_argument("--task-list", default="")
     ap.add_argument("--max-tasks", type=int, default=0)
@@ -499,19 +624,22 @@ def main():
                     help="Re-run the hack audit and rewrite summary.json without running tasks")
     ap.add_argument("--eval-timeout", type=int, default=900, help="Per-evaluation timeout (s)")
     ap.add_argument("--run-name", default="")
+    ap.add_argument('--resume-from',default='',help='Explicit paused run; preserve workspace, dialogue and budgets in a new run')
     ap.add_argument("--output", default="results")
     args = ap.parse_args()
+    os.environ["KH_SANDBOX_BACKEND"] = args.sandbox_backend
+    os.environ["KH_NCU_COUNTERS_AVAILABLE"] = "0" if args.counter_profiling_unavailable else "1"
 
     gpus = [int(g) for g in args.gpus.split(",") if g.strip()]
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpus[0])
     from cuda_hercules.runner import discover_tasks, get_gpu_sm, parse_filters
-    from cuda_hercules.utils import get_project_root
+    from cuda_hercules.utils import get_project_root, task_source_hash
 
     if not os.path.isfile(os.path.join(NCU_SKILL, "SKILL.md")):
         sys.exit("kda/skills/ncu-report-skill is missing: run `git submodule update --init kda && "
                  "git -C kda submodule update --init skills/ncu-report-skill`")
-    if not args.summarize_only:
+    if not args.summarize_only and not load_official_only_key(args):
         load_api_config(args)  # fail fast
 
     tasks = discover_tasks(get_project_root(), parse_filters(args.filter))
@@ -525,22 +653,52 @@ def main():
         tasks = tasks[:args.max_tasks]
     if not tasks:
         sys.exit("No tasks selected.")
+    if not args.summarize_only and any(t.runner.backend=='class2_defpy' for t in tasks):
+        from cuda_hercules.compiler import ensure_ninja_available
+        args.build_preflight=ensure_ninja_available()  # before clocks, model calls or any evaluation
     if skipped:
         print(f"Skipping {len(skipped)} task(s) with unsupported backends (class3/class4 not wired yet).")
 
     args.run_dir = os.path.abspath(os.path.join(args.output, args.run_name or f"kda_lite_{args.model}"))
+    args.selected_task_ids=[t.task_id for t in tasks]
+    args.task_source_hashes={t.task_id:task_source_hash(os.path.join(KH_ROOT,t.runner.workdir)) for t in tasks}
+    args.resume_tasks={}
+    if args.resume_from:
+        from kda_eval.resume import load_pause_checkpoints
+        args.resume_from=os.path.abspath(args.resume_from)
+        if args.run_dir==os.path.realpath(args.resume_from):
+            sys.exit('Resume into a new run-name to preserve the old benchmark results')
+        args.resume_tasks=load_pause_checkpoints(args.resume_from,args.task_source_hashes,
+            args.model,args.time_limit_min*60,args.max_evals)
     os.makedirs(args.run_dir, exist_ok=True)
     if args.summarize_only:
         _report(summarize(args.run_dir, tasks))
         return
     kda_rev = subprocess.run(["git", "-C", KDA_ROOT, "rev-parse", "HEAD"],
                              capture_output=True, text=True).stdout.strip()
-    with open(os.path.join(args.run_dir, "config.json"), "w") as f:
+    config_path=os.path.join(args.run_dir,"config.json")
+    if os.path.isfile(config_path):
+        previous=json.load(open(config_path))
+        for key in ["model","time_limit_min","max_evals","task_source_hashes","sandbox_backend"]:
+            if key in previous and previous[key]!=getattr(args,key):
+                sys.exit(f"Run configuration changed ({key}); choose a new --run-name")
+    with open(config_path, "w") as f:
         json.dump(dict(vars(args), gpu_sm=gpu_sm, num_tasks=len(tasks), kda_rev=kda_rev,
-                       task_ids=[t.task_id for t in tasks]), f, indent=2)
+                       benchmark_git_revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=KH_ROOT,text=True).strip(),
+                       controller_source_hash=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                       task_ids=[t.task_id for t in tasks],
+                       sandbox_sources_hash=hashlib.sha256(b"".join(p.read_bytes() for p in sorted(Path(HERE,'kda_eval').glob('*')) if p.suffix in ['.py','.c'])).hexdigest(),
+                       final_revalidation="independent scoring audit, outside agent time/evaluation budget"), f, indent=2)
 
+    for task in tasks:
+        completed=Path(args.run_dir,task.task_id.replace('/','_'),'result.json')
+        if completed.exists():
+            record=json.loads(completed.read_text())
+            if record.get('source_hash')!=args.task_source_hashes[task.task_id]:
+                sys.exit(f'Completed result has a stale benchmark fingerprint: {task.task_id}')
     todo = [t.task_id for t in tasks
             if not os.path.isfile(os.path.join(args.run_dir, t.task_id.replace("/", "_"), "result.json"))]
+    summarize(args.run_dir,tasks)
     print(f"KDA-lite (API) on CUDA-Hercules: {len(tasks)} tasks ({len(tasks) - len(todo)} already done), "
           f"model={args.model}, GPUs={gpus}, budget={args.time_limit_min:.0f}min/{args.max_evals} evals, "
           f"out={args.run_dir}", flush=True)

@@ -1078,15 +1078,23 @@ def _run_task_isolated(
     )
 
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [sys.executable, "-c", script],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_sec,
             cwd=project_root,
             env=os.environ.copy(),
+            start_new_session=True,
         )
+        stdout,stderr=proc.communicate(timeout=timeout_sec)
     except subprocess.TimeoutExpired:
+        # Compilation/test grandchildren must not survive a task's deadline.
+        try:
+            os.killpg(proc.pid,signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
         return TaskResult(
             task_id=config.task_id,
             status=TaskStatus.ERROR,
@@ -1095,7 +1103,7 @@ def _run_task_isolated(
             level=config.task_class,
         )
 
-    for line in reversed((proc.stdout or "").splitlines()):
+    for line in reversed((stdout or "").splitlines()):
         if line.startswith("__RESULT_JSON__"):
             try:
                 payload = json.loads(line[len("__RESULT_JSON__"):])
@@ -1122,7 +1130,7 @@ def _run_task_isolated(
                 level=config.task_class,
             )
 
-    err_tail = (proc.stderr or "")[-800:]
+    err_tail = (stderr or "")[-800:]
     return TaskResult(
         task_id=config.task_id,
         status=TaskStatus.ERROR,

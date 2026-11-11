@@ -60,7 +60,7 @@ def _sanitize(text: str, sol_path: str = "", source_path: str = "") -> str:
 
 class Judge:
     def __init__(self, config, run_dir: str, max_evals: int, time_limit_s: float,
-                 eval_timeout_s: int, target_speedup: float):
+                 eval_timeout_s: int, target_speedup: float, resume_state: dict | None = None):
         self.config = config
         self.run_dir = run_dir
         self.max_evals = max_evals
@@ -74,6 +74,16 @@ class Judge:
         self.has_pass = False
         self.best_index = -1
         self.best_speedup = 0.0
+        if resume_state is not None:
+            elapsed=float(resume_state['elapsed_s'])
+            used=int(resume_state['evals_used'])
+            if not 0<=elapsed<=time_limit_s or not 0<=used<=max_evals:
+                raise ValueError('Checkpoint exceeds the original task budget')
+            self.t0-=elapsed
+            self.evals_used=used
+            self.has_pass=bool(resume_state.get('has_pass',False))
+            self.best_index=int(resume_state.get('best_submission',-1))
+            self.best_speedup=float(resume_state.get('best_speedup',0))
         self.sub_root = os.path.join(run_dir, "submissions")
         os.makedirs(self.sub_root, exist_ok=True)
         self.log_path = os.path.join(run_dir, "submissions.jsonl")
@@ -89,6 +99,7 @@ class Judge:
         return {
             "elapsed_s": round(self.elapsed(), 1),
             "limit_s": self.time_limit_s,
+            "deadline_epoch": self.t0 + self.time_limit_s,
             "evals_used": self.evals_used,
             "evals_limit": self.max_evals,
             "has_pass": self.has_pass,
@@ -107,8 +118,10 @@ class Judge:
                 f"target {self.target_speedup:.2f}x vs reference.")
 
     def _write_state(self) -> None:
-        with open(self.state_path, "w") as f:
+        temporary=self.state_path+".tmp"
+        with open(temporary, "w") as f:
             json.dump(self.budget(), f, indent=2)
+        os.replace(temporary,self.state_path)
 
     # -- ops --------------------------------------------------------------
     def status(self) -> dict:
@@ -124,6 +137,8 @@ class Judge:
                         "text": "REJECTED: evaluation budget exhausted. " + self._summary_line()}
             self.evals_used += 1
             idx = self.evals_used
+            # A pause or crash during compilation still consumes this call.
+            self._write_state()
             resp = self._evaluate(idx, mode, content, source_path)
             self._write_state()
             resp["text"] += "\n\n" + self._summary_line()
@@ -153,7 +168,8 @@ class Judge:
             self._log(rec, t_eval)
             return {"status": "BLOCKED", "text": text}
 
-        tr = ea._run_task_isolated(cfg, sol_path, timeout_sec=self.eval_timeout_s,
+        timeout = min(self.eval_timeout_s, max(0.1,self.time_limit_s-self.elapsed()))
+        tr = ea._run_task_isolated(cfg, sol_path, timeout_sec=timeout,
                                    measure_perf=(mode == "full"))
         status = tr.status.value if tr.status else "ERROR"
         rec.update(status=status, compiled=tr.compiled, correct=tr.correct,
@@ -228,10 +244,12 @@ def main():
     ap.add_argument("--time-limit", type=float, required=True, help="seconds")
     ap.add_argument("--eval-timeout", type=int, default=900)
     ap.add_argument("--target-speedup", type=float, default=1.0)
+    ap.add_argument("--resume-state", help="Trusted host checkpoint preserving elapsed time/evaluations")
     args = ap.parse_args()
 
     judge = Judge(load_task(args.task_id), args.run_dir, args.max_evals,
-                  args.time_limit, args.eval_timeout, args.target_speedup)
+                  args.time_limit, args.eval_timeout, args.target_speedup,
+                  json.load(open(args.resume_state)) if args.resume_state else None)
     if os.path.exists(args.socket):
         os.unlink(args.socket)
     server = _Server(args.socket, _Handler)
