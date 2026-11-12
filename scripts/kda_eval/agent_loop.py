@@ -289,7 +289,7 @@ class AgentLoop:
                 self.stats["completion_tokens"] += usage.get("completion_tokens") or 0
                 self._log(type="response", finish_reason=choice.finish_reason, usage=usage,
                           max_completion_tokens=self.max_completion_tokens,
-                          provider=getattr(self.client,'last_provider','aws'),
+                          provider=getattr(self.client,'last_provider','openai_compat'),
                           reasoning_effort=self.reasoning_effort,
                           message=msg.model_dump(exclude_none=True))
 

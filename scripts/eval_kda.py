@@ -92,7 +92,7 @@ def load_api_config(args) -> tuple[str, str]:
 
 def load_official_only_key(args) -> str:
     """Retain the official-only CLI while preferring an explicit fallback route."""
-    if args.api_provider == 'anthropic_with_aws_fallback':
+    if args.api_provider == 'anthropic_with_openai_fallback':
         return ''
     return load_env_value(args, args.claude_key_env) if args.claude_key_env else ''
 
@@ -108,7 +108,7 @@ def make_api_client(args, task_id: str):
         return client
     api_base, api_key = load_api_config(args)
     client = OpenAI(base_url=api_base, api_key=api_key, timeout=900, max_retries=0)
-    if args.api_provider == 'anthropic_with_aws_fallback':
+    if args.api_provider == 'anthropic_with_openai_fallback':
         from kda_eval.providers import OfficialClaudeWithFallback
         client = OfficialClaudeWithFallback(
             client, args.env_file, args.provider_state_file, model=args.model,
@@ -377,7 +377,7 @@ def run_one(config, gpu: int, args, ea) -> dict:
     result = {
         "task_id": config.task_id, "task_class": config.task_class, "domain": config.domain,
         "model": args.model, "agent": "kda-lite-api", "gpu": gpu,
-        "api_routing":getattr(args,'api_provider','aws'),
+        "api_routing":getattr(args,'api_provider','openai_compat'),
         "reasoning_effort":args.reasoning_effort,
         "source_hash":fingerprint,
         "final_status": "FAIL", "best_speedup": 0.0, "best_solution_file": "",
@@ -410,7 +410,7 @@ def run_one(config, gpu: int, args, ea) -> dict:
 
         client = make_api_client(args, config.task_id)
         usage_before = client.snapshot() if hasattr(client, 'snapshot') else None
-        result['api_routing'] = (args.api_provider if args.api_provider == 'anthropic_with_aws_fallback'
+        result['api_routing'] = (args.api_provider if args.api_provider == 'anthropic_with_openai_fallback'
                                  else getattr(client, 'last_provider', args.api_provider))
         result['reasoning_effort'] = getattr(client, 'effort', args.reasoning_effort)
         loop = AgentLoop(
@@ -601,7 +601,7 @@ def main():
     ap.add_argument("--api-base-env", default="OPENAI_BASE_URL")
     ap.add_argument("--api-base", default="", help="Overrides --api-base-env")
     ap.add_argument("--reasoning-effort", default="", help="Passed through as reasoning_effort if set")
-    ap.add_argument('--api-provider',choices=['aws','anthropic_with_aws_fallback'],default='aws')
+    ap.add_argument('--api-provider',choices=['openai_compat','anthropic_with_openai_fallback'],default='openai_compat')
     ap.add_argument('--provider-state-file',default=os.path.join(KH_ROOT,'.cache/kda_official_usage.json'),
                     help='Trusted usage/cost estimate and durable credit-exhaustion fallback latch')
     ap.add_argument("--max-completion-tokens", type=int, default=65536, help="Per LLM call")

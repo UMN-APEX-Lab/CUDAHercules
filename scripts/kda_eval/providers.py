@@ -1,4 +1,4 @@
-"""Native Claude Messages API with durable credit-exhaustion fallback to AWS.
+"""Native Claude Messages API with durable credit-exhaustion fallback to an OpenAI-compatible endpoint.
 
 Only the trusted controller imports this module. Credentials never enter model
 history, usage files, or sandbox environments. Normal API keys cannot read the
@@ -34,7 +34,7 @@ def credit_exhausted(error):
 
 
 def native_messages(messages):
-    """Convert legacy AWS history while echoing native signed blocks verbatim."""
+    """Convert history from the OpenAI-compatible endpoint while echoing native signed blocks verbatim."""
     system=[];result=[]
     for message in messages:
         role=message['role'];content=message.get('content') or ''
@@ -55,7 +55,7 @@ def native_messages(messages):
     return '\n\n'.join(system),result
 
 
-def aws_messages(messages):
+def compat_messages(messages):
     allowed={'role','content','tool_calls','tool_call_id','name'}
     return [{k:copy.deepcopy(v) for k,v in m.items() if k in allowed} for m in messages]
 
@@ -74,8 +74,8 @@ def official_cost(usage):
 
 
 class OfficialClaudeWithFallback:
-    def __init__(self,aws_client,env_file,state_file,*,model='claude-opus-5',effort='low',task_id='',official_client=None,key_env='CLAUDE_API_KEY'):
-        self.aws=aws_client;self.env_file=Path(env_file).expanduser();self.state_file=Path(state_file)
+    def __init__(self,compat_client,env_file,state_file,*,model='claude-opus-5',effort='low',task_id='',official_client=None,key_env='CLAUDE_API_KEY'):
+        self.compat=compat_client;self.env_file=Path(env_file).expanduser();self.state_file=Path(state_file)
         self.key_env=key_env
         self.model=model;self.effort=effort;self.task_id=task_id
         self.client=official_client;self.client_key_id=None
@@ -118,18 +118,18 @@ class OfficialClaudeWithFallback:
 
     def _fallback(self,key_id,reason):
         def update(state):
-            state.update(official_disabled=True,active_provider='aws',fallback_reason=reason,
+            state.update(official_disabled=True,active_provider='openai_compat',fallback_reason=reason,
                 fallback_at_utc=datetime.datetime.now(datetime.timezone.utc).isoformat())
         self._state(key_id,update)
-        self._event(dict(type='provider_fallback',provider='aws',reason=reason))
+        self._event(dict(type='provider_fallback',provider='openai_compat',reason=reason))
 
-    def _aws(self,kwargs,timeout):
-        self.last_provider='aws'
-        kwargs=dict(kwargs,messages=aws_messages(kwargs['messages']))
-        response=self.aws.chat.completions.create(**kwargs,timeout=timeout)
+    def _compat(self,kwargs,timeout):
+        self.last_provider='openai_compat'
+        kwargs=dict(kwargs,messages=compat_messages(kwargs['messages']))
+        response=self.compat.chat.completions.create(**kwargs,timeout=timeout)
         # Do not modify the SDK response type; AgentLoop reads this router field.
         usage=response.usage.model_dump() if response.usage else {}
-        self._event(dict(type='usage',provider='aws',model=kwargs['model'],effort=kwargs.get('reasoning_effort'),usage=usage))
+        self._event(dict(type='usage',provider='openai_compat',model=kwargs['model'],effort=kwargs.get('reasoning_effort'),usage=usage))
         return response
 
     def create(self,*,timeout=900,**kwargs):
@@ -142,7 +142,7 @@ class OfficialClaudeWithFallback:
         state=self._state(key_id)
         if not key or state.get('official_disabled'):
             if not key:self._fallback(key_id,'missing_official_key')
-            return self._aws(kwargs,max(.1,deadline-time.monotonic()))
+            return self._compat(kwargs,max(.1,deadline-time.monotonic()))
         self.last_provider='anthropic'
         if self.client is None or (self.client_key_id is not None and self.client_key_id!=key_id):
             self.client=anthropic.Anthropic(api_key=key,max_retries=0,timeout=min(120,timeout))
@@ -186,7 +186,7 @@ class OfficialClaudeWithFallback:
             if credit_exhausted(error) or status in [401,403]:
                 reason='official_credit_or_spend_limit_exhausted' if credit_exhausted(error) else 'official_auth_or_permission_error'
                 self._fallback(key_id,reason)
-                return self._aws(kwargs,max(.1,deadline-time.monotonic()))
+                return self._compat(kwargs,max(.1,deadline-time.monotonic()))
             text=str(error).replace(key,'[REDACTED]')
             self._event(dict(type='api_error',provider='anthropic',status=status,error=text[:1000]))
             kind=RateLimitError if status==429 else InternalServerError if status>=500 else BadRequestError
@@ -204,7 +204,7 @@ class OfficialClaudeWithFallback:
             # Streaming errors may arrive inside HTTP 200 and have no status.
             if credit_exhausted(error):
                 self._fallback(key_id,'official_credit_or_spend_limit_exhausted')
-                return self._aws(kwargs,max(.1,deadline-time.monotonic()))
+                return self._compat(kwargs,max(.1,deadline-time.monotonic()))
             import httpx2
             text=str(error).replace(key,'[REDACTED]')
             self._event(dict(type='api_error',provider='anthropic',error=text[:1000]))

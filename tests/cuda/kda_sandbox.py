@@ -41,7 +41,7 @@ test ! -e /root/.env
 python3 - <<'PYTHON'
 import os,socket,numpy,ncu_report
 assert os.geteuid()!=0
-assert not any(name in os.environ for name in ['AWS_OPENAI_API_KEY','OPENAI_API_KEY'])
+assert not any(name in os.environ for name in ['OPENAI_API_KEY','CLAUDE_API_KEY'])
 for family in [socket.AF_INET,socket.AF_INET6]:
     try:socket.socket(family,socket.SOCK_STREAM)
     except PermissionError:pass

@@ -11,7 +11,7 @@ anthropic=pytest.importorskip('anthropic')
 httpx2=pytest.importorskip('httpx2')
 
 sys.path.insert(0,str(Path(__file__).parents[1]/'scripts'))
-from kda_eval.providers import OfficialClaudeWithFallback,native_messages,aws_messages,credit_exhausted,official_cost
+from kda_eval.providers import OfficialClaudeWithFallback,native_messages,compat_messages,credit_exhausted,official_cost
 
 
 def error(status,message):
@@ -32,7 +32,7 @@ class Stream:
 
 def clients(tmp_path,failure=None):
     env=tmp_path/'.env';env.write_text('CLAUDE_API_KEY=private-test-value\n')
-    calls=[];aws_calls=[]
+    calls=[];compat_calls=[]
     blocks=[{'type':'thinking','thinking':'','signature':'unchanged-signature'},
             {'type':'tool_use','id':'tool_1','name':'bash','input':{'command':'true'}}]
     response=SimpleNamespace(content=[SimpleNamespace(model_dump=lambda exclude_none=True,b=b:copy.deepcopy(b)) for b in blocks],
@@ -41,11 +41,11 @@ def clients(tmp_path,failure=None):
     def stream(**kwargs):calls.append(kwargs);return Stream(response,failure)
     official=SimpleNamespace(messages=SimpleNamespace(stream=stream))
     def complete(**kwargs):
-        aws_calls.append(kwargs)
+        compat_calls.append(kwargs)
         return SimpleNamespace(usage=SimpleNamespace(model_dump=lambda:dict(prompt_tokens=1,completion_tokens=1)))
-    aws=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=complete)))
-    router=OfficialClaudeWithFallback(aws,env,tmp_path/'usage.json',official_client=official)
-    return router,calls,aws_calls,blocks,official,aws,env
+    compat=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=complete)))
+    router=OfficialClaudeWithFallback(compat,env,tmp_path/'usage.json',official_client=official)
+    return router,calls,compat_calls,blocks,official,compat,env
 
 
 def request(router,messages=None):
@@ -55,9 +55,9 @@ def request(router,messages=None):
 
 
 def test_native_low_effort_cap_caching_usage_and_signed_history(tmp_path):
-    router,calls,aws_calls,blocks,*_=clients(tmp_path)
+    router,calls,compat_calls,blocks,*_=clients(tmp_path)
     response=request(router)
-    assert not aws_calls
+    assert not compat_calls
     assert calls[0]['max_tokens']==65536
     assert calls[0]['output_config']=={'effort':'low'}
     assert calls[0]['thinking']=={'type':'adaptive'}
@@ -79,54 +79,54 @@ def test_native_low_effort_cap_caching_usage_and_signed_history(tmp_path):
     assert 'private-test-value' not in (tmp_path/'usage.jsonl').read_text()
 
 
-def test_credit_exhaustion_retries_same_conversation_on_aws_and_latches_between_tasks(tmp_path):
-    router,calls,aws_calls,blocks,official,aws,env=clients(tmp_path,error(400,'Your credit balance is too low'))
+def test_credit_exhaustion_retries_same_conversation_on_fallback_and_latches_between_tasks(tmp_path):
+    router,calls,compat_calls,blocks,official,compat,env=clients(tmp_path,error(400,'Your credit balance is too low'))
     history=[{'role':'user','content':'task'},{'role':'assistant','content':'x','_anthropic_content':blocks}]
     request(router,history)
-    assert len(calls)==1 and len(aws_calls)==1
-    assert aws_calls[0]['messages']==aws_messages(history)
-    assert aws_calls[0]['max_completion_tokens']==65536
-    assert router.last_provider=='aws'
-    another=OfficialClaudeWithFallback(aws,env,tmp_path/'usage.json',official_client=official)
+    assert len(calls)==1 and len(compat_calls)==1
+    assert compat_calls[0]['messages']==compat_messages(history)
+    assert compat_calls[0]['max_completion_tokens']==65536
+    assert router.last_provider=='openai_compat'
+    another=OfficialClaudeWithFallback(compat,env,tmp_path/'usage.json',official_client=official)
     request(another)
-    assert len(calls)==1 and len(aws_calls)==2
+    assert len(calls)==1 and len(compat_calls)==2
     state=json.loads((tmp_path/'usage.json').read_text())
-    assert state['official_disabled'] and state['active_provider']=='aws'
+    assert state['official_disabled'] and state['active_provider']=='openai_compat'
 
 
 def test_normal_rate_limit_does_not_mark_credit_exhausted(tmp_path):
     from openai import RateLimitError
-    router,calls,aws_calls,*_=clients(tmp_path,error(429,'Input tokens per minute rate limit exceeded'))
+    router,calls,compat_calls,*_=clients(tmp_path,error(429,'Input tokens per minute rate limit exceeded'))
     with pytest.raises(RateLimitError):request(router)
-    assert not aws_calls
+    assert not compat_calls
     assert not json.loads((tmp_path/'usage.json').read_text())['official_disabled']
 
 
 def test_invalid_request_is_not_disguised_as_billing_failure(tmp_path):
     from openai import BadRequestError
-    router,_,aws_calls,*_=clients(tmp_path,error(400,'messages: invalid tool result'))
+    router,_,compat_calls,*_=clients(tmp_path,error(400,'messages: invalid tool result'))
     with pytest.raises(BadRequestError):request(router)
-    assert not aws_calls
+    assert not compat_calls
 
 
 def test_credit_error_inside_http200_stream_also_switches(tmp_path):
     failure=anthropic.APIError('credit balance too low',
         request=httpx2.Request('POST','https://api.anthropic.com/v1/messages'),
         body={'error':{'type':'billing_error'}})
-    router,_,aws_calls,*_=clients(tmp_path,failure)
+    router,_,compat_calls,*_=clients(tmp_path,failure)
     request(router)
-    assert len(aws_calls)==1 and router.last_provider=='aws'
+    assert len(compat_calls)==1 and router.last_provider=='openai_compat'
 
 
 def test_new_official_key_clears_credit_latch(tmp_path):
-    router,calls,aws_calls,_,official,aws,env=clients(tmp_path,error(402,'billing error'))
+    router,calls,compat_calls,_,official,compat,env=clients(tmp_path,error(402,'billing error'))
     request(router)
     env.write_text('CLAUDE_API_KEY=replacement-private-value\n')
     # The second client must attempt official again, even though the same usage
     # state previously disabled the old key. Its fake error can fall back again.
-    replacement=OfficialClaudeWithFallback(aws,env,tmp_path/'usage.json',official_client=official)
+    replacement=OfficialClaudeWithFallback(compat,env,tmp_path/'usage.json',official_client=official)
     request(replacement)
-    assert len(calls)==2 and len(aws_calls)==2
+    assert len(calls)==2 and len(compat_calls)==2
 
 
 @pytest.mark.parametrize('status,text,expected',[(402,'payment issue',True),
@@ -149,9 +149,9 @@ def test_legacy_tool_results_are_merged_and_input_history_not_modified():
 
 
 @pytest.mark.parametrize('route,official_key_name,expected',[
-    ('aws','','openai'),
-    ('aws','CUSTOM_CLAUDE_KEY','official_only'),
-    ('anthropic_with_aws_fallback','CUSTOM_CLAUDE_KEY','fallback'),
+    ('openai_compat','','openai'),
+    ('openai_compat','CUSTOM_CLAUDE_KEY','official_only'),
+    ('anthropic_with_openai_fallback','CUSTOM_CLAUDE_KEY','fallback'),
 ])
 def test_merged_cli_preserves_all_provider_modes(tmp_path,monkeypatch,route,official_key_name,expected):
     import eval_kda
@@ -168,8 +168,8 @@ def test_merged_cli_preserves_all_provider_modes(tmp_path,monkeypatch,route,offi
         claude_effort='low',reasoning_effort='',env_file=str(env),api_key_env='OPENAI_API_KEY',
         api_base_env='OPENAI_BASE_URL',api_base='',run_dir=str(tmp_path),
         provider_state_file=str(tmp_path/'usage.json'),model='claude-opus-5')
-    aws=SimpleNamespace();official=SimpleNamespace(effort='low');calls=[]
-    def compatible_client(**kwargs):calls.append(kwargs);return aws
+    compat=SimpleNamespace();official=SimpleNamespace(effort='low');calls=[]
+    def compatible_client(**kwargs):calls.append(kwargs);return compat
     monkeypatch.setattr(openai,'OpenAI',compatible_client)
     monkeypatch.setattr(claude_client,'shared_client',lambda *a,**kw:official)
     client=eval_kda.make_api_client(args,'class2/hopper/test')
@@ -182,7 +182,7 @@ def test_merged_cli_preserves_all_provider_modes(tmp_path,monkeypatch,route,offi
         assert eval_kda.load_official_only_key(args)==''
         if expected=='fallback':
             assert isinstance(client,OfficialClaudeWithFallback)
-            assert client.aws is aws and client.key_env=='CUSTOM_CLAUDE_KEY'
+            assert client.compat is compat and client.key_env=='CUSTOM_CLAUDE_KEY'
             assert client.effort=='low'
         else:
-            assert client is aws
+            assert client is compat
