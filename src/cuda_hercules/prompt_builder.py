@@ -16,12 +16,6 @@ PYTORCH_EXTENSION_TASKS = {
     "class3/tcgnn_gcn/general",
 }
 
-PROMPT_DISABLE_TEMPLATE_TASKS = {
-    "class3/exachem_ccsd_t/general",
-    "class3/exachem_ccsd_t/hopper",
-    "class3/exachem_ccsd_t/blackwell",
-}
-
 PROMPT_CONTEXT_FILES = {
     "class3/mgg_agnn/general": ["wrapper.cpp", "run.py"],
     "class3/mgg_agnn/hopper": ["wrapper.cpp", "run.py"],
@@ -107,7 +101,7 @@ def build_prompt(task_dir: str, task_config=None, description_dir: str = None) -
     Appends solution requirements and output format instructions.
 
     Args:
-        task_dir: Path to the task directory (for solution templates, etc.).
+        task_dir: Path to the task directory (for context files).
         task_config: Optional TaskConfig for additional context.
         description_dir: Optional override directory for description.txt.
             Used when description.txt lives in an arch subdirectory
@@ -139,18 +133,6 @@ def build_prompt(task_dir: str, task_config=None, description_dir: str = None) -
                 solution_info = f"\nYou are optimizing these files: {files}"
         elif task_config.runner.solution_file:
             solution_info = f"\nYou are writing: {task_config.runner.solution_file}"
-
-    # Read solution template if it exists
-    template = ""
-    if task_id not in PROMPT_DISABLE_TEMPLATE_TASKS:
-        for candidate in ["solution.cu", "solution.h"]:
-            tpl_path = os.path.join(task_dir, candidate)
-            if os.path.isfile(tpl_path):
-                with open(tpl_path) as f:
-                    content = f.read().strip()
-                if len(content) > 50:  # non-trivial template
-                    template = f"\n\n## Solution Template\n\nFill in this template:\n```cuda\n{content}\n```"
-                break
 
     context_sections = []
     for relpath in PROMPT_CONTEXT_FILES.get(task_id, []):
@@ -212,7 +194,6 @@ def build_prompt(task_dir: str, task_config=None, description_dir: str = None) -
     parts = [
         description,
         solution_info,
-        template,
         "".join(context_sections),
         "",
         "## Requirements",

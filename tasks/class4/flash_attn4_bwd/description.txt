@@ -25,6 +25,15 @@ std::vector<torch::Tensor> flash_attn4_bwd(
 
 Return `{dQ, dK, dV}` with shapes matching Q, K, and V.
 
+`solution.cu` is compiled as a PyTorch C++/CUDA extension (`TORCH_EXTENSION_NAME`) and must
+also export the function with pybind11 under the same name:
+
+```c++
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("flash_attn4_bwd", &flash_attn4_bwd, "FlashAttention-4 Backward (CUDA)");
+}
+```
+
 ## Required Algorithmic Work
 
 - Recompute attention scores from Q and K tiles without materializing the full

@@ -42,19 +42,22 @@ Five distinct warp roles execute concurrently:
 
 ## Function Signature
 
-```c
-extern "C" void flash_attn4_fwd(
-    const __nv_bfloat16* Q,   // [batch, seqlen_q, num_heads, head_dim]
-    const __nv_bfloat16* K,   // [batch, seqlen_k, num_heads_k, head_dim]
-    const __nv_bfloat16* V,   // [batch, seqlen_k, num_heads_k, head_dim]
-    __nv_bfloat16* O,         // [batch, seqlen_q, num_heads, head_dim]
-    float* LSE,               // [batch, num_heads, seqlen_q] (log-sum-exp)
-    int batch, int seqlen_q, int seqlen_k,
-    int num_heads, int num_heads_k, int head_dim,
-    float softmax_scale,
-    bool is_causal,
-    cudaStream_t stream
-);
+`solution.cu` is compiled as a PyTorch C++/CUDA extension (`TORCH_EXTENSION_NAME`) and must
+define the following function and export it with pybind11 under the same name:
+
+```c++
+#include <torch/extension.h>
+
+torch::Tensor flash_attn4_fwd(
+    torch::Tensor Q,    // [batch, seqlen_q, num_heads, head_dim] BF16
+    torch::Tensor K,    // [batch, seqlen_k, num_heads_k, head_dim] BF16
+    torch::Tensor V,    // [batch, seqlen_k, num_heads_k, head_dim] BF16
+    bool is_causal
+);   // returns O with the shape and dtype of Q
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("flash_attn4_fwd", &flash_attn4_fwd, "FlashAttention-4 Forward (CUDA)");
+}
 ```
 
 ## Supported Configurations

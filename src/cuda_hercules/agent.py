@@ -6,7 +6,7 @@ Iteratively generates, compiles, tests, and fixes CUDA solutions using tool call
 Tools:
   - read_task_description: Read the full task prompt
   - list_task_files: List files in task directory
-  - read_file: Read a specific file (reference code, template, etc.)
+  - read_file: Read a specific file (harness code, headers, etc.)
   - write_solution: Write CUDA code to the solution file
   - compile_and_test: Compile + run tests, return results/errors
 
@@ -43,6 +43,26 @@ _state = {}
 # Tools
 # ═══════════════════════════════════════════════════════════════════════
 
+def _hidden_solution_paths(task_dir: str, config) -> set:
+    """Task-relative paths of naive solution files that must never reach the model."""
+    hidden = {"solution.cu", "solution.h"}
+    if config is not None and config.runner.backend != "class3_app":
+        names = list(config.runner.solution_files or [])
+        if config.runner.solution_file:
+            names.append(config.runner.solution_file)
+        hidden.update(os.path.normpath(n) for n in names)
+    return hidden
+
+
+def _is_hidden(task_dir: str, rel: str) -> bool:
+    rel = os.path.normpath(rel)
+    hidden = _hidden_solution_paths(task_dir, _state.get("config"))
+    real = os.path.realpath(os.path.join(task_dir, rel))
+    if rel in hidden or any(rel.startswith(h.rstrip("/") + os.sep) for h in hidden if h.endswith("/")):
+        return True
+    return any(os.path.realpath(os.path.join(task_dir, h)) == real for h in hidden)
+
+
 @tool
 def read_task_description() -> str:
     """Read the full task description including function signature and requirements.
@@ -54,13 +74,15 @@ def read_task_description() -> str:
 
 @tool
 def list_task_files() -> str:
-    """List all files in the task directory. Useful to find reference code, templates, or headers."""
+    """List all files in the task directory. Useful to find harness code or headers."""
     task_dir = _state["task_dir"]
     files = []
     for root, dirs, filenames in os.walk(task_dir):
         dirs[:] = [d for d in dirs if d not in ('build', 'cmake-build-release', '__pycache__', 'data', 'ref_data')]
         for f in filenames:
             rel = os.path.relpath(os.path.join(root, f), task_dir)
+            if _is_hidden(task_dir, rel):
+                continue
             size = os.path.getsize(os.path.join(root, f))
             files.append(f"{rel} ({size} bytes)")
     return "\n".join(sorted(files))
@@ -68,10 +90,12 @@ def list_task_files() -> str:
 
 @tool
 def read_file(filename: str) -> str:
-    """Read a file from the task directory. Use to examine reference code, solution templates, harness code, or headers.
-    Examples: 'description.txt', 'solution.h', 'solution.cu', 'def.py', 'Makefile', 'harness.impl'"""
+    """Read a file from the task directory. Use to examine harness code or headers.
+    Examples: 'description.txt', 'def.py', 'Makefile', 'harness.impl'"""
     task_dir = _state["task_dir"]
     path = os.path.join(task_dir, filename)
+    if _is_hidden(task_dir, filename):
+        return f"Error: file '{filename}' not found in task directory"
     if not os.path.isfile(path):
         return f"Error: file '{filename}' not found in task directory"
     with open(path) as f:
@@ -267,7 +291,7 @@ SYSTEM_PROMPT = """You are an expert CUDA kernel programmer. Your job is to writ
 
 Workflow:
 1. Call read_task_description() to understand the task
-2. Optionally call list_task_files() and read_file() to examine reference code or templates
+2. Optionally call list_task_files() and read_file() to examine harness code or headers
 3. Call write_solution() with your complete CUDA implementation
 4. Call compile_and_test() to check compilation and correctness
 5. If there are errors, analyze them carefully, fix your code, then write_solution() and compile_and_test() again

@@ -243,11 +243,6 @@ def make_workspace(config, ws: str, task_md: str) -> None:
         os.makedirs(os.path.join(ws, d), exist_ok=True)
     with open(os.path.join(ws, "TASK.md"), "w") as f:
         f.write(task_md)
-    if config.runner.backend == "class1_make":
-        # The naive solution.h is already shown in the prompt's template block.
-        src = os.path.join(KH_ROOT, config.runner.workdir, config.runner.solution_file)
-        if os.path.isfile(src):
-            shutil.copy2(src, os.path.join(ws, config.runner.solution_file))
 
 
 # ---------------------------------------------------------------------------

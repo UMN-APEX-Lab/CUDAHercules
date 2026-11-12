@@ -496,7 +496,8 @@ def _profile_state_init(config: TaskConfig) -> dict:
             task_dir,
             os.path.join(tmp_dir, "task"),
             dirs_exist_ok=True,
-            ignore=shutil.ignore_patterns("ref", "test", "*.o"),
+            ignore=shutil.ignore_patterns("ref", "test", "*.o", "solution.h", "solution.cu",
+                                          os.path.basename(config.runner.solution_file or "solution.h")),
         )
         sol_file = config.runner.solution_file or "solution.h"
         return {
