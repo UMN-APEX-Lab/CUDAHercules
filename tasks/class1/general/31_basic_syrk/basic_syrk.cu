@@ -431,23 +431,29 @@ cudaError_t ReferenceSyrk(
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// FP64 accuracy requirement: every lower-triangle element must satisfy
-///   |x - ref| <= kFp64RelTol * max|ref|   (NaN/Inf always fail).
-/// Two correct FP64 implementations (any summation order) agree to ~1e-14 of max|ref| at
-/// these sizes; FP32 arithmetic or FP32-rounded inputs give ~1e-7, so they fail.
-static const double kFp64RelTol = 1e-10;
+/// FP64 accuracy requirement (FP64-level, i.e. comparable to a native FP64 implementation), over
+/// the lower triangle, with RMS = sqrt(mean(ref^2)) of that triangle and K the inner dimension:
+///   every element:  |x - ref| <= kElemTol * sqrt(K) * RMS        (NaN/Inf always fail)
+///   overall:        RMS(x - ref) <= kFroTol * sqrt(K) * RMS
+/// Native FP64 in any summation order stays >= 3x inside both bounds; FP32, ~48-bit
+/// (double-float) or ~33-bit (few-slice int8) emulation exceed them by ~10x to 1e6x.
+static const double kElemTol = 4e-15;
+static const double kFroTol = 1e-16;
+/// The error functions return error / bound (the larger of the two checks): pass iff <= 1.
+static const double kFp64RelTol = 1.0;
 
-/// Returns the max lower-triangle error relative to max|ref| (inf if any element is NaN/Inf
-/// or the strict upper triangle of `x` differs from `upper_expected`).
+/// Ratio of the error to the FP64 bound (inf if any element is NaN/Inf); *upper_ok tells whether
+/// the strict upper triangle of `x` equals `upper_expected`.
 static double SyrkRelError(std::vector<double> const &x, std::vector<double> const &ref,
-                           std::vector<double> const &upper_expected, int N, int ldc,
+                           std::vector<double> const &upper_expected, int N, int K, int ldc,
                            bool *upper_ok) {
-  double ref_scale = 0;
+  double ss = 0;
+  size_t cnt = 0;
   for (int jj = 0; jj < N; ++jj)
-    for (int ii = jj; ii < N; ++ii)
-      ref_scale = std::fmax(ref_scale, std::fabs(ref[ii + jj * ldc]));
-  if (ref_scale == 0) ref_scale = 1;
-  double max_rel = 0;
+    for (int ii = jj; ii < N; ++ii) { ss += ref[ii + jj * ldc] * ref[ii + jj * ldc]; ++cnt; }
+  double rms = cnt ? std::sqrt(ss / cnt) : 0;
+  if (rms == 0) rms = 1;
+  double max_e = 0, se = 0;
   bool bad = false;
   *upper_ok = true;
   for (int jj = 0; jj < N; ++jj) {
@@ -456,13 +462,15 @@ static double SyrkRelError(std::vector<double> const &x, std::vector<double> con
       if (std::memcmp(&a, &b, sizeof(double)) != 0) *upper_ok = false;
     }
     for (int ii = jj; ii < N; ++ii) {
-      double rel = std::fabs(x[ii + jj * ldc] - ref[ii + jj * ldc]) / ref_scale;
-      if (!(rel <= kFp64RelTol)) bad = true;   // also catches NaN/Inf
-      if (!std::isfinite(rel)) rel = INFINITY;
-      if (rel > max_rel) max_rel = rel;
+      double d = std::fabs(x[ii + jj * ldc] - ref[ii + jj * ldc]);
+      if (!std::isfinite(d)) { bad = true; continue; }
+      max_e = std::fmax(max_e, d);
+      se += d * d;
     }
   }
-  return bad ? std::fmax(max_rel, 2 * kFp64RelTol) : max_rel;
+  if (bad) return INFINITY;
+  double sk = std::sqrt(double(K));
+  return std::fmax(max_e / (kElemTol * sk * rms), std::sqrt(se / cnt) / (kFroTol * sk * rms));
 }
 
 /// Test correctness: CUTLASS reference vs naive, and (if KH_TEST_SOLUTION) solution vs CUTLASS.
@@ -523,14 +531,14 @@ cudaError_t TestCorrectness(int N, int K, double alpha, double beta) {
 
   {
     bool upper_ok = true;
-    double rel = SyrkRelError(host_cutlass, host_reference, host_c_init, N, ldc, &upper_ok);
+    double rel = SyrkRelError(host_cutlass, host_reference, host_c_init, N, K, ldc, &upper_ok);
     if (!(rel <= kFp64RelTol) || !upper_ok) {
-      std::cerr << "CUTLASS reference incorrect vs naive (rel err " << rel
+      std::cerr << "CUTLASS reference incorrect vs naive (error / FP64 bound " << rel
                 << (upper_ok ? "" : ", upper triangle modified") << ")" << std::endl;
       cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(A);
       return cudaErrorUnknown;
     }
-    std::cout << "Reference vs naive FP64 rel err: " << rel << std::endl;
+    std::cout << "Reference vs naive: error / FP64 bound = " << rel << std::endl;
   }
 
 #ifdef KH_TEST_SOLUTION
@@ -557,10 +565,10 @@ cudaError_t TestCorrectness(int N, int K, double alpha, double beta) {
   cudaMemcpy(host_solution.data(), C_solution, sizeof_C, cudaMemcpyDeviceToHost);
 
   bool upper_ok = true;
-  double sol_rel = SyrkRelError(host_solution, host_cutlass, host_c_init, N, ldc, &upper_ok);
-  std::cout << "Solution vs reference FP64 rel err: " << sol_rel << " (tolerance " << kFp64RelTol << ")" << std::endl;
+  double sol_rel = SyrkRelError(host_solution, host_cutlass, host_c_init, N, K, ldc, &upper_ok);
+  std::cout << "Solution vs reference: error / FP64 bound = " << sol_rel << " (must be <= 1)" << std::endl;
   if (!(sol_rel <= kFp64RelTol) || !upper_ok) {
-    std::cerr << "Solution incorrect. Max error vs reference (relative to max|ref|): " << sol_rel
+    std::cerr << "Solution incorrect (not FP64-accurate). Error / FP64 bound: " << sol_rel
               << (upper_ok ? "" : "; strict upper triangle of C was modified") << std::endl;
     cudaFree(C_solution); cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(A);
     return cudaErrorUnknown;
@@ -580,31 +588,32 @@ cudaError_t TestCorrectness(int N, int K, double alpha, double beta) {
 
 #ifdef KH_TEST_SOLUTION
 /// Device-side form of the SyrkRelError rule, used after every timed solution call (no host
-/// copies): every lower-triangle element must satisfy |x - ref| / ref_scale <= kFp64RelTol
-/// (NaN/Inf fail) with ref_scale = max|ref| over the lower triangle (1 if 0), and the strict upper
-/// triangle of x must be bitwise equal to the initial C.
+/// copies): with RMS = sqrt(mean(ref^2)) over the lower triangle, every lower-triangle element must
+/// satisfy |x - ref| <= kElemTol * sqrt(K) * RMS (NaN/Inf fail), RMS(x - ref) <= kFroTol * sqrt(K)
+/// * RMS, and the strict upper triangle of x must be bitwise equal to the initial C.
 struct KhSyrkStats {
-  unsigned long long n_bad;          // lower-triangle elements outside tolerance (incl. NaN/Inf)
+  unsigned long long n_bad;          // lower-triangle elements outside the bound (incl. NaN/Inf)
   unsigned long long n_upper;        // strict-upper elements that differ from the initial C
-  unsigned long long max_bits;       // bits of max |x - ref| / ref_scale (non-negative double)
+  unsigned long long max_bits;       // bits of max |x - ref| / RMS (non-negative double)
+  double err2;                       // sum of (x - ref)^2 over finite lower-triangle elements
 };
 
-__global__ void kh_lower_absmax_kernel(double const *X, int N, int ldc, unsigned long long *max_bits) {
+__global__ void kh_lower_sumsq_kernel(double const *X, int N, int ldc, double *sumsq) {
   double m = 0.0;
   size_t const n = size_t(N) * N;
   for (size_t idx = blockIdx.x * size_t(blockDim.x) + threadIdx.x; idx < n;
        idx += size_t(gridDim.x) * blockDim.x) {
     int i = int(idx % N), j = int(idx / N);
-    if (i >= j) m = fmax(m, fabs(X[i + size_t(j) * ldc]));
+    if (i >= j) { double v = X[i + size_t(j) * ldc]; m += v * v; }
   }
-  for (int o = 16; o > 0; o >>= 1) m = fmax(m, __shfl_xor_sync(0xffffffffu, m, o));
-  if ((threadIdx.x & 31) == 0) atomicMax(max_bits, (unsigned long long)__double_as_longlong(m));
+  for (int o = 16; o > 0; o >>= 1) m += __shfl_xor_sync(0xffffffffu, m, o);
+  if ((threadIdx.x & 31) == 0) atomicAdd(sumsq, m);
 }
 
 __global__ void kh_syrk_compare_kernel(double const *x, double const *ref, double const *c_init,
-                                       int N, int ldc, double ref_scale, KhSyrkStats *st) {
+                                       int N, int ldc, double rms, double elem_tol, KhSyrkStats *st) {
   unsigned long long bad = 0, upper = 0;
-  double mx = 0.0;
+  double mx = 0.0, e2 = 0.0;
   size_t const n = size_t(N) * N;
   for (size_t idx = blockIdx.x * size_t(blockDim.x) + threadIdx.x; idx < n;
        idx += size_t(gridDim.x) * blockDim.x) {
@@ -613,9 +622,10 @@ __global__ void kh_syrk_compare_kernel(double const *x, double const *ref, doubl
     if (i < j) {
       if (__double_as_longlong(x[o]) != __double_as_longlong(c_init[o])) ++upper;
     } else {
-      double rel = fabs(x[o] - ref[o]) / ref_scale;
-      if (!(rel <= kFp64RelTol)) ++bad;   // also catches NaN/Inf
-      if (!isfinite(rel)) rel = INFINITY;
+      double d = fabs(x[o] - ref[o]);
+      double rel = d / rms;
+      if (!(rel <= elem_tol)) ++bad;   // also catches NaN/Inf
+      if (!isfinite(rel)) rel = INFINITY; else e2 += d * d;
       mx = fmax(mx, rel);
     }
   }
@@ -623,42 +633,46 @@ __global__ void kh_syrk_compare_kernel(double const *x, double const *ref, doubl
     bad += __shfl_xor_sync(0xffffffffu, bad, o);
     upper += __shfl_xor_sync(0xffffffffu, upper, o);
     mx = fmax(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    e2 += __shfl_xor_sync(0xffffffffu, e2, o);
   }
   if ((threadIdx.x & 31) == 0) {
     if (bad) atomicAdd(&st->n_bad, bad);
     if (upper) atomicAdd(&st->n_upper, upper);
     atomicMax(&st->max_bits, (unsigned long long)__double_as_longlong(mx));
+    atomicAdd(&st->err2, e2);
   }
 }
 
-/// max|X| over the lower triangle, or 1 if it is 0 (the ref_scale of SyrkRelError).
+/// RMS of X over the lower triangle, or 1 if it is 0 (the RMS of SyrkRelError).
 static double kh_syrk_ref_scale(double const *X, int N, int ldc) {
-  unsigned long long *d = nullptr, h = 0;
+  double *d = nullptr, h = 0;
   kh_cuda_ok(cudaMalloc(&d, sizeof(h)), "syrk check");
   kh_cuda_ok(cudaMemset(d, 0, sizeof(h)), "syrk check");
-  kh_lower_absmax_kernel<<<1024, 256>>>(X, N, ldc, d);
+  kh_lower_sumsq_kernel<<<1024, 256>>>(X, N, ldc, d);
   kh_cuda_ok(cudaMemcpy(&h, d, sizeof(h), cudaMemcpyDeviceToHost), "syrk check");
   cudaFree(d);
-  double s;
-  std::memcpy(&s, &h, sizeof(s));
-  return s == 0 ? 1.0 : s;
+  double rms = std::sqrt(h / (double(N) * (N + 1) / 2));
+  return rms == 0 ? 1.0 : rms;
 }
 
 /// Returns true if x matches ref under the SyrkRelError rule; prints details on failure.
 static bool kh_syrk_check(char const *who, double const *x, double const *ref, double const *c_init,
-                          double ref_scale, int N, int ldc) {
+                          double rms, int N, int K, int ldc) {
   KhSyrkStats *d = nullptr, h;
+  double const sk = std::sqrt(double(K));
   kh_cuda_ok(cudaMalloc(&d, sizeof(h)), "syrk check");
   kh_cuda_ok(cudaMemset(d, 0, sizeof(h)), "syrk check");
-  kh_syrk_compare_kernel<<<1024, 256>>>(x, ref, c_init, N, ldc, ref_scale, d);
+  kh_syrk_compare_kernel<<<1024, 256>>>(x, ref, c_init, N, ldc, rms, kElemTol * sk, d);
   kh_cuda_ok(cudaMemcpy(&h, d, sizeof(h), cudaMemcpyDeviceToHost), "syrk check");
   cudaFree(d);
-  if (h.n_bad == 0 && h.n_upper == 0) return true;
+  double fro = std::sqrt(h.err2 / (double(N) * (N + 1) / 2)) / rms;
+  if (h.n_bad == 0 && h.n_upper == 0 && fro <= kFroTol * sk) return true;
   double mx;
   std::memcpy(&mx, &h.max_bits, sizeof(mx));
-  std::cerr << who << ": max error vs reference (relative to max|ref|) " << mx << " (tolerance "
-            << kFp64RelTol << "), " << h.n_bad << " lower-triangle elements out of tolerance, "
-            << h.n_upper << " strict-upper elements modified" << std::endl;
+  std::cerr << who << ": not FP64-accurate: max |x - ref| / RMS(ref) = " << mx << " (bound "
+            << kElemTol * sk << "), RMS(x - ref) / RMS(ref) = " << fro << " (bound " << kFroTol * sk
+            << "), " << h.n_bad << " lower-triangle elements out of bound, " << h.n_upper
+            << " strict-upper elements modified" << std::endl;
   return false;
 }
 
@@ -710,7 +724,7 @@ void Profile(int N, int K, double alpha, double beta, int iterations) {
     kh_cuda_ok(ReferenceSyrk(N, K, alpha, A_set[1], lda, beta, naive, ldc), "golden check (naive)");
     kh_cuda_ok(cudaDeviceSynchronize(), "golden check");
     if (!kh_syrk_check("CUTLASS reference vs naive (timing set 1)", G[1], naive, C_set[1],
-                       kh_syrk_ref_scale(naive, N, ldc), N, ldc))
+                       kh_syrk_ref_scale(naive, N, ldc), N, K, ldc))
       kh_fail("CUTLASS reference incorrect vs naive on timing set 1.");
     cudaFree(naive);
   }
@@ -719,7 +733,7 @@ void Profile(int N, int K, double alpha, double beta, int iterations) {
   KhTiming sol = kh_bench("Kernel time", warmup, iterations, prep, [&] {
     Dsyrk(N, K, alpha, A, lda, beta, C, ldc);
   }, [&](int s) {
-    return kh_syrk_check("Solution (timed call)", C, G[s], C_set[s], ref_scale[s], N, ldc);
+    return kh_syrk_check("Solution (timed call)", C, G[s], C_set[s], ref_scale[s], N, K, ldc);
   });
   fprintf(stdout, "Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
           sol.avg_ms, iterations, sol.min_ms);

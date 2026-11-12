@@ -443,25 +443,32 @@ cudaError_t ReferenceTrmm(
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// FP64 accuracy requirement: every element must satisfy |x - ref| <= kFp64RelTol * max|ref|
-/// (NaN/Inf always fail). Two correct FP64 implementations (any summation order) agree to
-/// ~1e-14 of max|ref| at these sizes; FP32 arithmetic or FP32-rounded inputs give ~1e-7.
-static const double kFp64RelTol = 1e-10;
+/// FP64 accuracy requirement (FP64-level, i.e. comparable to a native FP64 implementation), with
+/// RMS = sqrt(mean(ref^2)) and M the inner dimension (A is M x M):
+///   every element:  |x - ref| <= kElemTol * sqrt(M) * RMS        (NaN/Inf always fail)
+///   overall:        RMS(x - ref) <= kFroTol * sqrt(M) * RMS
+/// Native FP64 in any summation order stays >= 3x inside both bounds; FP32, ~48-bit
+/// (double-float) or ~33-bit (few-slice int8) emulation exceed them by ~10x to 1e6x.
+static const double kElemTol = 4e-15;
+static const double kFroTol = 1e-16;
+/// TrmmRelError returns error / bound (the larger of the two checks): pass iff <= 1.
+static const double kFp64RelTol = 1.0;
 
-/// Max element error relative to max|ref|; >= 2*kFp64RelTol (or inf) if any element is NaN/Inf.
-static double TrmmRelError(std::vector<double> const &x, std::vector<double> const &ref) {
-  double ref_scale = 0;
-  for (double r : ref) ref_scale = std::fmax(ref_scale, std::fabs(r));
-  if (ref_scale == 0) ref_scale = 1;
-  double max_rel = 0;
-  bool bad = false;
+/// Ratio of the error to the FP64 bound; inf if any element is NaN/Inf.
+static double TrmmRelError(std::vector<double> const &x, std::vector<double> const &ref, int M) {
+  double ss = 0;
+  for (double r : ref) ss += r * r;
+  double rms = ref.empty() ? 0 : std::sqrt(ss / ref.size());
+  if (rms == 0) rms = 1;
+  double max_e = 0, se = 0;
   for (size_t i = 0; i < ref.size(); ++i) {
-    double rel = std::fabs(x[i] - ref[i]) / ref_scale;
-    if (!(rel <= kFp64RelTol)) bad = true;   // also catches NaN/Inf
-    if (!std::isfinite(rel)) rel = INFINITY;
-    if (rel > max_rel) max_rel = rel;
+    double d = std::fabs(x[i] - ref[i]);
+    if (!std::isfinite(d)) return INFINITY;
+    max_e = std::fmax(max_e, d);
+    se += d * d;
   }
-  return bad ? std::fmax(max_rel, 2 * kFp64RelTol) : max_rel;
+  double sm = std::sqrt(double(M));
+  return std::fmax(max_e / (kElemTol * sm * rms), std::sqrt(se / ref.size()) / (kFroTol * sm * rms));
 }
 
 /// Test correctness: CUTLASS reference vs naive, and (if KH_TEST_SOLUTION) solution vs CUTLASS.
@@ -518,13 +525,13 @@ cudaError_t TestCorrectness(int M, int N, double alpha) {
   cudaMemcpy(host_reference.data(), C_reference, sizeof_C, cudaMemcpyDeviceToHost);
 
   {
-    double rel = TrmmRelError(host_cutlass, host_reference);
+    double rel = TrmmRelError(host_cutlass, host_reference, M);
     if (!(rel <= kFp64RelTol)) {
-      std::cerr << "CUTLASS reference incorrect vs naive (rel err " << rel << ")." << std::endl;
+      std::cerr << "CUTLASS reference incorrect vs naive (error / FP64 bound " << rel << ")." << std::endl;
       cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(B); cudaFree(A);
       return cudaErrorUnknown;
     }
-    std::cout << "Reference vs naive FP64 rel err: " << rel << std::endl;
+    std::cout << "Reference vs naive: error / FP64 bound = " << rel << std::endl;
   }
 
 #ifdef KH_TEST_SOLUTION
@@ -546,10 +553,10 @@ cudaError_t TestCorrectness(int M, int N, double alpha) {
   std::vector<double> host_solution(size_t(ldc) * N);
   cudaMemcpy(host_solution.data(), C_solution, sizeof_C, cudaMemcpyDeviceToHost);
 
-  double sol_rel = TrmmRelError(host_solution, host_cutlass);
-  std::cout << "Solution vs reference FP64 rel err: " << sol_rel << " (tolerance " << kFp64RelTol << ")" << std::endl;
+  double sol_rel = TrmmRelError(host_solution, host_cutlass, M);
+  std::cout << "Solution vs reference: error / FP64 bound = " << sol_rel << " (must be <= 1)" << std::endl;
   if (!(sol_rel <= kFp64RelTol)) {
-    std::cerr << "Solution incorrect. Max error vs reference (relative to max|ref|): " << sol_rel << std::endl;
+    std::cerr << "Solution incorrect (not FP64-accurate). Error / FP64 bound: " << sol_rel << std::endl;
     cudaFree(C_solution); cudaFree(C_reference); cudaFree(C_cutlass); cudaFree(B); cudaFree(A);
     return cudaErrorUnknown;
   }
@@ -569,67 +576,73 @@ cudaError_t TestCorrectness(int M, int N, double alpha) {
 
 #ifdef KH_TEST_SOLUTION
 /// Device-side form of the TrmmRelError rule, used after every timed solution call (no host
-/// copies): every element must satisfy |x - ref| / ref_scale <= kFp64RelTol (NaN/Inf fail) with
-/// ref_scale = max|ref| (1 if 0).
+/// copies): with RMS = sqrt(mean(ref^2)), every element must satisfy |x - ref| <= kElemTol *
+/// sqrt(M) * RMS (NaN/Inf fail) and RMS(x - ref) <= kFroTol * sqrt(M) * RMS.
 struct KhTrmmStats {
-  unsigned long long n_bad;          // elements outside tolerance (incl. NaN/Inf)
-  unsigned long long max_bits;       // bits of max |x - ref| / ref_scale (non-negative double)
+  unsigned long long n_bad;          // elements outside the bound (incl. NaN/Inf)
+  unsigned long long max_bits;       // bits of max |x - ref| / RMS (non-negative double)
+  double err2;                       // sum of (x - ref)^2 over finite elements
 };
 
-__global__ void kh_absmax_kernel(double const *X, size_t n, unsigned long long *max_bits) {
+__global__ void kh_sumsq_kernel(double const *X, size_t n, double *sumsq) {
   double m = 0.0;
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x)
-    m = fmax(m, fabs(X[i]));
-  for (int o = 16; o > 0; o >>= 1) m = fmax(m, __shfl_xor_sync(0xffffffffu, m, o));
-  if ((threadIdx.x & 31) == 0) atomicMax(max_bits, (unsigned long long)__double_as_longlong(m));
+    m += X[i] * X[i];
+  for (int o = 16; o > 0; o >>= 1) m += __shfl_xor_sync(0xffffffffu, m, o);
+  if ((threadIdx.x & 31) == 0) atomicAdd(sumsq, m);
 }
 
-__global__ void kh_trmm_compare_kernel(double const *x, double const *ref, size_t n, double ref_scale,
-                                       KhTrmmStats *st) {
+__global__ void kh_trmm_compare_kernel(double const *x, double const *ref, size_t n, double rms,
+                                       double elem_tol, KhTrmmStats *st) {
   unsigned long long bad = 0;
-  double mx = 0.0;
+  double mx = 0.0, e2 = 0.0;
   for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < n; i += size_t(gridDim.x) * blockDim.x) {
-    double rel = fabs(x[i] - ref[i]) / ref_scale;
-    if (!(rel <= kFp64RelTol)) ++bad;   // also catches NaN/Inf
-    if (!isfinite(rel)) rel = INFINITY;
+    double d = fabs(x[i] - ref[i]);
+    double rel = d / rms;
+    if (!(rel <= elem_tol)) ++bad;   // also catches NaN/Inf
+    if (!isfinite(rel)) rel = INFINITY; else e2 += d * d;
     mx = fmax(mx, rel);
   }
   for (int o = 16; o > 0; o >>= 1) {
     bad += __shfl_xor_sync(0xffffffffu, bad, o);
     mx = fmax(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    e2 += __shfl_xor_sync(0xffffffffu, e2, o);
   }
   if ((threadIdx.x & 31) == 0) {
     if (bad) atomicAdd(&st->n_bad, bad);
     atomicMax(&st->max_bits, (unsigned long long)__double_as_longlong(mx));
+    atomicAdd(&st->err2, e2);
   }
 }
 
-/// max|X|, or 1 if it is 0 (the ref_scale of TrmmRelError).
+/// RMS of X, or 1 if it is 0 (the RMS of TrmmRelError).
 static double kh_trmm_ref_scale(double const *X, size_t n) {
-  unsigned long long *d = nullptr, h = 0;
+  double *d = nullptr, h = 0;
   kh_cuda_ok(cudaMalloc(&d, sizeof(h)), "trmm check");
   kh_cuda_ok(cudaMemset(d, 0, sizeof(h)), "trmm check");
-  kh_absmax_kernel<<<1024, 256>>>(X, n, d);
+  kh_sumsq_kernel<<<1024, 256>>>(X, n, d);
   kh_cuda_ok(cudaMemcpy(&h, d, sizeof(h), cudaMemcpyDeviceToHost), "trmm check");
   cudaFree(d);
-  double s;
-  std::memcpy(&s, &h, sizeof(s));
-  return s == 0 ? 1.0 : s;
+  double rms = std::sqrt(h / double(n));
+  return rms == 0 ? 1.0 : rms;
 }
 
 /// Returns true if x matches ref under the TrmmRelError rule; prints details on failure.
-static bool kh_trmm_check(char const *who, double const *x, double const *ref, double ref_scale, size_t n) {
+static bool kh_trmm_check(char const *who, double const *x, double const *ref, double rms, size_t n, int M) {
   KhTrmmStats *d = nullptr, h;
+  double const sm = std::sqrt(double(M));
   kh_cuda_ok(cudaMalloc(&d, sizeof(h)), "trmm check");
   kh_cuda_ok(cudaMemset(d, 0, sizeof(h)), "trmm check");
-  kh_trmm_compare_kernel<<<1024, 256>>>(x, ref, n, ref_scale, d);
+  kh_trmm_compare_kernel<<<1024, 256>>>(x, ref, n, rms, kElemTol * sm, d);
   kh_cuda_ok(cudaMemcpy(&h, d, sizeof(h), cudaMemcpyDeviceToHost), "trmm check");
   cudaFree(d);
-  if (h.n_bad == 0) return true;
+  double fro = std::sqrt(h.err2 / double(n)) / rms;
+  if (h.n_bad == 0 && fro <= kFroTol * sm) return true;
   double mx;
   std::memcpy(&mx, &h.max_bits, sizeof(mx));
-  std::cerr << who << ": max error vs reference (relative to max|ref|) " << mx << " (tolerance "
-            << kFp64RelTol << "), " << h.n_bad << " elements out of tolerance" << std::endl;
+  std::cerr << who << ": not FP64-accurate: max |x - ref| / RMS(ref) = " << mx << " (bound "
+            << kElemTol * sm << "), RMS(x - ref) / RMS(ref) = " << fro << " (bound " << kFroTol * sm
+            << "), " << h.n_bad << " elements out of bound" << std::endl;
   return false;
 }
 
@@ -683,7 +696,7 @@ void Profile(int M, int N, double alpha, int iterations) {
     kh_cuda_ok(ReferenceTrmm(M, N, alpha, A_set[1], lda, B_set[1], ldb, naive, ldc), "golden check (naive)");
     kh_cuda_ok(cudaDeviceSynchronize(), "golden check");
     if (!kh_trmm_check("CUTLASS reference vs naive (timing set 1)", G[1], naive,
-                       kh_trmm_ref_scale(naive, count_C), count_C))
+                       kh_trmm_ref_scale(naive, count_C), count_C, M))
       kh_fail("CUTLASS reference incorrect vs naive on timing set 1.");
     cudaFree(naive);
   }
@@ -695,7 +708,7 @@ void Profile(int M, int N, double alpha, int iterations) {
   }, [&] {
     Dtrmm(M, N, alpha, A, lda, B, ldb, C, ldc);
   }, [&](int s) {
-    return kh_trmm_check("Solution (timed call)", C, G[s], ref_scale[s], count_C);
+    return kh_trmm_check("Solution (timed call)", C, G[s], ref_scale[s], count_C, M);
   });
   fprintf(stdout, "Kernel time: %.4f ms (avg over %d trials, min: %.4f ms)\n",
           sol.avg_ms, iterations, sol.min_ms);

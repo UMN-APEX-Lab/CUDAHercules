@@ -33,11 +33,11 @@ Where:
 
 All matrices are `double` (FP64).
 
-The result must be FP64-accurate: it is checked against an FP64 reference with the tolerance
-below, which plain FP32 (or lower-precision) computation cannot meet. How FP64 accuracy is
-reached is up to you: native FP64 arithmetic, or emulating FP64 with lower-precision units
-(e.g. double-float arithmetic, or Ozaki-style splitting on tensor cores), are both allowed as
-long as the result meets the tolerance.
+The result must be FP64-accurate, i.e. as accurate as a native FP64 implementation; the
+tolerance below is set at that level. How FP64 accuracy is reached is up to you: native FP64
+arithmetic, or emulating FP64 with lower-precision units (e.g. Ozaki-style splitting on tensor
+cores with enough slices), are both allowed as long as the result meets the tolerance. Emulation
+with less than FP64 precision (e.g. double-float arithmetic, or too few int8 slices) does not.
 
 ## Memory Layout
 
@@ -58,9 +58,11 @@ Default run: alpha = 1.1, beta = -0.7, lda = ldc = N, at three problem sizes
 (small: N=K=1024, medium: N=K=4096, large: N=4096 K=8192).
 A and the initial C hold pseudo-random FP64 values in [-1, 1) (full 52-bit mantissa).
 
-Correctness is verified against a reference implementation at every size: each
-lower-triangle element must satisfy |C - C_ref| <= 1e-10 * max|C_ref| (NaN/Inf fail), and
-the strictly upper triangle must be bit-identical to the initial C.
+Correctness is verified against a reference implementation at every size. With
+RMS = sqrt(mean(C_ref^2)) over the lower triangle: each lower-triangle element must satisfy
+|C - C_ref| <= 4e-15 * sqrt(K) * RMS, and RMS(C - C_ref) <= 1e-16 * sqrt(K) * RMS (NaN/Inf
+fail); the strictly upper triangle must be bit-identical to the initial C. A native FP64
+implementation (any summation order) stays >= 3x inside both bounds.
 Performance is timed for both reference and your solution at each size.
 
 CUTLASS headers are available on the include path.

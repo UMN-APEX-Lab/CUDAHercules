@@ -31,11 +31,11 @@ Where:
 
 All matrices are `double` (FP64).
 
-The result must be FP64-accurate: it is checked against an FP64 reference with the tolerance
-below, which plain FP32 (or lower-precision) computation cannot meet. How FP64 accuracy is
-reached is up to you: native FP64 arithmetic, or emulating FP64 with lower-precision units
-(e.g. double-float arithmetic, or Ozaki-style splitting on tensor cores), are both allowed as
-long as the result meets the tolerance.
+The result must be FP64-accurate, i.e. as accurate as a native FP64 implementation; the
+tolerance below is set at that level. How FP64 accuracy is reached is up to you: native FP64
+arithmetic, or emulating FP64 with lower-precision units (e.g. Ozaki-style splitting on tensor
+cores with enough slices), are both allowed as long as the result meets the tolerance. Emulation
+with less than FP64 precision (e.g. double-float arithmetic, or too few int8 slices) does not.
 
 ## Memory Layout
 
@@ -59,8 +59,10 @@ The lower triangle of A and all of B hold pseudo-random FP64 values in [-1, 1)
 (full 52-bit mantissa); the upper triangle of A is zero. C is output-only: every element
 must be written (its initial contents are undefined).
 
-Correctness is verified against a reference implementation at every size: each element
-must satisfy |C - C_ref| <= 1e-10 * max|C_ref| (NaN/Inf fail).
+Correctness is verified against a reference implementation at every size. With
+RMS = sqrt(mean(C_ref^2)): each element must satisfy |C - C_ref| <= 4e-15 * sqrt(M) * RMS, and
+RMS(C - C_ref) <= 1e-16 * sqrt(M) * RMS (NaN/Inf fail). A native FP64 implementation (any
+summation order) stays >= 3x inside both bounds.
 Performance is timed for both reference and your solution at each size.
 
 CUTLASS headers are available on the include path.

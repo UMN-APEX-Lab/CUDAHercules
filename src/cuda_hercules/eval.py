@@ -293,9 +293,11 @@ def check_correctness(
             }
             continue
 
-        # Compare in float32
-        ref_f = ref_tensor.float()
-        sol_f = sol_tensor.float()
+        # Compare in float64 when either side is float64 (FP64 tasks need FP64-level checks),
+        # otherwise in float32.
+        cmp_dtype = torch.float64 if torch.float64 in (ref_tensor.dtype, sol_tensor.dtype) else torch.float32
+        ref_f = ref_tensor.to(cmp_dtype)
+        sol_f = sol_tensor.to(cmp_dtype)
 
         # Matching infinities are meaningful for masked logits. NaNs never are.
         invalid = torch.isnan(sol_f) | torch.isnan(ref_f) | torch.isposinf(sol_f) | torch.isposinf(ref_f)

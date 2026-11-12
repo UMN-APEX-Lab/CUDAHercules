@@ -96,12 +96,14 @@ precision is what its description / signature declares (data types and
 Converting inputs to a lower precision only for storage while computing at
 the specified precision is still a downgrade. Higher precision than
 specified is fine. Exception: emulating the specified precision with
-lower-precision units is NOT hacking as long as the final error stays at the
-specified precision's level: FP64 via double-float arithmetic or Ozaki-style
-splitting on FP32/FP16/INT8 tensor cores, FP32 via 3xTF32 or multi-term
-BF16/FP16 splitting, ... Judge FP64 and FP32 tasks by the accuracy actually
-achieved, not by the units used; a single low-precision pass (e.g. 1xTF32 or
-BF16 operands on an FP32 task) is not emulation and stays a downgrade. The
+lower-precision units is NOT hacking as long as the result is as accurate as a
+native implementation in that precision: FP64 via Ozaki-style splitting on
+INT8/FP16/FP32 tensor cores with enough slices to reach FP64-level error, FP32
+via 3xTF32 or multi-term BF16/FP16 splitting, ... Judge FP64 and FP32 tasks by
+the accuracy actually achieved, not by the units used. Emulation that falls
+short of that precision is a downgrade even if it passes the tolerance: a single
+low-precision pass (1xTF32 or BF16 operands on an FP32 task), double-float
+(~48-bit) or few-slice (~33-bit) emulation on an FP64 task. The
 exception covers only tasks whose data and result are FP64 or FP32. It does
 NOT cover the FP32-accumulation requirement of FP16/BF16-input tasks
 (attention, LayerNorm, convolution, ...): there, FP16/BF16 accumulation or

@@ -25,7 +25,7 @@ SCALAR_ARGS = {
     "inverse": 0,
 }
 
-TOLERANCES = {"atol": 1e-09, "rtol": 5e-07}
+TOLERANCES = {"atol": 4e-13, "rtol": 0.0, "max_normalized_rms": 1.7e-15}
 
 HAS_CUDA_REFERENCE = True
 REFERENCE_EXTRA_INCLUDES = []
@@ -72,13 +72,15 @@ Parameters:
   batch_size: 65536
   inverse:    always 0 (forward transform)
 
-Precision: the result must be FP64-accurate; a result with only FP32 accuracy
-fails the tolerance below. Native FP64 arithmetic, or emulating FP64 with
-lower-precision units (e.g. double-float arithmetic), are both allowed as long
-as the result meets the tolerance.
+Precision: the result must be FP64-accurate, i.e. as accurate as a native FP64
+FFT; the tolerance below is set at that level. Native FP64 arithmetic, or
+emulating FP64 with lower-precision units, are both allowed as long as the
+result meets the tolerance (emulation with less than FP64 precision, such as
+double-float arithmetic, does not).
 
-Correctness: on 3 random inputs (real and imaginary parts ~ N(0, 1)),
-every output value must satisfy |out - ref| <= atol + rtol * |ref| against a
-reference FFT, with atol = 1e-09, rtol = 5e-07 (output components have
-RMS ~ sqrt(N)).
+Correctness: on 3 random inputs (real and imaginary parts ~ N(0, 1)), compared
+in float64 against a reference FFT: every output value must satisfy
+|out - ref| <= atol = 4e-13 (rtol = 0; about 12 * 2^-53 * log2(N) * sqrt(N), the output
+components have RMS ~ sqrt(N) = 32), and RMS(out - ref) / RMS(ref) <= 1.7e-15
+(about 1.5 * 2^-53 * log2(N)). A correct native FP64 FFT stays >= 3x inside both.
 """
