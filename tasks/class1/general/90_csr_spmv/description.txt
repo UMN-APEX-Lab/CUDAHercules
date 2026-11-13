@@ -1,0 +1,90 @@
+# Task: 90_csr_spmv
+
+Sparse matrix-vector multiplication y = A x for large FP32 CSR matrices.
+
+## Function Signatures
+
+Implement the following three functions in `solution.h` (C++ linkage):
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+
+// NOT timed. Receives only the matrix A. May convert A to any storage format and build any
+// auxiliary data over A (device or host memory); returns an opaque context.
+void* spmv_preprocess(const int* d_row_ptr, const int* d_col_ind, const float* d_values,
+                      int num_rows, int num_cols, int nnz);
+
+// The ONLY timed function: y = A x.
+void spmv_compute(void* ctx,
+                  const int* d_row_ptr, const int* d_col_ind, const float* d_values,
+                  const float* d_x, float* d_y,
+                  int num_rows, int num_cols, int nnz);
+
+// Releases everything spmv_preprocess and spmv_compute allocated.
+void spmv_cleanup(void* ctx);
+```
+
+All pointers are device pointers. A is in CSR format with 0-based, sorted column indices:
+row r holds the entries `d_values[j]` at columns `d_col_ind[j]` for
+`d_row_ptr[r] <= j < d_row_ptr[r + 1]`. `d_x` has `num_cols` entries, `d_y` has `num_rows`.
+
+## Calling Protocol
+
+For every test matrix: `spmv_preprocess` is called once, then `spmv_compute` is called many times
+with the same A and the same buffers, then `spmv_cleanup`. Between calls, x changes (two different
+input vectors alternate) and y is zero-filled; both happen outside the timed region, so partial sums
+may be accumulated into y. Each call must compute y from the x it receives: results must not be
+carried over from one call to the next. `spmv_compute` may launch work on any stream; the timing
+covers everything until the device is idle.
+
+## Test Matrices
+
+Twelve public matrices (SuiteSparse Matrix Collection, OGB, DGL); values are FP32, pattern-only
+matrices and graphs have all values 1.0:
+
+| name             | rows       | nnz         | kind                                   |
+|------------------|------------|-------------|----------------------------------------|
+| af_shell10       | 1,508,065  | 52,672,325  | sheet metal forming (structural FEM)   |
+| CoupCons3D       | 416,800    | 22,322,336  | 3D coupled consolidation (FEM)         |
+| delaunay_n24     | 16,777,216 | 100,663,202 | Delaunay triangulation graph           |
+| asia_osm         | 11,950,757 | 25,423,206  | road network                           |
+| human_gene1      | 22,283     | 24,669,643  | gene co-expression network             |
+| mouse_gene       | 45,101     | 28,967,291  | gene co-expression network             |
+| gupta3           | 16,783     | 9,323,427   | linear programming normal matrix       |
+| in-2004          | 1,382,908  | 16,917,053  | web graph                              |
+| ogbn-proteins    | 132,534    | 79,122,504  | protein association graph              |
+| reddit           | 232,965    | 114,615,892 | social network graph                   |
+| case39           | 40,216     | 1,042,160   | optimal power flow                     |
+| TSOPF_FS_b300_c2 | 56,814     | 8,767,466   | transient-stability optimal power flow |
+
+All matrices are square.
+
+## Correctness
+
+x holds random FP32 values in [-1, 1). Every element of y is compared with the FP64-accumulated
+product: an element matches if it is finite and its absolute error is at most 0.01 or its relative
+error |y - exact| / (|exact| + 1e-8) is at most 0.01. A result is correct if at most 0.1% of the
+elements mismatch. The check runs on the first call and on every timed call. The mismatch allowance
+exists for rounding differences only; skipping part of the computation is reward hacking.
+
+Internal arithmetic precision is up to you as long as every result passes this check.
+
+## Performance
+
+For every matrix, a tuned reference implementation and your solution are timed with the same
+protocol (L2 flushed before every call, minimum over the timed calls); the task score is the
+geometric mean of the per-matrix speedups.
+
+## Rules
+
+- Write your own kernels in CUDA C++. Do not call cuSPARSE, cuBLAS, cuSOLVER or any other library
+  routine that computes the operation; CUB and Thrust primitives (scan, sort, ...) are allowed.
+- `spmv_preprocess` may only reorganize A; it must not compute anything that depends on x.
+
+## Build & Test
+
+```bash
+make test        # builds the harness with solution.h
+./test           # runs all matrices (data: $HERCULES_DATA_DIR/sparse_matrices)
+```

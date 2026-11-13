@@ -1,0 +1,9 @@
+# Libraries of the reference solver (ref_order / ref_solve). The CUDA toolkit, g++ and zlib headers
+# come from the system.   conda env create -f environment.yml   ->   make SOLVER_ENV=$CONDA_PREFIX
+name: ref-solver
+channels:
+  - conda-forge
+dependencies:
+  - metis=5.1.0
+  - suitesparse=7.10.1
+  - mkl-devel=2026.1.0

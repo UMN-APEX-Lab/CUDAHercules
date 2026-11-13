@@ -1,0 +1,50 @@
+schema_version: 1
+task_id: class3/long_context_ttft/blackwell
+name: long_context_ttft
+task_class: 3
+domain: llm-inference
+tags:
+- long-context
+- prefill
+- attention
+- ttft
+- vllm
+- blackwell
+hardware:
+  min_sm: 120
+  tested_sms:
+  - 120
+  required_features: []
+runner:
+  backend: class3_app
+  workdir: tasks/class3/long_context_ttft
+  timeout_sec: 7200
+  env: {}
+  solution_files:
+  - src/
+build:
+  cmd: ''
+  clean_cmd: ''
+execute:
+  cmd: python run.py candidate --plugin src
+  success:
+    exit_code: 0
+    stdout_regex: Passed
+correctness:
+  mode: stdout_or_exit
+  tolerances:
+    top1_agreement_min: 0.965
+    delta_nll_max: 0.01
+performance:
+  enabled: true
+  parser:
+    kernel_time_ms_regex: ''
+  metric: speedup_ref_over_sol
+source:
+  repo: ''
+  files: []
+  commit: ''
+  license: ''
+anti_cheat:
+  blocked_patterns: []
+  required_patterns: []

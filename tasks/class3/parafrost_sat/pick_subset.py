@@ -32,7 +32,8 @@ from typing import Optional
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PARAFROST_BIN = os.path.join(ROOT, "src", "parafrost")
-XZ_DIR_DEFAULT = "/mnt/data2/li004074/parafrost_benchmarks/xz_files"
+XZ_DIR_DEFAULT = os.path.join(os.environ.get("HERCULES_DATA_DIR") or os.path.join(ROOT, "..", "..", "..", "data"),
+                              "parafrost_benchmarks", "xz_files")
 OUT_DIR_DEFAULT = os.path.join(ROOT, "subset_j2021_v1")
 
 

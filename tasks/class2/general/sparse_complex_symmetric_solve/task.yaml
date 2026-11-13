@@ -1,0 +1,60 @@
+schema_version: 1
+task_id: class2/general/sparse_complex_symmetric_solve
+name: sparse_complex_symmetric_solve
+task_class: 2
+domain: hpc
+tags:
+- sparse
+- linear-solver
+- complex-symmetric
+- electromagnetics
+hardware:
+  min_sm: 80
+  tested_sms:
+  - 120
+  required_features: []
+runner:
+  backend: class1_make
+  workdir: tasks/class2/general/sparse_complex_symmetric_solve
+  timeout_sec: 5400
+  env: {}
+  solution_file: solution.cu
+build:
+  cmd: make test
+  clean_cmd: make clean
+execute:
+  cmd: ./test
+  success:
+    exit_code: 0
+    stdout_regex: Passed
+correctness:
+  mode: stdout_or_exit
+  tolerances:
+    max_relative_residual: 1.0e-08
+performance:
+  enabled: true
+  parser:
+    kernel_time_ms_regex: Kernel time:\s*([0-9.]+)\s*ms
+    ref_time_ms_regex: Ref time:\s*([0-9.]+)\s*ms
+  metric: speedup_ref_over_sol
+source:
+  repo: ''
+  files: []
+  commit: ''
+  license: ''
+anti_cheat:
+  # External solver / ordering / BLAS libraries, file I/O and cross-call state are off limits.
+  blocked_patterns:
+  - '#include\s*[<"](cudss|cusolver|cusparse|cublas|magma|metis|parmetis|scotch|cholmod|suitesparse|umfpack|klu|amd\.h|camd|colamd|mkl|pardiso|[a-z]*mumps|superlu|strumpack|Eigen|petsc|amgx|hypre)'
+  - \bcudss[A-Z]\w*\s*\(
+  - \bcusolver\w*\s*\(
+  - \bcusparse\w*\s*\(
+  - \bcublas\w*\s*\(
+  - \bMETIS_\w+\s*\(
+  - \bcholmod_\w+\s*\(
+  - \b(fopen|freopen|popen|system|getenv|dlopen|mmap)\s*\(
+  - std::[io]?fstream
+  - \bKH_REF_BIN_DIR\b
+  required_patterns:
+  - __global__\s+void
+  - extern\s+"C"\s+void\s+sparse_solve

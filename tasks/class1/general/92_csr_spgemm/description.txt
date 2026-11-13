@@ -1,0 +1,93 @@
+# Task: 92_csr_spgemm
+
+Sparse matrix-matrix multiplication C = A A for large square FP32 CSR matrices, with C produced in
+CSR format.
+
+## Function Signatures
+
+Implement the following three functions in `solution.h` (C++ linkage):
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+
+// NOT timed. May ONLY convert A's storage format or build auxiliary data over A (device or host
+// memory). It must not compute anything about C (neither structure nor values).
+void* spgemm_preprocess(const int* d_row_ptr, const int* d_col_ind, const float* d_values,
+                        int num_rows, int num_cols, int nnz);
+
+// The ONLY timed function: computes the complete CSR matrix C = A A (structure and values).
+// On return *d_c_row_ptr (num_rows + 1 entries), *d_c_col_ind and *d_c_values (*c_nnz entries)
+// point to device memory owned by the implementation (allocate once, reuse across calls; the
+// harness only reads it).
+void spgemm_compute(void* ctx,
+                    const int* d_row_ptr, const int* d_col_ind, const float* d_values,
+                    int** d_c_row_ptr, int** d_c_col_ind, float** d_c_values, int* c_nnz,
+                    int num_rows, int num_cols, int nnz);
+
+// Releases everything spgemm_preprocess and spgemm_compute allocated.
+void spgemm_cleanup(void* ctx);
+```
+
+All pointers are device pointers. A is in CSR format with 0-based, sorted column indices:
+row r holds the entries `d_values[j]` at columns `d_col_ind[j]` for
+`d_row_ptr[r] <= j < d_row_ptr[r + 1]`.
+
+The returned C must be a valid CSR matrix: `row_ptr[0] = 0`, non-decreasing, `row_ptr[num_rows] =
+c_nnz`, column indices in range. Column indices within a row may be in any order, but each
+(row, column) may appear only once (accumulate duplicates yourself). Entries that are absent
+compare as 0, so structurally present entries whose value is exactly zero may be dropped.
+
+## Calling Protocol
+
+For every test matrix: `spgemm_preprocess` is called once, then `spgemm_compute` is called many
+times with the same A, then `spgemm_cleanup`. Before every call the arrays returned by the
+previous call are overwritten with garbage (outside the timed region): every call must produce the
+complete C again; results must not be carried over from one call to the next. `spgemm_compute` may
+launch work on any stream; the timing covers everything until the device is idle.
+
+## Test Matrices
+
+Seven public matrices (SuiteSparse Matrix Collection); values are FP32, pattern-only matrices have
+all values 1.0:
+
+| name             | rows       | nnz(A)      | nnz(C)      | kind                                   |
+|------------------|------------|-------------|-------------|----------------------------------------|
+| asia_osm         | 11,950,757 | 25,423,206  | 42,751,639  | road network                           |
+| delaunay_n24     | 16,777,216 | 100,663,202 | 347,322,258 | Delaunay triangulation graph           |
+| CoupCons3D       | 416,800    | 22,322,336  | 89,148,864  | 3D coupled consolidation (FEM)         |
+| case39           | 40,216     | 1,042,160   | 404,705,284 | optimal power flow                     |
+| gupta3           | 16,783     | 9,323,427   | 270,864,545 | linear programming normal matrix       |
+| in-2004          | 1,382,908  | 16,917,053  | 213,255,458 | web graph                              |
+| TSOPF_FS_b300_c2 | 56,814     | 8,767,466   | 805,683,050 | transient-stability optimal power flow |
+
+## Correctness
+
+Every entry of C (over the union of the returned and the exact structure) is compared with the
+FP64-accumulated product: an entry matches if it is finite and its absolute error is at most 0.01
+or its relative error |C - exact| / (|exact| + 1e-8) is at most 0.01. A result is correct if at
+most 0.1% of the entries mismatch, and it is rejected outright if its structure is invalid or it
+contains a duplicate (row, column). The check runs on the first calls and on every timed call. The
+mismatch allowance exists for rounding differences only; skipping part of the computation is
+reward hacking.
+
+Internal arithmetic precision is up to you as long as every result passes this check.
+
+## Performance
+
+For every matrix, a tuned reference implementation and your solution are timed with the same
+protocol (L2 flushed before every call, minimum over the timed calls); the task score is the
+geometric mean of the per-matrix speedups.
+
+## Rules
+
+- Write your own kernels in CUDA C++. Do not call cuSPARSE, cuBLAS, cuSOLVER or any other library
+  routine that computes the operation; CUB and Thrust primitives (scan, sort, ...) are allowed.
+- `spgemm_preprocess` may only reorganize A; it must not compute anything about C.
+
+## Build & Test
+
+```bash
+make test        # builds the harness with solution.h
+./test           # runs all matrices (data: $HERCULES_DATA_DIR/sparse_matrices)
+```

@@ -21,7 +21,7 @@ endif
 
 # CUDA path
 
-CUDA_PATH := /home/li004074/cuda-12.8
+CUDA_PATH ?= $(or $(CUDA_HOME),/usr/local/cuda)
 
 ifneq ($(MAKECMDGOALS),clean)
 ifeq ($(CUDA_PATH),NONE)

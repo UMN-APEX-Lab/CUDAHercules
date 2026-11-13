@@ -1,0 +1,92 @@
+# Task: 91_csr_spmm
+
+Sparse matrix times dense matrix C = A B for large FP32 CSR matrices A and dense row-major B with
+K = 8, 32, 128 and 256 columns.
+
+## Function Signatures
+
+Implement the following three functions in `solution.h` (C++ linkage):
+
+```cuda
+#pragma once
+#include <cuda_runtime.h>
+
+// NOT timed. Receives only the matrix A and K. May convert A to any storage format and build any
+// auxiliary data over A (device or host memory); returns an opaque context.
+void* spmm_preprocess(const int* d_row_ptr, const int* d_col_ind, const float* d_values,
+                      int num_rows, int num_cols, int nnz, int K);
+
+// The ONLY timed function: C = A B.
+void spmm_compute(void* ctx,
+                  const int* d_row_ptr, const int* d_col_ind, const float* d_values,
+                  const float* d_B, float* d_C,
+                  int num_rows, int num_cols, int nnz, int K);
+
+// Releases everything spmm_preprocess and spmm_compute allocated.
+void spmm_cleanup(void* ctx);
+```
+
+All pointers are device pointers. A is in CSR format with 0-based, sorted column indices:
+row r holds the entries `d_values[j]` at columns `d_col_ind[j]` for
+`d_row_ptr[r] <= j < d_row_ptr[r + 1]`. B is `num_cols x K` and C is `num_rows x K`, both
+row-major: element (i, k) is at `i * K + k`.
+
+## Calling Protocol
+
+For every (matrix, K) case: `spmm_preprocess` is called once, then `spmm_compute` is called many
+times with the same A and the same buffers, then `spmm_cleanup`. Between calls, B changes (two
+different input matrices alternate) and C is zero-filled; both happen outside the timed region, so
+partial sums may be accumulated into C. Each call must compute C from the B it receives: results
+must not be carried over from one call to the next. `spmm_compute` may launch work on any stream;
+the timing covers everything until the device is idle.
+
+## Test Matrices
+
+Twelve public matrices (SuiteSparse Matrix Collection, OGB, DGL), each with K = 8, 32, 128 and 256
+(48 cases); values are FP32, pattern-only matrices and graphs have all values 1.0:
+
+| name             | rows       | nnz         | kind                                   |
+|------------------|------------|-------------|----------------------------------------|
+| af_shell10       | 1,508,065  | 52,672,325  | sheet metal forming (structural FEM)   |
+| CoupCons3D       | 416,800    | 22,322,336  | 3D coupled consolidation (FEM)         |
+| delaunay_n24     | 16,777,216 | 100,663,202 | Delaunay triangulation graph           |
+| asia_osm         | 11,950,757 | 25,423,206  | road network                           |
+| human_gene1      | 22,283     | 24,669,643  | gene co-expression network             |
+| mouse_gene       | 45,101     | 28,967,291  | gene co-expression network             |
+| gupta3           | 16,783     | 9,323,427   | linear programming normal matrix       |
+| in-2004          | 1,382,908  | 16,917,053  | web graph                              |
+| ogbn-proteins    | 132,534    | 79,122,504  | protein association graph              |
+| reddit           | 232,965    | 114,615,892 | social network graph                   |
+| case39           | 40,216     | 1,042,160   | optimal power flow                     |
+| TSOPF_FS_b300_c2 | 56,814     | 8,767,466   | transient-stability optimal power flow |
+
+All matrices are square.
+
+## Correctness
+
+B holds random FP32 values in [-1, 1). Every element of C is compared with the FP64-accumulated
+product: an element matches if it is finite and its absolute error is at most 0.01 or its relative
+error |C - exact| / (|exact| + 1e-8) is at most 0.01. A result is correct if at most 0.1% of the
+elements mismatch. The check runs on the first call and on every timed call. The mismatch allowance
+exists for rounding differences only; skipping part of the computation is reward hacking.
+
+Internal arithmetic precision is up to you as long as every result passes this check.
+
+## Performance
+
+For every (matrix, K) case, a tuned reference implementation and your solution are timed with the
+same protocol (L2 flushed before every call, minimum over the timed calls); the task score is the
+geometric mean of the 48 per-case speedups.
+
+## Rules
+
+- Write your own kernels in CUDA C++. Do not call cuSPARSE, cuBLAS, cuSOLVER or any other library
+  routine that computes the operation; CUB and Thrust primitives (scan, sort, ...) are allowed.
+- `spmm_preprocess` may only reorganize A; it must not compute anything that depends on B.
+
+## Build & Test
+
+```bash
+make test        # builds the harness with solution.h
+./test           # runs all cases (data: $HERCULES_DATA_DIR/sparse_matrices)
+```

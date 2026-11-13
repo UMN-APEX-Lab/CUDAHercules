@@ -124,6 +124,17 @@ def get_gpu_name() -> str:
     return "No GPU"
 
 
+# Compute capabilities with an arch-specific ("a") target (sm_90a, sm_100a, sm_120a, ...). A build
+# for the live GPU uses that target, so arch-specific instructions (wgmma, tcgen05, block-scaled
+# MMA, setmaxnreg, ...) are available.
+ARCH_SPECIFIC_SMS = (90, 100, 101, 103, 110, 120, 121)
+
+
+def sm_target(sm: int) -> str:
+    """nvcc target name for compute capability `sm`: '90a' for 90, '86' for 86, ..."""
+    return f"{sm}a" if sm in ARCH_SPECIFIC_SMS else str(sm)
+
+
 def get_cuda_arch() -> int:
     """Get the compute capability of the current GPU as an int (e.g., 80 for SM80)."""
     import torch

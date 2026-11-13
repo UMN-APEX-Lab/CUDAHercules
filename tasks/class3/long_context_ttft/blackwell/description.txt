@@ -1,0 +1,70 @@
+# Task: long_context_ttft (Blackwell, SM120)
+
+Minimize the time to first token (TTFT) of Qwen3.8-27B served by vLLM 0.30.0 on one NVIDIA RTX PRO
+6000 Blackwell (SM120, 96 GB) for single long prompts of 64K, 128K and 256K tokens, while keeping the
+model's output quality.
+
+## Fixed Serving Configuration
+
+The harness starts the OpenAI-compatible vLLM server itself, always with:
+
+```
+--dtype bfloat16 --quantization fp8 --kv-cache-dtype fp8 --max-model-len 262144
+--max-num-batched-tokens 8192 --max-num-seqs 4 --enable-chunked-prefill --no-enable-prefix-caching
+--language-model-only --gpu-memory-utilization 0.88 --seed 20261112
+```
+
+Model weights, quantization, tokenizer, sampling and these arguments cannot be changed.
+
+## What You Write
+
+A Python package `hercules_plugin` in `src/` (i.e. `src/hercules_plugin/__init__.py` and anything
+else under `src/`), plus the CUDA C++ sources it builds. The harness puts `src/` on `PYTHONPATH` and
+imports `hercules_plugin` at interpreter start in every vLLM process (API server, engine core,
+workers), before vLLM initializes. The package may register custom operators and replace or patch any
+part of vLLM at runtime. It may compile its CUDA C++ code when imported (e.g. with
+`torch.utils.cpp_extension`); server start-up is not timed. An empty package gives unmodified vLLM.
+
+## Rules
+
+- Every new compute kernel must be written in CUDA C++ (`.cu`/`.cuh`/`.cpp`, built with nvcc). Python
+  is only for integration. Not allowed for the computation you replace: Python kernel DSLs and JITs
+  (Triton, CuTe DSL, TileLang, Numba, CuPy kernels, ...) and third-party attention or GEMM kernels
+  (FlashInfer, FlashAttention, xFormers, PyTorch SDPA / flex attention, cuBLAS, cuDNN). Parts of vLLM
+  you leave untouched keep running vLLM's own kernels.
+- Every request must be computed from its own prompt: no caching or reuse of results across requests
+  (prefix caching is disabled; do not add your own).
+- One code path serves every request: behavior must not depend on request parameters (`max_tokens`,
+  log-probability requests, streaming) or on recognizing the benchmark prompts.
+- Approximate computation (for example in attention) is allowed as long as the quality gates below
+  hold.
+
+## Measurement
+
+The prompts are long technical documents (open-source software documentation) with one planted fact
+and a question about it, of exactly 65,536, 131,072 and 260,096 tokens. For every length the harness
+sends one warm-up request and two timed requests, each with a different prompt. TTFT is the time from
+sending a streaming completion request (`max_tokens = 1`) to receiving its first token; the faster of
+the two timed requests counts. A reference implementation is measured the same way on the same GPU.
+The score is the geometric mean over the three lengths of reference TTFT / solution TTFT, or 0 if a
+quality gate fails.
+
+## Quality Gates
+
+Compared with the BF16 model (BF16 weights and KV cache) on unmodified vLLM, for one prompt per
+length:
+- Needle: the greedy 384-token answer must contain the planted code, at every length.
+- Teacher forcing: the BF16 model's 256-token greedy continuation is scored under the solution; the
+  mean top-1 agreement over the three lengths must be at least 96.5% and the mean increase of the
+  negative log-likelihood (ΔNLL) at most 0.01.
+
+## Running
+
+```bash
+python run.py candidate --plugin src --output result.json   # serve with your plugin, TTFT + quality
+python run.py stock --output stock.json                     # unmodified vLLM, same configuration
+```
+
+Environment: `HERCULES_DATA_DIR` (prompts and quality reference under `long_context_ttft/`, see
+`prepare_data.sh`), `HERCULES_VLLM_PYTHON` (Python of the vLLM 0.30.0 environment, see
+`docker/Dockerfile`), `HF_HOME` (model cache), `CUDA_VISIBLE_DEVICES` (one GPU).

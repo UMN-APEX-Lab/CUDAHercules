@@ -258,7 +258,7 @@ PROBE_SCRIPT = r"""
 set +e
 echo "== whoami / hostname"; id; hostname
 echo "== host paths (expect all absent)"
-for p in /home/li004074 /home/li004074/KernelHell /mnt /opt/miniconda3 /data; do test -e $p && echo "VISIBLE $p" || echo "absent $p"; done
+for p in __HOST_HOME__ __KH_ROOT__ /mnt /opt/miniconda3 /data; do test -e $p && echo "VISIBLE $p" || echo "absent $p"; done
 echo "== /home /opt"; ls -la /home; find /opt -maxdepth 2 | sort
 echo "== network (expect failure)"
 ip -brief addr 2>/dev/null || cat /proc/net/dev
@@ -299,7 +299,8 @@ def probe(gpu: int, scan: bool, ro_binds: list) -> int:
     try:
         spec = SandboxSpec(workspace=dirs["ws"], sock_dir=dirs["sock"], gpu_index=gpu,
                            opt_kh=dirs["opt_kh"], ro_binds=ro_binds)
-        script = PROBE_SCRIPT + (_leak_scan_cmd() if scan else "")
+        script = (PROBE_SCRIPT.replace("__HOST_HOME__", os.path.expanduser("~")).replace("__KH_ROOT__", KH_ROOT)
+                  + (_leak_scan_cmd() if scan else ""))
         code, out, err, _ = run_in_sandbox(spec, ["/bin/bash", "-c", script])
         print(out, end="")
         print(err, end="", file=sys.stderr)

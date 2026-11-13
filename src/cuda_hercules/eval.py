@@ -30,7 +30,7 @@ def _timeout_handler(signum, frame):
 
 from .compiler import compile_cuda_module, get_reference_include_dirs
 from .timing import calibrate_sync_overhead, time_cuda_function, TimingStats
-from .utils import get_project_root
+from .utils import get_project_root, sm_target
 
 
 class TimingVerificationError(Exception):
@@ -124,10 +124,12 @@ def _get_device_sm(device: Optional[torch.device] = None) -> int:
 
 
 def _current_arch_gencode_flags(target_sm: int) -> list[str]:
-    """Return nvcc flags targeting exactly the current GPU arch plus PTX fallback."""
+    """Return nvcc flags targeting exactly the current GPU arch (its arch-specific "a" target
+    where one exists, e.g. sm_90a) plus PTX."""
+    tgt = sm_target(target_sm)
     return [
-        "-gencode", f"arch=compute_{target_sm},code=sm_{target_sm}",
-        "-gencode", f"arch=compute_{target_sm},code=compute_{target_sm}",
+        "-gencode", f"arch=compute_{tgt},code=sm_{tgt}",
+        "-gencode", f"arch=compute_{tgt},code=compute_{tgt}",
     ]
 
 

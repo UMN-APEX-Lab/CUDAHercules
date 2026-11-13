@@ -1,0 +1,76 @@
+# Task: sparse_complex_symmetric_solve
+
+Solve A X = B for large sparse complex-symmetric linear systems (A = A^T, not Hermitian) from
+frequency-domain finite-element discretizations of 3D electromagnetic problems, with a small number
+of right-hand sides. The systems are indefinite and, at low frequency, badly conditioned.
+
+## Function Signature
+
+Implement the following function in `solution.cu`:
+
+```cuda
+#include <cuComplex.h>
+
+extern "C" void sparse_solve(int n, long long nnz,
+                             const int* row_ptr,              // n + 1 entries
+                             const int* col_idx,              // nnz entries
+                             const cuDoubleComplex* values,   // nnz entries
+                             int nrhs,
+                             const cuDoubleComplex* B,        // n x nrhs, column-major
+                             cuDoubleComplex* X);             // n x nrhs, column-major (output)
+```
+
+All pointers are device pointers. A is given by its upper triangle in CSR format: row `i` holds the
+entries `values[j]` at columns `col_idx[j]` for `row_ptr[i] <= j < row_ptr[i + 1]`, with
+`col_idx[j] >= i`, 0-based, sorted within each row, and the diagonal entry present in every row.
+The lower triangle is implied by symmetry (A[j][i] = A[i][j], no conjugation). `nnz` counts the
+stored (upper) entries. B is mostly zero (the excitations act on a few rows); `nrhs` is 2.
+
+## Calling Protocol
+
+`sparse_solve` is timed from the call to device idle (wall clock), so all of its work counts:
+ordering, analysis, factorization, solves, refinement, allocations, host-side computation and
+transfers. Each call is an independent solve: before every call the test system is renumbered by a
+fresh random symmetric permutation (A -> P A P^T, B -> P B), so nothing may be carried over from one
+call to the next. Host code (including OpenMP threads, enabled at compile time) may be used.
+
+## Test Systems
+
+| case          | n          | nnz (upper)  | frequency |
+|---------------|------------|--------------|-----------|
+| em_7M_1MHz    | 7,031,004  | 34,898,044   | 1 MHz     |
+| em_7M_1GHz    | 7,031,004  | 34,898,044   | 1 GHz     |
+| em_18M_5MHz   | 18,655,233 | 151,510,160  | 5 MHz     |
+| em_18M_142MHz | 18,655,233 | 151,510,160  | 142 MHz   |
+
+The two meshes have average row lengths (full matrix) of about 8.9 and 15.2 and no block structure.
+The final evaluation runs all four cases; `HERCULES_SOLVER_CASES=dev ./test` runs only the em_7M
+cases. Data: `$HERCULES_DATA_DIR/sparse_solver`.
+
+## Correctness
+
+After every call, the relative residual ||B_k - A X_k||_2 / ||B_k||_2 of every column k is computed
+in extended precision; it must be at most 1e-8, and X must be finite. Any algorithm and any
+internal precision (direct, iterative, mixed precision, ...) is allowed as long as this holds.
+
+## Performance
+
+For every case, a reference solver and your solution are timed on the same permuted systems (one
+warm-up call and two timed calls, each on a new permutation; the minimum counts). The task score is
+the geometric mean of the per-case speedups.
+
+## Rules
+
+- Write the solver yourself in CUDA C++. Do not call external solver, ordering or dense/sparse
+  linear-algebra libraries (cuDSS, cuSOLVER, cuSPARSE, cuBLAS, MAGMA, METIS, SuiteSparse/CHOLMOD,
+  MKL/PARDISO, MUMPS, SuperLU, STRUMPACK, Eigen, PETSc, AmgX, ...). CUB and Thrust primitives are
+  allowed.
+- No file or network I/O and no state kept across calls or processes (caches on disk, environment
+  variables, ...).
+
+## Build & Test
+
+```bash
+make test        # builds the harness with solution.cu
+./test           # runs all cases
+```

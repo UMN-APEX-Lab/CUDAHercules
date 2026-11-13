@@ -53,3 +53,9 @@ tasks/class3/llmc/src/train_gpt2cu
 .idea/
 .DS_Store
 Thumbs.db
+
+# per-architecture builds of the sparse reference kernels
+reference_sources/sparse_kernels/build/
+
+# task datasets (HERCULES_DATA_DIR default)
+/data/

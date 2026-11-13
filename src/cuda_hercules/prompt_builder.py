@@ -16,6 +16,12 @@ PYTORCH_EXTENSION_TASKS = {
     "class3/tcgnn_gcn/general",
 }
 
+# Tasks whose solution is a Python integration layer around CUDA C++ kernels (the generic "pure CUDA,
+# extern \"C\" entry point" requirements do not apply; the description states the contract).
+PYTHON_INTEGRATION_TASKS = {
+    "class3/long_context_ttft/blackwell",
+}
+
 PROMPT_CONTEXT_FILES = {
     "class3/mgg_agnn/general": ["wrapper.cpp", "run.py"],
     "class3/mgg_agnn/hopper": ["wrapper.cpp", "run.py"],
@@ -172,7 +178,14 @@ def build_prompt(task_dir: str, task_config=None, description_dir: str = None) -
     # description (which may use overloads / templates, e.g. 77_blackwell_fmha), so the rule would
     # contradict the task there.
     uses_include_harness = bool(task_config) and task_config.runner.backend == "class1_make"
-    if task_id not in PYTORCH_EXTENSION_TASKS and not uses_include_harness:
+    if task_id in PYTHON_INTEGRATION_TASKS:
+        requirements = [
+            "- Write every new compute kernel in CUDA C++ (`__global__` kernels launched via `<<<>>>`); "
+            "use Python only to integrate them, as the task description specifies",
+            LIBRARY_RULES_PROMPT,
+            "- Optimize for maximum performance on the target GPU",
+        ]
+    elif task_id not in PYTORCH_EXTENSION_TASKS and not uses_include_harness:
         requirements.insert(2, "- The entry function MUST be declared with `extern \"C\"` linkage")
 
     output_format = "Return the complete .cu file content in a ```cuda code block."

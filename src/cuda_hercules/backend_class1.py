@@ -22,7 +22,7 @@ import torch
 from .backend_base import Backend
 from .task_schema import TaskConfig
 from .result import PerfMetrics
-from .utils import get_project_root, task_source_hash
+from .utils import get_project_root, sm_target, task_source_hash
 
 UNSUPPORTED_ARCH_PREFIX = "UNSUPPORTED_ARCH:"
 
@@ -73,8 +73,9 @@ def _get_gpu_sm() -> int:
 
 
 def _current_arch_make_vars(target_sm: int) -> dict[str, str]:
-    arch = f"-gencode arch=compute_{target_sm},code=sm_{target_sm}"
-    arch_ptx = f"-gencode arch=compute_{target_sm},code=compute_{target_sm}"
+    tgt = sm_target(target_sm)
+    arch = f"-gencode arch=compute_{tgt},code=sm_{tgt}"
+    arch_ptx = f"-gencode arch=compute_{tgt},code=compute_{tgt}"
     return {
         "ARCH": arch,
         "ARCH_PTX": arch_ptx,
@@ -140,6 +141,8 @@ class Class1MakeBackend(Backend):
         ref_sources = os.path.join(root, "reference_sources")
         env["CUTLASS_DIR"] = os.path.join(ref_sources, "cutlass")
         env["TK_DIR"] = os.path.join(ref_sources, "ThunderKittens")
+        env["SPARSE_KERNELS_DIR"] = os.path.join(ref_sources, "sparse_kernels")
+        env["SPARSE_SOLVER_DIR"] = os.path.join(ref_sources, "sparse_solver")
         env["DEEPGEMM_DIR"] = os.path.join(ref_sources, "deep_gemm")
         env["CUDNN_FE_DIR"] = os.path.join(ref_sources, "cudnn_frontend")
         # cuDNN (used by reference builds such as 77_blackwell_fmha): honour an explicit
@@ -205,6 +208,8 @@ class Class1MakeBackend(Backend):
     def run_correctness(self, config: TaskConfig) -> tuple[bool, dict, str]:
         env = os.environ.copy()
         env.update(config.runner.env)
+        # Task datasets live under $HERCULES_DATA_DIR (default: <repo>/data, git-ignored).
+        env.setdefault("HERCULES_DATA_DIR", os.path.join(get_project_root(), "data"))
         measure_perf = _should_measure_perf(config)
         env["CUDA_HERCULES_MEASURE_PERF"] = "1" if measure_perf else "0"
         if not measure_perf:

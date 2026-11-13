@@ -78,6 +78,7 @@ class Class3AppBackend(Backend):
 
         env = os.environ.copy()
         env.update(config.runner.env)
+        env.setdefault("HERCULES_DATA_DIR", os.path.join(get_project_root(), "data"))
 
         cmd = [sys.executable, eval_script, solution_path]
         rc, stdout, stderr, timed_out = _run_with_pgroup(
@@ -159,6 +160,7 @@ class Class3AppBackend(Backend):
         """Fallback: run run.py directly (for tasks without eval_solution.py)."""
         env = os.environ.copy()
         env.update(config.runner.env)
+        env.setdefault("HERCULES_DATA_DIR", os.path.join(get_project_root(), "data"))
 
         cmd = config.execute.cmd
         rc, stdout, stderr, timed_out = _run_with_pgroup(

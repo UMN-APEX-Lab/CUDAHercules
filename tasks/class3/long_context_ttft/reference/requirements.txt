@@ -1,0 +1,5 @@
+# Extra Python packages the reference imports at runtime, beyond vllm==0.30.0 (and the torch / flashinfer / numpy it pins).
+# Versions are the ones installed in the validated environment (Python 3.12, torch 2.13.0+cu130, CUDA 13).
+nvidia-cutlass-dsl[cu13]==4.7.1
+cuda-python==13.4.4
+cuda-bindings==13.4.4

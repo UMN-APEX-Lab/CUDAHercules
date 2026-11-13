@@ -3,7 +3,7 @@
 # Prefer using test_all_references.py instead (supports CSV + resume).
 set -u
 
-cd /home/li004074/CUDA-Hercules
+cd "$(dirname "$0")/.."
 RESULTS_FILE="results/reference_test_results.txt"
 mkdir -p results
 

@@ -1,0 +1,59 @@
+schema_version: 1
+task_id: class1/general/90_csr_spmv
+name: 90_csr_spmv
+task_class: 1
+domain: hpc
+tags:
+- sparse
+- spmv
+- csr
+hardware:
+  min_sm: 80
+  tested_sms:
+  - 120
+  required_features: []
+runner:
+  backend: class1_make
+  workdir: tasks/class1/general/90_csr_spmv
+  timeout_sec: 1800
+  env:
+    KH_BENCHMARK: '20'
+  solution_file: solution.h
+build:
+  cmd: make test
+  clean_cmd: make clean
+execute:
+  cmd: ./test
+  success:
+    exit_code: 0
+    stdout_regex: Passed
+correctness:
+  mode: stdout_or_exit
+  tolerances:
+    atol: 0.01
+    rtol: 0.01
+    max_mismatch_rate: 0.001
+performance:
+  enabled: true
+  parser:
+    kernel_time_ms_regex: Kernel time:\s*([0-9.]+)\s*ms
+    ref_time_ms_regex: Ref time:\s*([0-9.]+)\s*ms
+  metric: speedup_ref_over_sol
+source:
+  repo: ''
+  files: []
+  commit: ''
+  license: ''
+anti_cheat:
+  # Library sparse routines and the per-matrix reference libraries are off limits.
+  blocked_patterns:
+  - \bcusparse
+  - \bcusolver
+  - \bcublas
+  - \bdlopen\b
+  - \bdlsym\b
+  - KH_REF_DIR
+  - \bkh_ref_
+  required_patterns:
+  - __global__\s+void
+  - <<<.*>>>
