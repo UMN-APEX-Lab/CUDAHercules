@@ -5,7 +5,9 @@ set -euo pipefail
 : "${HERCULES_DATA_DIR:?set HERCULES_DATA_DIR}"
 DEST="$HERCULES_DATA_DIR/long_context_ttft"
 mkdir -p "$DEST"
-hf download --repo-type dataset "${HERCULES_HF_DATASET:?set HERCULES_HF_DATASET to the task data repo}" \
-    --include "long_context_ttft/*" --local-dir "$HERCULES_DATA_DIR"
+BASE="${HERCULES_DATA_URL:-https://anonymous-hf.com/api/a/cs6btyea9aef}"   # <base>/resolve/<path>
+for f in prompts.json quality_reference.json; do
+    curl -fsSL -o "$DEST/$f" "$BASE/resolve/long_context_ttft/$f"
+done
 hf download Qwen/Qwen3.8-27B
 ls -la "$DEST"

@@ -31,9 +31,9 @@ import urllib.request
 
 TASK_DIR = os.path.dirname(os.path.abspath(__file__))
 LENGTHS = (65536, 131072, 260096)
-GEN_TOKENS = 384          # greedy generation for the needle check
-CONT_TOKENS = 256         # teacher-forced continuation tokens scored per prompt
-TOP1_MIN = 0.965          # quality gates (mean over the three lengths)
+GEN_TOKENS = 512          # greedy generation: needle check, and the continuation of the BF16 reference
+CONT_TOKENS = 512         # teacher-forced continuation tokens scored per prompt
+TOP1_MIN = 0.965          # quality gates (means over all prompts)
 DNLL_MAX = 0.01
 
 # Fixed for every configuration; a solution cannot change them.
@@ -177,23 +177,25 @@ def score(port, ids, cont):
 
 
 def quality(port, prompts, qref):
-    rows, ok = {}, True
-    for L in LENGTHS:
-        p = next(p for p in prompts if p["length"] == L and p["index"] == 0)
-        ref = qref[str(L)]
+    """Needle check and teacher-forced scoring on every prompt (all variants of all lengths)."""
+    rows = {}
+    for p in sorted(prompts, key=lambda p: (p["length"], p["index"])):
+        key = f"{p['length']}/{p['index']}"
+        ref = qref[key]
         text, _ = generate(port, p["prompt_token_ids"])
         hit = p["needle_code"] in text
         lps, top1 = score(port, p["prompt_token_ids"], ref["continuation"])
         nll = -sum(lps) / len(lps)
         dnll = nll - ref["nll"]
-        rows[str(L)] = {"needle_hit": hit, "nll": nll, "delta_nll": dnll, "top1_agreement": top1,
-                        "text_head": text[:200]}
-        print(f"  quality {L}: needle {'ok' if hit else 'MISSING'}, top-1 {top1:.3f}, dNLL {dnll:+.4f}", flush=True)
+        rows[key] = {"needle_hit": hit, "nll": nll, "delta_nll": dnll, "top1_agreement": top1, "text_head": text[:200]}
+        print(f"  quality {key}: needle {'ok' if hit else 'MISSING'}, top-1 {top1:.3f}, dNLL {dnll:+.4f}", flush=True)
     mean_top1 = sum(r["top1_agreement"] for r in rows.values()) / len(rows)
     mean_dnll = sum(r["delta_nll"] for r in rows.values()) / len(rows)
     ok = all(r["needle_hit"] for r in rows.values()) and mean_top1 >= TOP1_MIN and mean_dnll <= DNLL_MAX
-    return {"per_length": rows, "mean_top1_agreement": mean_top1, "mean_delta_nll": mean_dnll,
-            "gates": {"needle": "all lengths", "top1_min": TOP1_MIN, "delta_nll_max": DNLL_MAX}, "passed": ok}
+    print(f"  quality: mean top-1 {mean_top1:.4f} (>= {TOP1_MIN}), mean dNLL {mean_dnll:+.4f} (<= {DNLL_MAX}) -> "
+          f"{'ok' if ok else 'FAIL'}", flush=True)
+    return {"per_prompt": rows, "mean_top1_agreement": mean_top1, "mean_delta_nll": mean_dnll,
+            "gates": {"needle": "every prompt", "top1_min": TOP1_MIN, "delta_nll_max": DNLL_MAX}, "passed": ok}
 
 
 def run_config(name, plugin=None, skip_quality=False, log_dir=None):
@@ -234,24 +236,24 @@ def run_config(name, plugin=None, skip_quality=False, log_dir=None):
             server.stop()
 
 
-def make_quality_reference():
-    """BF16 dense model: greedy continuation and its own teacher-forced NLL per length (variant 0)."""
+def make_quality_reference(log_dir=None):
+    """BF16 dense model: greedy continuation and its own teacher-forced NLL for every prompt."""
     prompts = json.load(open(os.path.join(data_dir(), "prompts.json")))
-    res = run_config("dense")
+    res = run_config("dense", log_dir=log_dir)
     if not res.get("started"):
         sys.exit(res.get("error", "dense server failed"))
     server = res["server"]
     out = {}
     try:
-        for L in LENGTHS:
-            p = next(p for p in prompts if p["length"] == L and p["index"] == 0)
+        for p in sorted(prompts, key=lambda p: (p["length"], p["index"])):
+            key = f"{p['length']}/{p['index']}"
             text, toks = generate(server.port, p["prompt_token_ids"])
             cont = toks[:CONT_TOKENS]
             lps, top1 = score(server.port, p["prompt_token_ids"], cont)
-            out[str(L)] = {"prompt_sha256": p["prompt_sha256"], "continuation": cont, "nll": -sum(lps) / len(lps),
-                           "top1_agreement": top1, "needle_hit": p["needle_code"] in text, "text": text}
-            print(f"  dense {L}: needle {'ok' if out[str(L)]['needle_hit'] else 'MISSING'}, NLL {out[str(L)]['nll']:.4f}",
-                  flush=True)
+            out[key] = {"prompt_sha256": p["prompt_sha256"], "continuation": cont, "nll": -sum(lps) / len(lps),
+                        "top1_agreement": top1, "needle_hit": p["needle_code"] in text, "text": text}
+            print(f"  dense {key}: needle {'ok' if out[key]['needle_hit'] else 'MISSING'}, NLL {out[key]['nll']:.4f}, "
+                  f"{len(cont)} tokens", flush=True)
     finally:
         server.stop()
     path = os.path.join(data_dir(), "quality_reference.json")
@@ -268,7 +270,7 @@ def main():
     ap.add_argument("--log-dir")
     a = ap.parse_args()
     if a.config == "make-quality-reference":
-        make_quality_reference()
+        make_quality_reference(a.log_dir)
         return
     if a.config == "candidate" and not (a.plugin and os.path.isdir(os.path.join(a.plugin, "hercules_plugin"))):
         sys.exit("candidate needs --plugin <dir> containing hercules_plugin/")

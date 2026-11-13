@@ -51,11 +51,11 @@ quality gate fails.
 
 ## Quality Gates
 
-Compared with the BF16 model (BF16 weights and KV cache) on unmodified vLLM, for one prompt per
-length:
-- Needle: the greedy 384-token answer must contain the planted code, at every length.
-- Teacher forcing: the BF16 model's 256-token greedy continuation is scored under the solution; the
-  mean top-1 agreement over the three lengths must be at least 96.5% and the mean increase of the
+Compared with the BF16 model (BF16 weights and KV cache) on unmodified vLLM, on all nine prompts (the
+three prompts of every length):
+- Needle: the greedy 512-token answer must contain the planted code, for every prompt.
+- Teacher forcing: the BF16 model's 512-token greedy continuation is scored under the solution; the
+  mean top-1 agreement over the nine prompts must be at least 96.5% and the mean increase of the
   negative log-likelihood (ΔNLL) at most 0.01.
 
 ## Running
